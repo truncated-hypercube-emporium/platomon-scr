@@ -6,10 +6,16 @@
 pub mod ascii;
 pub mod aspect;
 pub mod clock;
+pub mod color;
 pub mod collector;
 pub mod config;
 pub mod metrics;
 pub mod overlay;
+#[cfg(all(windows, feature = "screensaver"))]
+pub mod scrconfig;
+pub mod screensaver;
+#[cfg(windows)]
+pub mod winconsole;
 pub mod render;
 pub mod scene;
 pub mod ui;

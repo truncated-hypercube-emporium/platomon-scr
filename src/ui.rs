@@ -35,6 +35,62 @@ pub fn map_event(ev: &Event) -> Action {
     }
 }
 
+/// Screensaver wake-up: any key press, mouse button or wheel, or the mouse
+/// moving a couple of cells. Movement in the first second (the console
+/// settling, a jittery mouse) only sets the reference position.
+pub struct InputWatch {
+    start: std::time::Instant,
+    origin: Option<(u16, u16)>,
+}
+
+impl Default for InputWatch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl InputWatch {
+    pub const GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+    /// Cells the pointer must travel to count as movement.
+    pub const MOVE_CELLS: u16 = 2;
+
+    pub fn new() -> Self {
+        Self { start: std::time::Instant::now(), origin: None }
+    }
+
+    /// Start a new grace period and forget the reference position, e.g. after
+    /// the window was moved or resized (the pointer's cell position changes
+    /// without the mouse moving).
+    pub fn rearm(&mut self) {
+        *self = Self::new();
+    }
+
+    pub fn wakes(&mut self, ev: &Event) -> bool {
+        self.wakes_at(ev, self.start.elapsed())
+    }
+
+    fn wakes_at(&mut self, ev: &Event, since_start: std::time::Duration) -> bool {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        match ev {
+            Event::Key(k) => k.kind != KeyEventKind::Release,
+            Event::Mouse(MouseEvent { kind: MouseEventKind::Moved, column, row, .. }) => {
+                let here = (*column, *row);
+                match self.origin {
+                    Some(o) if since_start >= Self::GRACE => {
+                        here.0.abs_diff(o.0) >= Self::MOVE_CELLS || here.1.abs_diff(o.1) >= Self::MOVE_CELLS
+                    }
+                    _ => {
+                        self.origin = Some(here);
+                        false
+                    }
+                }
+            }
+            Event::Mouse(_) => since_start >= Self::GRACE,
+            _ => false,
+        }
+    }
+}
+
 fn pct(v: Option<f32>) -> String {
     v.map_or_else(|| "n/a".to_string(), |p| format!("{:.0}%", p))
 }
@@ -132,6 +188,26 @@ mod tests {
         assert_eq!(map_event(&Event::Resize(80, 24)), Action::Resize(80, 24));
         assert_eq!(map_event(&key(KeyCode::Char('l'), KeyModifiers::NONE, p)), Action::ToggleLegend);
         assert_eq!(map_event(&key(KeyCode::Char('W'), KeyModifiers::SHIFT, p)), Action::ToggleWireframe);
+    }
+
+    #[test]
+    fn input_watch_wakes_on_input_but_not_jitter() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        use std::time::Duration;
+        let mouse = |kind, column, row| Event::Mouse(MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE });
+        let (early, late) = (Duration::from_millis(200), Duration::from_secs(2));
+        let mut w = InputWatch::new();
+        assert!(!w.wakes_at(&mouse(MouseEventKind::Moved, 10, 10), early), "settling");
+        assert!(!w.wakes_at(&mouse(MouseEventKind::Moved, 40, 20), early), "still settling: new origin");
+        assert!(!w.wakes_at(&mouse(MouseEventKind::Moved, 41, 21), late), "1-cell jitter");
+        assert!(w.wakes_at(&mouse(MouseEventKind::Moved, 43, 20), late), "real movement");
+        let mut w = InputWatch::new();
+        assert!(!w.wakes_at(&mouse(MouseEventKind::Down(MouseButton::Left), 1, 1), early));
+        assert!(w.wakes_at(&mouse(MouseEventKind::Down(MouseButton::Left), 1, 1), late));
+        assert!(w.wakes_at(&mouse(MouseEventKind::ScrollDown, 1, 1), late));
+        assert!(w.wakes_at(&key(KeyCode::Char('x'), KeyModifiers::NONE, KeyEventKind::Press), early), "keys always");
+        assert!(!w.wakes_at(&key(KeyCode::Char('x'), KeyModifiers::NONE, KeyEventKind::Release), late));
+        assert!(!w.wakes_at(&Event::Resize(80, 24), late));
     }
 
     #[test]

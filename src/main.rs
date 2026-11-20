@@ -8,6 +8,7 @@ use crossterm::{cursor, event, execute, terminal};
 use platomon::ascii::{self, Ramp, StatsLine};
 use platomon::aspect::{self, AspectMode, PRESETS};
 use platomon::clock::{self, FrameClock, SPIN_MARGIN};
+use platomon::color::{self, ColorBy, ColorDepth, ColorMap, Gradient};
 use platomon::collector::{Collector, gpu::GpuSampler, system::SystemSampler};
 use platomon::config::{Config, SlotSpec, split_assignment};
 use platomon::metrics::{Channel, MetricKind, MetricsState, Reading, activity_score};
@@ -16,7 +17,7 @@ use platomon::render::{QualityGovernor, RenderSettings, Renderer, TraceSettings}
 use platomon::scene::camera::{CameraMode, CameraParams, OrbitDir};
 use platomon::scene::ground::{Pattern, Spin, parse_vec2};
 use platomon::scene::sdf::{Polyhedron, SolidKind};
-use platomon::scene::{AnimParams, Scene, SlotLayout};
+use platomon::scene::{AnimParams, Layout, Scene, SlotLayout};
 use platomon::ui::{self, Action};
 
 /// Longest sleep between input polls while waiting for a frame deadline.
@@ -29,6 +30,7 @@ enum ListWhat {
     Aspects,
     Sensors,
     Patterns,
+    Gradients,
 }
 
 /// Platonic-solid ASCII system monitor.
@@ -59,6 +61,18 @@ struct Cli {
     /// Show the stats bar at start.
     #[arg(long)]
     stats: bool,
+    /// Screensaver: quit on any key, click or mouse movement.
+    #[arg(long, hide = true)]
+    exit_on_input: bool,
+    /// Screensaver: write the input that ended the run to PATH.
+    #[arg(long, hide = true, value_name = "PATH")]
+    wake_log: Option<PathBuf>,
+    /// Windows console: set the font before starting, e.g. Consolas:16.
+    #[arg(long, hide = true, value_name = "FACE:HEIGHT")]
+    console_font: Option<String>,
+    /// Windows console: go fullscreen before starting.
+    #[arg(long, hide = true)]
+    console_fullscreen: bool,
 
     // ---- metrics & solids
     /// Metrics to show, one solid each (max 16): cpu,ram,disk,net,gpu,nic[:NAME],disk-dev[:NAME].
@@ -84,6 +98,9 @@ struct Cli {
     /// Frame-rate ceiling (full load).
     #[arg(long, value_name = "FPS")]
     fps_max: Option<f32>,
+    /// Invert the load/fps relationship: idle runs at --fps-max, full load at --fps-min.
+    #[arg(long)]
+    fps_invert: bool,
     /// Glyph ramp, darkest first.
     #[arg(long, value_name = "STR")]
     ramp: Option<String>,
@@ -108,6 +125,25 @@ struct Cli {
     #[arg(long)]
     wireframe: bool,
 
+    // ---- colour
+    /// Colour gradient: off, a preset (see --list gradients) or hex stops like "#000:#f80:#fff".
+    #[arg(long, value_name = "GRADIENT")]
+    color: Option<String>,
+    /// What picks the colour: lum (brightness) or load (each solid by its metric). Implies a default gradient.
+    #[arg(long, value_name = "lum|load")]
+    color_by: Option<ColorBy>,
+    /// Colour codes: 24bit or 256.
+    #[arg(long, value_name = "24bit|256")]
+    color_depth: Option<ColorDepth>,
+    /// Run the gradient backwards.
+    #[arg(long)]
+    color_reverse: bool,
+
+    // ---- layout
+    /// rings (on the ground) or sphere (concentric spherical shells; --ring picks the shell).
+    #[arg(long, value_name = "rings|sphere")]
+    layout: Option<Layout>,
+
     // ---- display ratio
     /// Picture ratio: fill, a preset (vga, wxga, fhd, uwqhd, ... see --list aspects) or W:H.
     #[arg(long, value_name = "PRESET|W:H")]
@@ -117,9 +153,15 @@ struct Cli {
     aspect_mode: Option<AspectMode>,
 
     // ---- camera
-    /// static or orbit (circle the centroid of the solids).
+    /// static, orbit (circle the centroid of the solids) or focus (glide toward the busiest solid).
     #[arg(long, value_name = "MODE")]
     camera: Option<CameraMode>,
+    /// Focus camera: 0 = only turn toward the busiest solid, 1 = close-up.
+    #[arg(long, value_name = "0..1")]
+    focus_zoom: Option<f32>,
+    /// Focus camera: glide time constant, seconds.
+    #[arg(long, value_name = "SECS")]
+    focus_tau: Option<f32>,
     /// Seconds per orbit.
     #[arg(long, value_name = "SECS")]
     orbit_period: Option<f32>,
@@ -181,11 +223,22 @@ fn apply_cli(cfg: &mut Config, cli: &Cli) -> Result<(), String> {
     set!(spp, bounces, fps_min, fps_max, ramp, char_aspect, aspect, aspect_mode, camera, orbit_period, orbit_dir, orbit_bob);
     set!(bg_lum, bg_pattern, bg_contrast, bg_scale, bg_sway, bg_sway_period, bg_rotate, bg_rotate_period);
     set!(legend_size, legend_opacity, legend_pos);
+    set!(color, color_by, color_depth, layout, focus_zoom, focus_tau);
+    if cli.color_reverse {
+        cfg.color_reverse = true;
+    }
+    // Choosing a colour source (or reversing) without a gradient picks a default one.
+    if (cli.color_by.is_some() || cli.color_reverse) && cli.color.is_none() && cfg.color.trim() == "off" {
+        cfg.color = platomon::color::default_for(cfg.color_by).to_string();
+    }
     if cli.legend || cli.legend_size.is_some() || cli.legend_opacity.is_some() || cli.legend_pos.is_some() {
         cfg.legend = true;
     }
     if cli.wireframe {
         cfg.wireframe = true;
+    }
+    if cli.fps_invert {
+        cfg.fps_invert = true;
     }
     if let Some(s) = &cli.bg_scroll {
         cfg.bg_scroll = parse_vec2(s).map_err(|e| format!("--bg-scroll: {e}"))?;
@@ -242,18 +295,60 @@ fn main() {
         else {
             fail("--snapshot expects COLSxROWS, e.g. 120x40");
         };
-        println!("{}", snapshot(&cfg, &slots, ratio, w, h, cli.snapshot_time));
+        println!("{}", snapshot(&cfg, &slots, ratio, (w, h), cli.snapshot_time));
         return;
     }
+    let cmap = cfg.color_map().unwrap_or_else(|e| fail(format!("--color: {e}")));
 
     let perf = match cli.perf_log.as_deref().map(PerfLog::create).transpose() {
         Ok(p) => p,
         Err(e) => fail(format!("--perf-log: {e}")),
     };
-    if let Err(e) = run(&cfg, &slots, ratio, perf) {
+    setup_console(&cli, &mut cfg);
+    let flags = RunFlags {
+        exit_on_input: cli.exit_on_input,
+        console_fullscreen: cli.console_fullscreen,
+        wake_log: cli.wake_log.clone(),
+    };
+    if let Err(e) = run(&cfg, &slots, ratio, perf, cmap.as_ref(), flags) {
         restore_terminal();
         eprintln!("platomon: {e}");
         std::process::exit(1);
+    }
+}
+
+/// Screensaver switches for the run loop.
+#[derive(Debug, Clone)]
+struct RunFlags {
+    exit_on_input: bool,
+    console_fullscreen: bool,
+    wake_log: Option<PathBuf>,
+}
+
+/// `--console-font` / `--console-fullscreen` (Windows console only). The cell
+/// aspect of the new font replaces the configured one unless `--char-aspect`
+/// was given.
+fn setup_console(cli: &Cli, cfg: &mut Config) {
+    if cli.console_font.is_none() && !cli.console_fullscreen {
+        return;
+    }
+    #[cfg(windows)]
+    {
+        let font = cli
+            .console_font
+            .as_deref()
+            .map(|s| platomon::winconsole::parse_font(s).unwrap_or_else(|e| fail(format!("--console-font: {e}"))));
+        let measured = platomon::winconsole::setup(font.as_ref().map(|(f, h)| (f.as_str(), *h)), cli.console_fullscreen);
+        if let Some(a) = measured
+            && cli.char_aspect.is_none()
+        {
+            cfg.char_aspect = a.clamp(0.1, 4.0);
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = cfg;
+        eprintln!("platomon: --console-font / --console-fullscreen only apply to the Windows console; ignored");
     }
 }
 
@@ -288,6 +383,20 @@ fn list(what: ListWhat) {
                 println!("{:<10} {}", p.id(), p.describe());
             }
             println!("\nTiles alternate around --bg-lum by --bg-contrast; --bg-scale sets tile size.");
+        }
+        ListWhat::Gradients => {
+            println!("{:<9} {:<32} DESCRIPTION", "GRADIENT", "SWATCH (24-bit)");
+            for (id, desc, stops) in color::PRESETS {
+                let g = Gradient::from_stops(stops);
+                let mut bar = String::new();
+                for i in 0..32 {
+                    color::push_sgr(&mut bar, g.sample(i as f32 / 31.0, 1.0), ColorDepth::True);
+                    bar.push('█');
+                }
+                color::push_sgr(&mut bar, color::NONE, ColorDepth::True);
+                println!("{id:<9} {bar} {desc}");
+            }
+            println!("\nOr 2+ hex stops, dark/idle first: --color \"#000:#f80:#fff\". --color-reverse flips any gradient.");
         }
         ListWhat::Aspects => {
             println!("{:<8} {:>11}  RATIO", "PRESET", "RESOLUTION");
@@ -340,7 +449,14 @@ fn camera_params(cfg: &Config) -> CameraParams {
         height: cfg.orbit_height,
         bob: cfg.orbit_bob,
         seed: cfg.seed,
+        focus_zoom: cfg.focus_zoom,
+        focus_tau: cfg.focus_tau,
     }
+}
+
+fn build_scene(cfg: &Config, slots: &[SlotSpec]) -> Scene {
+    Scene::with_layout(&layouts(slots), &anim_params(cfg), &camera_params(cfg), cfg.layout)
+        .with_ground(&cfg.ground_params())
 }
 
 fn render_settings(cfg: &Config, ratio: Option<f32>) -> RenderSettings {
@@ -357,9 +473,10 @@ fn layouts(slots: &[SlotSpec]) -> Vec<SlotLayout> {
 }
 
 /// One frame with every slot at a fixed demo level.
-fn snapshot(cfg: &Config, slots: &[SlotSpec], ratio: Option<f32>, w: usize, h: usize, secs: f32) -> String {
+fn snapshot(cfg: &Config, slots: &[SlotSpec], ratio: Option<f32>, (w, h): (usize, usize), secs: f32) -> String {
     let anim = anim_params(cfg);
-    let mut scene = Scene::new(&layouts(slots), &anim, &camera_params(cfg)).with_ground(&cfg.ground_params());
+    let cmap = cfg.color_map().unwrap_or_else(|e| fail(format!("--color: {e}")));
+    let mut scene = build_scene(cfg, slots);
     let levels = [0.7, 0.5, 0.3, 0.9, 0.0, 0.6, 0.4, 0.8];
     let ch: Vec<Channel> = (0..slots.len())
         .map(|i| {
@@ -386,12 +503,15 @@ fn snapshot(cfg: &Config, slots: &[SlotSpec], ratio: Option<f32>, w: usize, h: u
         char_aspect: cfg.char_aspect,
         ramp: &Ramp::new(&cfg.ramp),
         exposure: cfg.exposure,
+        color: cmap.as_ref(),
+        levels: &ch.iter().map(|c| c.level).collect::<Vec<_>>(),
     };
     let mut overlays = Overlays::new(&scene);
     let mut s = String::new();
     if let Some(view) = r.view() {
         let cells = overlays.compose(&view, vp.w, vp.h, &scene, &opt);
-        ascii::compose_plain(cells, vp.w, vp.h, &mut s);
+        let colors = cells.colors.zip(cmap.as_ref().map(|m| m.depth));
+        ascii::compose_plain(cells.chars, colors, vp.w, vp.h, &mut s);
     }
     s
 }
@@ -404,16 +524,28 @@ fn legend_labels(readings: &[&Reading], size: u8, out: &mut Vec<String>) {
 
 // ------------------------------------------------------------------ terminal
 
+/// Mouse capture is only switched on for `--exit-on-input`.
+static MOUSE_CAPTURE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn restore_terminal() {
     let mut out = io::stdout();
-    let _ = execute!(out, terminal::EnableLineWrap, cursor::Show, terminal::LeaveAlternateScreen);
+    if MOUSE_CAPTURE.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        let _ = execute!(out, event::DisableMouseCapture);
+    }
+    let _ = execute!(
+        out,
+        crossterm::style::ResetColor,
+        terminal::EnableLineWrap,
+        cursor::Show,
+        terminal::LeaveAlternateScreen
+    );
     let _ = terminal::disable_raw_mode();
 }
 
 struct TerminalGuard;
 
 impl TerminalGuard {
-    fn enter() -> io::Result<Self> {
+    fn enter(mouse: bool) -> io::Result<Self> {
         terminal::enable_raw_mode()?;
         let guard = Self; // restores even if the next line fails
         execute!(
@@ -423,6 +555,10 @@ impl TerminalGuard {
             terminal::DisableLineWrap,
             terminal::Clear(terminal::ClearType::All)
         )?;
+        if mouse {
+            MOUSE_CAPTURE.store(true, std::sync::atomic::Ordering::SeqCst);
+            execute!(io::stdout(), event::EnableMouseCapture)?;
+        }
         Ok(guard)
     }
 }
@@ -548,11 +684,24 @@ impl PerfLog {
     }
 }
 
-fn run(cfg: &Config, slots: &[SlotSpec], ratio: Option<f32>, mut perf: Option<PerfLog>) -> io::Result<()> {
+fn run(
+    cfg: &Config,
+    slots: &[SlotSpec],
+    ratio: Option<f32>,
+    mut perf: Option<PerfLog>,
+    cmap: Option<&ColorMap>,
+    flags: RunFlags,
+) -> io::Result<()> {
+    let exit_on_input = flags.exit_on_input;
     install_panic_hook();
     let collector = Collector::spawn(cfg.poll_hz);
-    let _guard = TerminalGuard::enter()?;
+    let _guard = TerminalGuard::enter(exit_on_input)?;
     let mut out = io::stdout().lock();
+    let mut watch = exit_on_input.then(ui::InputWatch::new);
+    // Fullscreen console: pin the window again once the alternate screen is
+    // up and twice more while the console host settles.
+    let started = Instant::now();
+    let mut repins: &[f32] = if flags.console_fullscreen { &[0.0, 0.5, 1.5] } else { &[] };
 
     let (mut cols, mut rows) = terminal::size()?;
     let mut show_stats = cfg.show_stats;
@@ -563,10 +712,11 @@ fn run(cfg: &Config, slots: &[SlotSpec], ratio: Option<f32>, mut perf: Option<Pe
     let ramp = Ramp::new(&cfg.ramp);
     let specs: Vec<_> = slots.iter().map(|s| s.metric.clone()).collect();
 
-    let mut scene = Scene::new(&layouts(slots), &anim, &camera_params(cfg)).with_ground(&cfg.ground_params());
+    let mut scene = build_scene(cfg, slots);
     let mut metrics = MetricsState::new(cfg, &specs);
+    let mut levels: Vec<f32> = Vec::new();
     let weights = metrics.weights(&cfg.weights);
-    let mut fps = FrameClock::new(cfg.fps_min, cfg.fps_max, cfg.fps_curve, cfg.fps_slew);
+    let mut fps = FrameClock::new(cfg.fps_min, cfg.fps_max, cfg.fps_curve, cfg.fps_slew).inverted(cfg.fps_invert);
     let mut renderer = Renderer::new();
     let mut governor = QualityGovernor::default();
     let mut frame = String::with_capacity(cols as usize * rows as usize * 2 + 1024);
@@ -585,7 +735,19 @@ fn run(cfg: &Config, slots: &[SlotSpec], ratio: Option<f32>, mut perf: Option<Pe
         let wait_start = Instant::now();
         loop {
             while event::poll(Duration::ZERO)? {
-                match ui::map_event(&event::read()?) {
+                let ev = event::read()?;
+                if let Some(w) = watch.as_mut()
+                    && w.wakes(&ev)
+                {
+                    if let Some(p) = &flags.wake_log {
+                        let _ = std::fs::write(
+                            p,
+                            format!("woke after {:.2} s by {ev:?}\n", started.elapsed().as_secs_f32()),
+                        );
+                    }
+                    return Ok(());
+                }
+                match ui::map_event(&ev) {
                     Action::Quit => return Ok(()),
                     Action::ToggleStats => {
                         show_stats = !show_stats;
@@ -620,6 +782,19 @@ fn run(cfg: &Config, slots: &[SlotSpec], ratio: Option<f32>, mut perf: Option<Pe
             need_clear = true;
         }
 
+        if let Some((&at, rest)) = repins.split_first()
+            && started.elapsed().as_secs_f32() >= at
+        {
+            repins = rest;
+            #[cfg(windows)]
+            platomon::winconsole::repin();
+            need_clear = true;
+            // The window just moved under the pointer: not user input.
+            if let Some(w) = watch.as_mut() {
+                w.rearm();
+            }
+        }
+
         let dt = fps.begin_frame();
         if let Some(raw) = collector.latest() {
             metrics.ingest(&raw);
@@ -628,6 +803,8 @@ fn run(cfg: &Config, slots: &[SlotSpec], ratio: Option<f32>, mut perf: Option<Pe
         let channels = metrics.channels();
         fps.update_target(activity_score(&channels, &weights), dt);
         scene.update(&channels, &anim, dt);
+        levels.clear();
+        levels.extend(channels.iter().map(|c| if c.available { c.level } else { 0.0 }));
 
         let area_h = (rows as usize).saturating_sub(show_stats as usize);
         let vp = aspect::viewport(cols as usize, area_h, ratio, cfg.aspect_mode, cfg.char_aspect);
@@ -651,10 +828,13 @@ fn run(cfg: &Config, slots: &[SlotSpec], ratio: Option<f32>, mut perf: Option<Pe
             char_aspect: cfg.char_aspect,
             ramp: &ramp,
             exposure: cfg.exposure,
+            color: cmap,
+            levels: &levels,
         };
         if let Some(view) = renderer.view() {
             let cells = overlays.compose(&view, vp.w, vp.h, &scene, &opt);
-            ascii::compose_terminal(cells, &vp, (cols as usize, area_h), stats, &mut frame);
+            let colors = cells.colors.zip(cmap.map(|m| m.depth));
+            ascii::compose_terminal(cells.chars, colors, &vp, (cols as usize, area_h), stats, &mut frame);
         }
         let render_secs = t0.elapsed().as_secs_f32();
 

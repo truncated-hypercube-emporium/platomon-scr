@@ -8,6 +8,22 @@ license = "MIT OR Apache-2.0"
 [features]
 default = ["nvidia"]
 nvidia = ["dep:nvml-wrapper"]
+# Windows screensaver (platomon.scr). Build it with scripts/build-scr.ps1.
+screensaver = []
+
+[[bin]]
+name = "platomon"
+path = "src/main.rs"
+
+[[bin]]
+name = "platomon-scr"
+path = "src/bin/platomon-scr.rs"
+required-features = ["screensaver"]
+
+[[bin]]
+name = "platomon-config"
+path = "src/bin/platomon-config.rs"
+required-features = ["screensaver"]
 
 [dependencies]
 clap = { version = "4.6.8", features = ["derive"] }

@@ -42,6 +42,11 @@ jobs:
         run: cargo test ${{ env.FLAGS }} --lib -- --ignored --test-threads=1
       - name: Clippy
         run: cargo clippy --all-targets ${{ env.FLAGS }} -- -D warnings
+      - name: Screensaver (platomon.scr, platomon-config.exe)
+        if: runner.os == 'Windows'
+        run: |
+          cargo clippy --all-targets --features screensaver -- -D warnings
+          cargo test --features screensaver --lib
       - name: Smoke test (no terminal needed)
         run: |
           cargo run --release ${{ env.FLAGS }} -- --print-config
@@ -52,6 +57,9 @@ jobs:
           cargo run --release ${{ env.FLAGS }} -- --snapshot 80x24 --snapshot-time 5 --bg-pattern hex --bg-scroll 0.5:0 --bg-rotate ccw
           cargo run --release ${{ env.FLAGS }} -- --snapshot 80x24 --bg-lum 0
           cargo run --release ${{ env.FLAGS }} -- --snapshot 120x40 --wireframe --legend-size 4 --legend-pos br --legend-opacity 1
+          cargo run --release ${{ env.FLAGS }} -- --snapshot 120x40 --layout sphere --camera focus --snapshot-time 4 --color-by load --legend
+          cargo run --release ${{ env.FLAGS }} -- --snapshot 80x24 --color "#000:#f80:#fff" --color-depth 256
+          cargo run --release ${{ env.FLAGS }} -- --list gradients
           cargo run --release ${{ env.FLAGS }} -- --snapshot 80x24 --camera orbit --aspect uwqhd --show cpu,ram,disk,net,gpu,nic,disk-dev --ring nic=1 --solid cpu=truncated-icosahedron
       - name: Release build
         run: cargo build --release ${{ env.FLAGS }}
