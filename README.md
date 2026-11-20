@@ -365,8 +365,16 @@ screensaver interface. A master **Random look each run** switch (on by default) 
 every time; turn it off to use the look chosen below it instead: layout, camera, colour gradient and
 source, background pattern and luminosity, wireframe, stats bar, inverted frame rate and extra
 metrics (greyed out while the switch is on). The frame-rate cap (the display's refresh rate by
-default), the CPU budget used to size the text and the burn-in shift (on/off, frame interval,
-range) always apply. Settings are stored, like the Windows SDK screensaver sample does, in a private
+default), the CPU budget used to size the text, the text density, the number of luminosity levels
+and the burn-in shift (on/off, frame interval, range) always apply.
+
+**Text density.** The text is first sized so rendering fits the CPU budget, then (with the default
+double density) set at half that height, never below 4 px: twice the characters per axis, about 4x
+the rendering cost of the budget. Choose Standard to keep the budget-sized text.
+
+**Luminosity levels.** 10, 16 or 32 glyphs from dark to bright; Random keeps the random look's
+choice (usually 16, sometimes 10). The 32-level ramp `` `-.':"~=*+c7ix5ah6HmB80$MWNQg&@`` (after a
+blank) is the Consolas glyphs whose measured ink coverage is nearest to 32 even steps. Settings are stored, like the Windows SDK screensaver sample does, in a private
 INI file through `WritePrivateProfileString`: `%APPDATA%\platomon\screensaver.ini`, section
 `[platomon]`:
 
@@ -385,6 +393,8 @@ fps_invert=off         ; on | off
 extras=none            ; none | nic | disk | both
 fps_cap=display        ; or 30..240
 budget=15              ; percent
+density=2              ; 1 = standard | 2 = double
+levels=auto            ; auto | 10 | 16 | 32
 shift=on
 shift_min_frames=600
 shift_max_frames=3600

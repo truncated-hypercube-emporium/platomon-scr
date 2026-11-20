@@ -25,9 +25,12 @@ pub struct Display {
 
 /// Share of wall time spent rendering at the full frame rate (all cores).
 pub const RENDER_BUDGET: f32 = 0.15;
-/// Console font height range, pixels.
+/// Font height range for the budget sizing, pixels (before the density
+/// factor).
 pub const FONT_MIN: i16 = 8;
 pub const FONT_MAX: i16 = 40;
+/// Smallest font after the density factor, pixels.
+pub const FONT_FLOOR: i16 = 4;
 /// Width / height of a Consolas cell (only used to plan; the real value is
 /// measured once the font is set).
 pub const EST_CHAR_ASPECT: f32 = 0.55;
@@ -198,6 +201,15 @@ pub fn font_height(d: &Display, fps: f32, sec_per_cell: f32, budget: f32) -> (i1
     (px, cols, rows)
 }
 
+/// Divide the budget-sized font height by `density` (glyphs per axis per
+/// budget glyph; never below [`FONT_FLOOR`]). Returns (height, est. cols,
+/// est. rows).
+pub fn apply_density(d: &Display, px: i16, density: u8) -> (i16, u32, u32) {
+    let px = ((px as f32 / density.max(1) as f32).round() as i16).max(FONT_FLOOR);
+    let (w, h) = (d.width.max(320) as f32, d.height.max(200) as f32);
+    (px, (w / (px as f32 * EST_CHAR_ASPECT)).floor() as u32, (h / px as f32).floor() as u32)
+}
+
 /// Everything the launcher needs for one run.
 #[derive(Debug, Clone)]
 pub struct Plan {
@@ -221,8 +233,15 @@ pub fn plan(d: &Display, seed: u64, s: &ScrSettings) -> Result<Plan, String> {
     };
     config.sanitize();
     let spc = seconds_per_cell(&config)?;
+    match s.levels {
+        Levels::Auto => {}
+        Levels::L10 => config.ramp = crate::ascii::CLASSIC_RAMP.to_string(),
+        Levels::L16 => config.ramp = crate::ascii::DEFAULT_RAMP.to_string(),
+        Levels::L32 => config.ramp = crate::ascii::RAMP_32.to_string(),
+    }
     let budget = s.budget_pct as f32 / 100.0;
-    let (font_px, cols, rows) = font_height(d, config.fps_max, spc, budget);
+    let (px, ..) = font_height(d, config.fps_max, spc, budget);
+    let (font_px, cols, rows) = apply_density(d, px, s.density);
     Ok(Plan { config, font_px, est_grid: (cols, rows), sec_per_cell: spc, budget, settings: s.clone() })
 }
 
@@ -258,6 +277,29 @@ pub enum Extras {
     Both,
 }
 
+/// Number of luminosity levels (glyphs in the ramp).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Levels {
+    /// Part of the random look: usually 16, sometimes 10.
+    Auto,
+    L10,
+    L16,
+    L32,
+}
+
+fn levels_id(l: Levels) -> &'static str {
+    match l {
+        Levels::Auto => "auto",
+        Levels::L10 => "10",
+        Levels::L16 => "16",
+        Levels::L32 => "32",
+    }
+}
+
+fn parse_levels(v: &str) -> Option<Levels> {
+    [Levels::Auto, Levels::L10, Levels::L16, Levels::L32].into_iter().find(|l| levels_id(*l) == v)
+}
+
 /// The user's choices from the configuration dialog, stored in the
 /// screensaver's INI file.
 ///
@@ -283,8 +325,13 @@ pub struct ScrSettings {
     // --- always applied
     /// Frame-rate cap; `None` = the display's refresh rate.
     pub fps_cap: Option<u32>,
-    /// Rendering CPU budget, percent of wall time at full frame rate.
+    /// Rendering CPU budget, percent of wall time at full frame rate, for the
+    /// font size before the density factor.
     pub budget_pct: u8,
+    /// Glyphs per axis relative to the budget-sized font (1 or 2); 2 costs
+    /// about 4x the budget.
+    pub density: u8,
+    pub levels: Levels,
     /// OLED burn-in protection: move the picture 1 px at random intervals.
     pub shift: bool,
     pub shift_min_frames: u32,
@@ -309,6 +356,8 @@ impl Default for ScrSettings {
             extras: Extras::None,
             fps_cap: None,
             budget_pct: (RENDER_BUDGET * 100.0).round() as u8,
+            density: 2,
+            levels: Levels::Auto,
             shift: true,
             shift_min_frames: 600,
             shift_max_frames: 3600,
@@ -417,6 +466,12 @@ pub fn choices() -> Vec<Choice> {
         ),
         always("fps_cap", "Frame-rate cap", caps),
         always("budget", "CPU budget", budgets),
+        always("density", "Text density", vec![opt("1", "Standard"), opt("2", "Double (about 4x CPU)")]),
+        always(
+            "levels",
+            "Luminosity levels",
+            vec![opt("auto", "Random (10 or 16)"), opt("10", "10"), opt("16", "16"), opt("32", "32")],
+        ),
         always("shift_radius", "Burn-in shift range", (1..=4).map(|r| opt(&r.to_string(), &format!("\u{b1}{r} px"))).collect()),
     ]
 }
@@ -438,6 +493,8 @@ impl ScrSettings {
             ("extras", extras_id(self.extras).into()),
             ("fps_cap", self.fps_cap.map_or_else(|| "display".to_string(), |f| f.to_string())),
             ("budget", self.budget_pct.to_string()),
+            ("density", self.density.to_string()),
+            ("levels", levels_id(self.levels).into()),
             ("shift", on_off(self.shift)),
             ("shift_min_frames", self.shift_min_frames.to_string()),
             ("shift_max_frames", self.shift_max_frames.to_string()),
@@ -478,6 +535,8 @@ impl ScrSettings {
                 Some(v) => v.parse::<u32>().ok().filter(|f| (30..=240).contains(f)).or(d.fps_cap),
             },
             budget_pct: num("budget").filter(|b| (1..=100).contains(b)).map_or(d.budget_pct, |b| b as u8),
+            density: num("density").filter(|v| (1..=2).contains(v)).map_or(d.density, |v| v as u8),
+            levels: val("levels").and_then(|v| parse_levels(&v)).unwrap_or(d.levels),
             shift: flag("shift", d.shift),
             shift_min_frames: shift_min,
             shift_max_frames: shift_max,
@@ -620,6 +679,44 @@ mod tests {
     }
 
     #[test]
+    fn double_density_halves_the_font() {
+        let (px, cols, rows) = font_height(&WQHD, 144.0, 2e-7, RENDER_BUDGET);
+        let (px1, cols1, rows1) = apply_density(&WQHD, px, 1);
+        assert_eq!((px1, cols1, rows1), (px, cols, rows), "density 1 is unchanged");
+        let (px2, cols2, rows2) = apply_density(&WQHD, 20, 2);
+        assert_eq!(px2, 10);
+        assert_eq!((cols2, rows2), (465, 144));
+        assert_eq!(apply_density(&WQHD, FONT_MIN, 2).0, FONT_FLOOR);
+        assert_eq!(apply_density(&WQHD, 5, 2).0, FONT_FLOOR, "never below the floor");
+        // the plan uses it: same seed, density 2 ⇒ half the font (or the floor)
+        let one = plan(&WQHD, 5, &ScrSettings { density: 1, ..ScrSettings::default() }).unwrap();
+        let two = plan(&WQHD, 5, &ScrSettings::default()).unwrap();
+        assert_eq!(two.font_px, ((one.font_px as f32 / 2.0).round() as i16).max(FONT_FLOOR));
+        assert!(two.est_grid.0 > one.est_grid.0 && two.est_grid.1 > one.est_grid.1);
+    }
+
+    #[test]
+    fn luminosity_levels_pick_the_ramp() {
+        let ramp32 = crate::ascii::Ramp::new(crate::ascii::RAMP_32);
+        assert_eq!(ramp32.len(), 32);
+        let distinct: std::collections::HashSet<char> = crate::ascii::RAMP_32.chars().collect();
+        assert_eq!(distinct.len(), 32, "32 different glyphs");
+        assert!(crate::ascii::RAMP_32.starts_with(' '), "darkest is blank");
+        for random in [true, false] {
+            for (l, n) in [(Levels::L10, 10), (Levels::L16, 16), (Levels::L32, 32)] {
+                let p = plan(&WQHD, 2, &ScrSettings { levels: l, random, ..ScrSettings::default() }).unwrap();
+                assert_eq!(crate::ascii::Ramp::new(&p.config.ramp).len(), n, "{l:?}");
+            }
+        }
+        // auto keeps the random look's ramp
+        for seed in 0..20 {
+            let mut rng = fastrand::Rng::with_seed(seed);
+            let c = randomize(&mut rng, &WQHD);
+            assert_eq!(plan(&WQHD, seed, &ScrSettings::default()).unwrap().config.ramp, c.ramp);
+        }
+    }
+
+    #[test]
     fn plan_measures_and_records() {
         let p = plan(&WQHD, 3, &ScrSettings::default()).unwrap();
         assert!(p.sec_per_cell > 0.0 && p.sec_per_cell < 1e-3);
@@ -653,6 +750,8 @@ mod tests {
             extras: Extras::Both,
             fps_cap: Some(60),
             budget_pct: 25,
+            density: 1,
+            levels: Levels::L32,
             shift: false,
             shift_min_frames: 10,
             shift_max_frames: 20,
