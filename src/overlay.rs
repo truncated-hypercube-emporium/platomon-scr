@@ -389,6 +389,19 @@ pub struct OverlayOptions<'a> {
     pub levels: &'a [f32],
     /// Sound halo: a second wireframe of every solid, drawn on top.
     pub halo: Option<Halo>,
+    /// Per-slot halo sizes overriding `halo.factor` (empty = all solids use
+    /// `halo.factor`).
+    pub halo_factors: &'a [f32],
+}
+
+impl OverlayOptions<'_> {
+    /// Halo size per solid, or `None` without a halo.
+    fn halo_sizes(&self) -> Option<Vec<f32>> {
+        self.halo.map(|hl| {
+            let f = if self.halo_factors.is_empty() { &[hl.factor][..] } else { self.halo_factors };
+            f.iter().map(|v| if v.is_finite() { v.max(1.0) } else { 1.0 }).collect()
+        })
+    }
 }
 
 /// The sound halo for one frame.
@@ -445,8 +458,9 @@ fn cell_color(cm: &ColorMap, frame: &FrameView<'_>, ramp: &Ramp, levels: &[f32],
 }
 
 /// Mark every visible edge cell of every solid's wire model scaled by
-/// `factor` (1 = the solid itself) in `mask`; newly marked cells are also
-/// pushed to `list`.
+/// `factors[i]` for solid `i` (1 = the solid itself; past the end of
+/// `factors`, its last value) in `mask`; newly marked cells are also pushed
+/// to `list`.
 #[allow(clippy::too_many_arguments)]
 fn mark_edges(
     wires: &[Wire],
@@ -454,7 +468,7 @@ fn mark_edges(
     w: usize,
     h: usize,
     scene: &Scene,
-    factor: f32,
+    factors: &[f32],
     mask: &mut [bool],
     mut list: Option<&mut Vec<usize>>,
 ) {
@@ -465,6 +479,7 @@ fn mark_edges(
     let eye = proj.cam.pos;
     for (i, (inst, wire)) in scene.solids.iter().zip(wires).enumerate() {
         let rot = inst.inv_rot.transpose();
+        let factor = factors.get(i).or(factors.last()).copied().unwrap_or(1.0);
         let scale = inst.scale * factor;
         let front: Vec<bool> = wire
             .faces
@@ -555,8 +570,8 @@ impl Overlays {
             }
             let mut fresh = std::mem::take(&mut self.scratch);
             fresh.clear();
-            if let Some(hl) = opt.halo {
-                mark_edges(&self.wires, frame, w, h, scene, hl.factor.max(1.0), &mut self.halo_mask, Some(&mut fresh));
+            if let Some(sizes) = opt.halo_sizes() {
+                mark_edges(&self.wires, frame, w, h, scene, &sizes, &mut self.halo_mask, Some(&mut fresh));
             }
             let lum_on = opt.halo.map_or(0.0, |hl| hl.lum);
             for &c in self.halo_cells.iter().chain(&fresh) {
@@ -621,7 +636,7 @@ impl Overlays {
         if opt.wireframe {
             self.mask.clear();
             self.mask.resize(w * h, false);
-            mark_edges(&self.wires, frame, w, h, scene, 1.0, &mut self.mask, None);
+            mark_edges(&self.wires, frame, w, h, scene, &[1.0], &mut self.mask, None);
             for (l, &m) in self.lum.iter_mut().zip(&self.mask) {
                 if m {
                     *l = invert(*l);
@@ -642,9 +657,9 @@ impl Overlays {
         self.halo_mask.clear();
         self.halo_mask.resize(w * h, false);
         self.halo_cells.clear();
-        if let Some(hl) = opt.halo {
+        if let (Some(hl), Some(sizes)) = (opt.halo, opt.halo_sizes()) {
             self.base.clone_from(&self.lum);
-            mark_edges(&self.wires, frame, w, h, scene, hl.factor.max(1.0), &mut self.halo_mask, Some(&mut self.halo_cells));
+            mark_edges(&self.wires, frame, w, h, scene, &sizes, &mut self.halo_mask, Some(&mut self.halo_cells));
             for &c in &self.halo_cells {
                 self.lum[c] = hl.lum;
             }
@@ -843,6 +858,7 @@ mod tests {
             color,
             levels: &levels,
             halo,
+            halo_factors: &[],
         };
         let out = o.compose(&view, W, H, &scene, &opt);
         (plain, out.chars.to_vec(), out.colors.map(<[u32]>::to_vec), view.ids.to_vec())
@@ -980,6 +996,7 @@ mod tests {
                 color: cm,
                 levels: &levels,
                 halo,
+                halo_factors: &[],
             };
             let steps = [
                 Some(Halo { factor: 1.15, lum: 0.2 }),
@@ -1010,6 +1027,61 @@ mod tests {
                 assert_eq!(chars, f.chars, "step {k} ({wireframe}, {:?}) glyphs", cm.map(|c| c.by));
                 assert_eq!(colors.as_deref(), f.colors, "step {k} colours");
             }
+        }
+    }
+
+    #[test]
+    fn per_solid_halo_sizes_move_only_their_solid() {
+        let scene = Scene::demo(&AnimParams::default());
+        let mut r = Renderer::new();
+        r.render(&scene, W, H, &RenderSettings { spp: 1, ..RenderSettings::default() });
+        let view = r.view().unwrap();
+        let ramp = Ramp::default();
+        let centres: Vec<(f32, f32)> = scene.solids.iter().filter_map(|s| view.proj.project(s.center)).collect();
+        let opt = |f: &'static [f32]| OverlayOptions {
+            wireframe: false,
+            legend: None,
+            labels: &[],
+            char_aspect: 0.5,
+            ramp: &ramp,
+            exposure: 1.0,
+            color: None,
+            levels: &[],
+            halo: Some(Halo { factor: 1.2, lum: 1.0 }),
+            halo_factors: f,
+        };
+        let calm: &'static [f32] = &[1.15; 5];
+        let base = Overlays::new(&scene).compose(&view, W, H, &scene, &opt(calm)).chars.to_vec();
+        // the factors override `halo.factor`
+        let single = Overlays::new(&scene).compose(&view, W, H, &scene, &opt(&[])).chars.to_vec();
+        assert_ne!(base, single);
+        let bumps: [&'static [f32]; 5] = [
+            &[1.4, 1.15, 1.15, 1.15, 1.15],
+            &[1.15, 1.4, 1.15, 1.15, 1.15],
+            &[1.15, 1.15, 1.4, 1.15, 1.15],
+            &[1.15, 1.15, 1.15, 1.4, 1.15],
+            &[1.15, 1.15, 1.15, 1.15, 1.4],
+        ];
+        let mut inc = Overlays::new(&scene);
+        inc.compose(&view, W, H, &scene, &opt(calm));
+        for (k, f) in bumps.into_iter().enumerate() {
+            let out = Overlays::new(&scene).compose(&view, W, H, &scene, &opt(f)).chars.to_vec();
+            let diff: Vec<usize> = (0..W * H).filter(|&i| out[i] != base[i]).collect();
+            assert!(!diff.is_empty(), "solid {k}'s halo moved");
+            let nearest = |i: usize| {
+                let (x, y) = ((i % W) as f32 + 0.5, (i / W) as f32 + 0.5);
+                (0..centres.len())
+                    .min_by(|&a, &b| {
+                        let d = |c: (f32, f32)| ((x - c.0) * 0.5).hypot(y - c.1);
+                        d(centres[a]).total_cmp(&d(centres[b]))
+                    })
+                    .unwrap()
+            };
+            let near_k = diff.iter().filter(|&&i| nearest(i) == k).count();
+            assert!(near_k * 10 >= diff.len() * 8, "solid {k}: {near_k}/{} changed cells near it", diff.len());
+            // halo-only updates agree with a full compose
+            let u = inc.update_halo(&view, W, H, &scene, &opt(f));
+            assert_eq!(u.chars, &out[..], "solid {k}: incremental matches full");
         }
     }
 

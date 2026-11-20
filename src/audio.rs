@@ -15,6 +15,7 @@
 pub struct Envelope {
     env: f32,
     reference: f32,
+    floor: f32,
 }
 
 impl Default for Envelope {
@@ -34,7 +35,14 @@ impl Envelope {
     pub const REF_FLOOR: f32 = 0.05;
 
     pub fn new() -> Self {
-        Self { env: 0.0, reference: Self::REF_FLOOR }
+        Self::with_floor(Self::REF_FLOOR)
+    }
+
+    /// An envelope whose auto-gain reference never falls below `floor`
+    /// (smaller for quiet signals such as single treble bands).
+    pub fn with_floor(floor: f32) -> Self {
+        let floor = if floor.is_finite() { floor.clamp(1e-4, 1.0) } else { Self::REF_FLOOR };
+        Self { env: 0.0, reference: floor, floor }
     }
 
     /// Feed the reading since the last call; returns the level 0..=1.
@@ -43,12 +51,24 @@ impl Envelope {
         let dt = dt.clamp(0.0, 1.0);
         let tau = if p > self.env { Self::ATTACK } else { Self::RELEASE };
         self.env += (p - self.env) * (1.0 - (-dt / tau).exp());
-        self.reference = (self.reference * (-dt / Self::GAIN_DECAY).exp()).max(self.env).max(Self::REF_FLOOR);
+        self.reference = (self.reference * (-dt / Self::GAIN_DECAY).exp()).max(self.env).max(self.floor);
         self.level()
     }
 
     pub fn level(&self) -> f32 {
         (self.env / self.reference).clamp(0.0, 1.0)
+    }
+
+    /// The auto-gain reference (what counts as full level now).
+    pub fn reference(&self) -> f32 {
+        self.reference
+    }
+
+    /// Change the smallest reference; takes effect on the next update.
+    pub fn set_floor(&mut self, floor: f32) {
+        if floor.is_finite() {
+            self.floor = floor.clamp(1e-4, 1.0);
+        }
     }
 }
 
@@ -85,6 +105,95 @@ pub fn band_weight(b: usize) -> f32 {
 pub fn bass_weighted(bands: &[f32; BANDS]) -> f32 {
     let v: f32 = bands.iter().enumerate().map(|(b, &e)| band_weight(b) * if e.is_finite() { e.max(0.0) } else { 0.0 }).sum();
     v.clamp(0.0, 1.0)
+}
+
+// ------------------------------------------------------- solids ↔ frequencies
+
+/// Auto-gain floor for a solid's band level ([`band_mix`]): single bands,
+/// treble especially, are far quieter than the overall peak.
+pub const BAND_REF_FLOOR: f32 = 0.01;
+/// Width (in bands, one standard deviation) of a solid's slice of the
+/// spectrum in [`band_mix`]: neighbouring solids overlap a little.
+pub const BAND_SPREAD: f32 = 1.25;
+
+/// How complex a solid is: its edge count (= faces + vertices − 2), faces
+/// breaking ties (the icosahedron ranks above the dodecahedron).
+pub fn complexity(kind: crate::scene::sdf::SolidKind) -> f32 {
+    let (f, v) = kind.counts();
+    (f + v - 2) as f32 * (1.0 + f as f32 / 1000.0)
+}
+
+/// Each solid's place on the frequency gradient, 0 (bass) ..= 1 (treble):
+/// the simplest solid in the scene gets 0, the most complex 1, the rest in
+/// between on a log scale of [`complexity`]. Equal solids share a place; a
+/// scene of one kind sits in the middle.
+pub fn frequency_gradient(kinds: &[crate::scene::sdf::SolidKind]) -> Vec<f32> {
+    let c: Vec<f32> = kinds.iter().map(|&k| complexity(k).ln()).collect();
+    let (lo, hi) = c.iter().fold((f32::MAX, f32::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+    c.iter().map(|&v| if hi - lo > 1e-6 { (v - lo) / (hi - lo) } else { 0.5 }).collect()
+}
+
+/// Frequency where [`tilt`] is 1, Hz.
+pub const TILT_HZ: f32 = 1000.0;
+
+/// Spectral tilt correction for band `b`: `√(f / TILT_HZ)`. Music falls off
+/// about 3 dB per octave (a pink spectrum), so after this every band of
+/// typical material reads about equally loud and treble solids move too.
+pub fn tilt(b: usize) -> f32 {
+    (band_centre(b) / TILT_HZ).sqrt()
+}
+
+/// A solid's level from the band amplitudes: a Gaussian-weighted average of
+/// the tilt-corrected bands around band `pos × (BANDS − 1)`, so `pos` 0
+/// hears the bass and 1 the treble.
+pub fn band_mix(bands: &[f32; BANDS], pos: f32) -> f32 {
+    let p = if pos.is_finite() { pos.clamp(0.0, 1.0) } else { 0.0 };
+    let centre = p * (BANDS - 1) as f32;
+    let (mut sum, mut wsum) = (0.0, 0.0);
+    for (b, &a) in bands.iter().enumerate() {
+        let d = (b as f32 - centre) / BAND_SPREAD;
+        let w = (-0.5 * d * d).exp();
+        sum += w * tilt(b) * if a.is_finite() { a.clamp(0.0, 1.0) } else { 0.0 };
+        wsum += w;
+    }
+    (sum / wsum).min(1.0)
+}
+
+/// Each solid's auto-gain never reaches below this share of the loudest
+/// solid's: a sound with nothing in a solid's slice leaves it calm instead
+/// of amplifying the leftovers to full size.
+pub const BAND_RELATIVE_FLOOR: f32 = 0.1;
+
+/// Per-solid levels 0..=1 from the spectrum, each solid listening to its
+/// place on the frequency gradient ([`frequency_gradient`]).
+#[derive(Debug, Clone)]
+pub struct SolidLevels {
+    places: Vec<f32>,
+    env: Vec<Envelope>,
+    levels: Vec<f32>,
+}
+
+impl SolidLevels {
+    pub fn new(places: Vec<f32>) -> Self {
+        let env = places.iter().map(|_| Envelope::with_floor(BAND_REF_FLOOR)).collect();
+        let levels = vec![0.0; places.len()];
+        Self { places, env, levels }
+    }
+
+    pub fn places(&self) -> &[f32] {
+        &self.places
+    }
+
+    /// Feed the latest band amplitudes; returns one level per solid.
+    pub fn update(&mut self, bands: &[f32; BANDS], dt: f32) -> &[f32] {
+        let loudest = self.env.iter().map(Envelope::reference).fold(0.0, f32::max);
+        let floor = BAND_REF_FLOOR.max(BAND_RELATIVE_FLOOR * loudest);
+        for ((&p, e), l) in self.places.iter().zip(&mut self.env).zip(&mut self.levels) {
+            e.set_floor(floor);
+            *l = e.update(band_mix(bands, p), dt);
+        }
+        &self.levels
+    }
 }
 
 /// In-place radix-2 complex FFT; `re.len()` must be a power of two.
@@ -699,6 +808,78 @@ mod tests {
         eprintln!("highest output peak over 2 s: {max:.3}");
         eprintln!("highest band amplitudes (low→high): {}", bands.join(" "));
         eprintln!("bass-weighted: {:.3}", bass_weighted(&bmax));
+    }
+
+    #[test]
+    fn simple_solids_get_bass_complex_ones_treble() {
+        use crate::scene::sdf::SolidKind as K;
+        let kinds = [K::Icosahedron, K::Cube, K::Tetrahedron, K::Dodecahedron, K::Octahedron];
+        let g = frequency_gradient(&kinds);
+        assert_eq!(g[2], 0.0, "tetrahedron: lowest");
+        assert_eq!(g[0], 1.0, "icosahedron: highest");
+        assert!(g[2] < g[1] && g[1] < g[4] && g[4] < g[3] && g[3] < g[0], "gradient order {g:?}");
+        // one kind only: middle of the spectrum
+        assert_eq!(frequency_gradient(&[K::Cube, K::Cube]), vec![0.5, 0.5]);
+        // Archimedean solids extend the scale
+        let g = frequency_gradient(&[K::Tetrahedron, K::Icosahedron, K::TruncatedIcosahedron]);
+        assert!(g[0] == 0.0 && g[1] > 0.3 && g[1] < 0.8 && g[2] == 1.0, "{g:?}");
+    }
+
+    #[test]
+    fn band_mix_follows_the_solids_place() {
+        let mut a = Analyzer::new();
+        let rate = 48_000.0;
+        let bin = |k: f32| k * rate / FFT_N as f32;
+        let bass = a.bands(&sine(bin(2.0), 0.5, rate), rate);
+        let treble = a.bands(&sine(bin(300.0), 0.5, rate), rate);
+        // a bass tone moves the bass solid, not the treble one, and vice versa
+        assert!(band_mix(&bass, 0.0) > 5.0 * band_mix(&bass, 1.0), "{bass:?}");
+        assert!(band_mix(&treble, 1.0) > 5.0 * band_mix(&treble, 0.0), "{treble:?}");
+        // in between, the level slides along the gradient
+        let mid: Vec<f32> = (0..=4).map(|i| band_mix(&treble, i as f32 / 4.0)).collect();
+        assert!(mid.windows(2).all(|w| w[0] <= w[1] + 1e-6), "{mid:?}");
+        assert_eq!(band_mix(&[0.0; BANDS], 0.5), 0.0);
+        assert_eq!(band_mix(&[f32::NAN; BANDS], f32::NAN), 0.0);
+        // band envelopes auto-gain small levels
+        let mut e = Envelope::with_floor(BAND_REF_FLOOR);
+        let mut l = 0.0;
+        for _ in 0..30 {
+            l = e.update(0.02, 1.0 / 60.0);
+        }
+        assert!(l > 0.95, "{l}");
+    }
+
+    #[test]
+    fn solid_levels_split_the_spectrum() {
+        let mut a = Analyzer::new();
+        let rate = 48_000.0;
+        let bin = |k: f32| k * rate / FFT_N as f32;
+        let dt = 1.0 / 60.0;
+        let run = |bands: [f32; BANDS]| {
+            let mut s = SolidLevels::new(vec![0.0, 0.5, 1.0]);
+            for _ in 0..120 {
+                s.update(&bands, dt);
+            }
+            s.update(&bands, dt).to_vec()
+        };
+        // a bass tone: the simplest solid at full size, the most complex calm
+        let l = run(a.bands(&sine(bin(2.0), 0.3, rate), rate));
+        assert!(l[0] > 0.9 && l[2] < 0.15, "bass tone {l:?}");
+        // a treble tone: the other way round
+        let l = run(a.bands(&sine(bin(400.0), 0.3, rate), rate));
+        assert!(l[2] > 0.9 && l[0] < 0.15, "treble tone {l:?}");
+        // a mid tone: the middle solid leads
+        let l = run(a.bands(&sine(bin(25.0), 0.3, rate), rate));
+        assert!(l[1] > 0.9 && l[0] < 0.5 && l[2] < 0.5, "mid tone {l:?}");
+        // a pink-ish spectrum (falling 3 dB/octave, like music): all move
+        let mut pink = [0.0; BANDS];
+        for (b, v) in pink.iter_mut().enumerate() {
+            *v = 0.05 / tilt(b);
+        }
+        let l = run(pink);
+        assert!(l.iter().all(|&v| v > 0.9), "pink {l:?}");
+        // silence: all still
+        assert!(run([0.0; BANDS]).iter().all(|&v| v == 0.0));
     }
 
     #[test]

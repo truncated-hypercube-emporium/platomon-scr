@@ -1,4 +1,4 @@
-# platomon 1.3
+# platomon 1.3.1
 
 A terminal system monitor: one path-traced polyhedron per metric, rendered in monochrome ASCII on
 concentric rings. Each solid's scale and spin follow its metric; the frame rate (5–150 fps) follows
@@ -340,13 +340,21 @@ At that resolution expect the adaptive quality to drop to `q-1`/`q-2` and tens o
 ## Windows screensaver
 
 **Download:** `platomon.scr` and `platomon-config.exe` are attached to the
-[v1.3 release](https://github.com/truncated-hypercube-emporium/platomon-scr/releases/tag/v1.3)
+[v1.3.1 release](https://github.com/truncated-hypercube-emporium/platomon-scr/releases/tag/v1.3.1)
 (64-bit Windows 10/11, no installer, no dependencies). To build them yourself,
 `scripts\build-scr.ps1` writes both to `dist\`.
 
 To install, copy both files to `C:\Windows\System32` (administrator rights needed), or right-click
 `platomon.scr` › Install, then choose **platomon** in Settings › Personalization › Lock screen ›
 Screen saver. `platomon-config.exe` opens the same settings dialog as the Settings… button there.
+The `install` folder has both files and `install-platomon-scr.bat`, which moves them there (asking for
+administrator rights).
+
+**New in 1.3.1:**
+
+- **Halo bounce by frequency** (on by default): each solid's halo follows its own part of the
+  spectrum, the simplest solid in the scene the bass and the most complex the treble, on a gradient
+  in between. *Halo bounce source* › Overall level brings back one size for all.
 
 **New in 1.3:**
 
@@ -402,6 +410,16 @@ halo bright and treble-only or silent passages leave it dim. Both size and brigh
 (fast rise, slower fall) and auto-gained over the last few seconds, so quiet material moves them
 as well. The halo is hidden behind nearer solids.
 
+**Halo bounce by frequency** (on by default; *Halo bounce source* in the dialog). Each solid's halo
+size follows its own slice of the spectrum instead of the overall level. Solids are ranked by
+complexity (edge count, faces breaking ties) and placed on a log gradient from the simplest in the
+scene (the bass, 20 Hz) to the most complex (the treble, 16 kHz): with the five Platonic solids the
+tetrahedron hears sub-bass, the cube and octahedron about 350 Hz, the dodecahedron and icosahedron
+about 12 kHz. Each solid takes a Gaussian-weighted average of the bands around its place. The bands
+are first tilted by √(f / 1 kHz) so typical music (falling about 3 dB per octave) moves every solid,
+and each solid's auto-gain stays at least a tenth of the loudest solid's, so a bass-only sound leaves
+the treble solids calm. The run log lists each solid's place and its size range and average.
+
 The halo runs at the display's refresh rate (or the frame-rate cap) independently of the full
 frames: between renders only the halo is recomputed, and only the cells it changes are redrawn
 (about 0.5–0.7 ms per halo frame at 2560×1440). Full frames keep rendering within the CPU budget,
@@ -437,6 +455,7 @@ density=2              ; 1 = standard | 2 = double
 levels=auto            ; auto | 10 | 16 | 32
 sound=on               ; sound halo from the default output device
 halo_wide=off          ; on = halo size swing ±30% of the radius instead of ±5%
+halo_bands=on          ; on = each solid's halo follows its frequency band; off = overall level
 shift=on
 shift_min_frames=600
 shift_max_frames=3600

@@ -338,6 +338,10 @@ pub struct ScrSettings {
     /// Wide halo swing: the halo shrinks and grows an extra ±25% of the
     /// radius (0.9x..1.5x instead of 1.15x..1.25x).
     pub halo_wide: bool,
+    /// Frequency gradient: each solid's halo bounces to its own part of the
+    /// spectrum, the simplest solid to the bass and the most complex to the
+    /// treble; off = every halo follows the overall level.
+    pub halo_bands: bool,
     /// OLED burn-in protection: move the picture 1 px at random intervals.
     pub shift: bool,
     pub shift_min_frames: u32,
@@ -366,6 +370,7 @@ impl Default for ScrSettings {
             levels: Levels::Auto,
             sound: true,
             halo_wide: false,
+            halo_bands: true,
             shift: true,
             shift_min_frames: 600,
             shift_max_frames: 3600,
@@ -489,6 +494,14 @@ pub fn choices() -> Vec<Choice> {
             vec![opt("off", "\u{b1}5% of radius"), opt("on", "\u{b1}30% of radius (extra \u{b1}25%)")],
         ),
         always(
+            "halo_bands",
+            "Halo bounce source",
+            vec![
+                opt("on", "Frequency by solid (simple = bass, complex = treble)"),
+                opt("off", "Overall level (all solids together)"),
+            ],
+        ),
+        always(
             "shift_radius",
             "Burn-in shift range",
             (1..=SHIFT_RADIUS_MAX).map(|r| opt(&r.to_string(), &format!("\u{b1}{r} px"))).collect(),
@@ -517,6 +530,7 @@ impl ScrSettings {
             ("levels", levels_id(self.levels).into()),
             ("sound", on_off(self.sound)),
             ("halo_wide", on_off(self.halo_wide)),
+            ("halo_bands", on_off(self.halo_bands)),
             ("shift", on_off(self.shift)),
             ("shift_min_frames", self.shift_min_frames.to_string()),
             ("shift_max_frames", self.shift_max_frames.to_string()),
@@ -561,6 +575,7 @@ impl ScrSettings {
             levels: val("levels").and_then(|v| parse_levels(&v)).unwrap_or(d.levels),
             sound: flag("sound", d.sound),
             halo_wide: flag("halo_wide", d.halo_wide),
+            halo_bands: flag("halo_bands", d.halo_bands),
             shift: flag("shift", d.shift),
             shift_min_frames: shift_min,
             shift_max_frames: shift_max,
@@ -780,6 +795,7 @@ mod tests {
             levels: Levels::L32,
             sound: false,
             halo_wide: true,
+            halo_bands: false,
             shift: false,
             shift_min_frames: 10,
             shift_max_frames: 20,

@@ -35,7 +35,7 @@ mod win {
 
     use platomon::aspect;
     use platomon::ascii::Ramp;
-    use platomon::audio::{Envelope, OutputMeter, bass_weighted};
+    use platomon::audio::{Envelope, OutputMeter, SolidLevels, bass_weighted, frequency_gradient};
     use platomon::config::Config;
     use platomon::clock::FrameClock;
     use platomon::collector::Collector;
@@ -725,7 +725,15 @@ mod win {
         let mut governor = QualityGovernor::default();
         let mut overlays = Overlays::new(&scene);
         let mut levels: Vec<f32> = Vec::new();
-        let mut sound = s.sound.then(|| SoundHalo::new(s.halo_wide));
+        let mut sound = s.sound.then(|| {
+            let places = if s.halo_bands {
+                let kinds: Vec<_> = scene.solids.iter().map(|i| i.poly.kind()).collect();
+                frequency_gradient(&kinds)
+            } else {
+                Vec::new()
+            };
+            SoundHalo::new(s.halo_wide, places)
+        });
         // Halo-only frames between renders, at the frame-rate cap (the
         // display's refresh rate unless capped lower).
         let halo_every = Duration::from_secs_f32(1.0 / cfg.fps_max.max(1.0));
@@ -741,11 +749,25 @@ mod win {
         let mut spent = [0.0f64; 5];
         // Burn-in shift: largest drift reached per axis, and moves made.
         let (mut shift_reach, mut shift_moves) = ((0i32, 0i32), 0u64);
+        let scene_kinds: Vec<_> = scene.solids.iter().map(|i| i.poly.kind()).collect();
         let report = |full: u64, halo: u64, cells: u64, secs: f32, spent: &[f64; 5], sound: Option<&SoundHalo>, shift: ((i32, i32), u64)| {
             let ms = |s: f64, n: u64| s * 1e3 / n.max(1) as f64;
             let halo_line = sound.filter(|s| s.range.0 <= s.range.1).map_or_else(
                 || "sound halo off\n".to_string(),
-                |s| format!("halo size {:.3}x..{:.3}x of radius (wide {})\n", s.range.0, s.range.1, s.wide),
+                |s| {
+                    let mut t = format!("halo size {:.3}x..{:.3}x of radius (wide {})\n", s.range.0, s.range.1, s.wide);
+                    if s.solid.places().is_empty() {
+                        t += "halo bounce: overall level\n";
+                    } else {
+                        t += "halo bounce by frequency (place 0 = bass, 1 = treble):\n";
+                        for (i, ((p, r), sum)) in s.solid.places().iter().zip(&s.solid_range).zip(&s.solid_sum).enumerate() {
+                            let kind = scene_kinds.get(i).map_or("?", |k| k.id());
+                            let avg = sum / s.updates.max(1) as f64;
+                            t += &format!("  {kind} place {p:.2}: {:.3}x..{:.3}x, average {avg:.3}x\n", r.0, r.1);
+                        }
+                    }
+                    t
+                },
             );
             let shift_line = format!("burn-in shift {} moves, reached {} px x, {} px y\n", shift.1, shift.0.0, shift.0.1);
             let text = halo_line + &shift_line + &format!(
@@ -801,7 +823,8 @@ mod win {
                     next_halo = Some(if next > now { next } else { now + halo_every });
                     let th = Instant::now();
                     if let Some(view) = renderer.view() {
-                        let opt = options(&cfg, &ramp, cmap.as_ref(), &levels, Some(sh.next()));
+                        let hl = sh.next();
+                        let opt = options(&cfg, &ramp, cmap.as_ref(), &levels, Some(hl), &sh.factors);
                         let u = overlays.update_halo(&view, vp.w, vp.h, &scene, &opt);
                         screen.draw_dirty(u.dirty, vp.w, u.chars, u.colors);
                         screen.present();
@@ -849,7 +872,8 @@ mod win {
             let r = (t1 - t0).as_secs_f32();
             render_avg = if render_avg == 0.0 { r } else { 0.9 * render_avg + 0.1 * r };
             if let Some(view) = renderer.view() {
-                let opt = options(&cfg, &ramp, cmap.as_ref(), &levels, halo);
+                let factors = sound.as_ref().map_or(&[][..], |s| &s.factors[..]);
+                let opt = options(&cfg, &ramp, cmap.as_ref(), &levels, halo, factors);
                 let cells = overlays.compose(&view, vp.w, vp.h, &scene, &opt);
                 let t2 = Instant::now();
                 spent[1] += (t2 - t1).as_secs_f64();
@@ -877,7 +901,9 @@ mod win {
     }
 
     /// The default output device's level (halo size) and bass-weighted
-    /// spectrum (halo brightness), each smoothed and auto-gained.
+    /// spectrum (halo brightness), each smoothed and auto-gained. With the
+    /// frequency gradient on, each solid's halo size follows its own slice of
+    /// the spectrum instead: simple solids the bass, complex ones the treble.
     struct SoundHalo {
         meter: OutputMeter,
         size: Envelope,
@@ -885,29 +911,56 @@ mod win {
         last: Instant,
         /// Extra ±25% size swing.
         wide: bool,
+        /// Per-solid levels from their places on the gradient (0 = bass,
+        /// 1 = treble); no places = one size for all.
+        solid: SolidLevels,
+        /// This frame's per-solid sizes (empty when `places` is).
+        factors: Vec<f32>,
         /// Smallest and largest size used, for the run log.
         range: (f32, f32),
+        /// Per-solid smallest and largest size, for the run log.
+        solid_range: Vec<(f32, f32)>,
+        /// Per-solid sum of sizes over `updates` frames (average for the log).
+        solid_sum: Vec<f64>,
+        updates: u64,
     }
 
     impl SoundHalo {
-        fn new(wide: bool) -> Self {
+        fn new(wide: bool, places: Vec<f32>) -> Self {
+            let n = places.len();
             Self {
                 meter: OutputMeter::spawn(),
                 size: Envelope::new(),
                 bass: Envelope::new(),
                 last: Instant::now(),
                 wide,
+                solid: SolidLevels::new(places),
+                factors: Vec::with_capacity(n),
                 range: (f32::MAX, f32::MIN),
+                solid_range: vec![(f32::MAX, f32::MIN); n],
+                solid_sum: vec![0.0; n],
+                updates: 0,
             }
         }
 
         fn next(&mut self) -> Halo {
             let dt = self.last.elapsed().as_secs_f32();
             self.last = Instant::now();
+            let bands = self.meter.bands();
             let size = self.size.update(self.meter.take_peak(), dt);
-            let bass = self.bass.update(bass_weighted(&self.meter.bands()), dt);
+            let bass = self.bass.update(bass_weighted(&bands), dt);
             let factor = halo_factor(size, self.wide);
             self.range = (self.range.0.min(factor), self.range.1.max(factor));
+            self.factors.clear();
+            self.updates += 1;
+            for (&l, r) in self.solid.update(&bands, dt).iter().zip(&mut self.solid_range) {
+                let f = halo_factor(l, self.wide);
+                *r = (r.0.min(f), r.1.max(f));
+                self.factors.push(f);
+            }
+            for (s, &f) in self.solid_sum.iter_mut().zip(&self.factors) {
+                *s += f as f64;
+            }
             Halo { factor, lum: halo_lum(bass) }
         }
     }
@@ -918,6 +971,7 @@ mod win {
         color: Option<&'a ColorMap>,
         levels: &'a [f32],
         halo: Option<Halo>,
+        halo_factors: &'a [f32],
     ) -> OverlayOptions<'a> {
         OverlayOptions {
             wireframe: cfg.wireframe,
@@ -929,6 +983,7 @@ mod win {
             color,
             levels,
             halo,
+            halo_factors,
         }
     }
 
