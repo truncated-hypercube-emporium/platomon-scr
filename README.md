@@ -361,25 +361,28 @@ default), the whole character grid moves 1 px horizontally and 1 px vertically, 
 
 **Settings.** Screen Saver Settings › Settings… (`platomon.scr /c`) and `platomon-config.exe` open
 the same dialog, run by a dialog procedure named `ScreenSaverConfigureDialog` as in the Win32
-screensaver interface. Each look parameter can be left on Random or fixed: layout, camera, colour
-gradient and source, background pattern and luminosity, wireframe, stats bar, inverted frame rate
-and extra metrics. You can also set the frame-rate cap (the display's refresh rate by default), the
-CPU budget used to size the text, and the burn-in shift (on/off, frame interval, range). Settings are
-stored, like the Windows SDK screensaver sample does, in a private INI file through
-`WritePrivateProfileString`: `%APPDATA%\platomon\screensaver.ini`, section `[platomon]`:
+screensaver interface. A master **Random look each run** switch (on by default) picks the look anew
+every time; turn it off to use the look chosen below it instead: layout, camera, colour gradient and
+source, background pattern and luminosity, wireframe, stats bar, inverted frame rate and extra
+metrics (greyed out while the switch is on). The frame-rate cap (the display's refresh rate by
+default), the CPU budget used to size the text and the burn-in shift (on/off, frame interval,
+range) always apply. Settings are stored, like the Windows SDK screensaver sample does, in a private
+INI file through `WritePrivateProfileString`: `%APPDATA%\platomon\screensaver.ini`, section
+`[platomon]`:
 
 ```ini
 [platomon]
-layout=random          ; rings | sphere
-camera=random          ; static | orbit | focus
-color=random           ; off | inferno | viridis | ... (see --list gradients)
-color_by=random        ; lum | load
-bg_pattern=random      ; solid | checker | diamond | brick | triangles | hex | radial
-bg_lum=random          ; 0..10
-wireframe=random       ; on | off
-stats=random           ; on | off
-fps_invert=random      ; on | off
-extras=random          ; none | nic | disk | both
+random=on              ; on = random look each run; off = use the look below
+layout=rings           ; rings | sphere
+camera=orbit           ; static | orbit | focus
+color=inferno          ; off | inferno | viridis | ... (see --list gradients)
+color_by=lum           ; lum | load
+bg_pattern=checker     ; solid | checker | diamond | brick | triangles | hex | radial
+bg_lum=2               ; 0..10
+wireframe=off          ; on | off
+stats=off              ; on | off
+fps_invert=off         ; on | off
+extras=none            ; none | nic | disk | both
 fps_cap=display        ; or 30..240
 budget=15              ; percent
 shift=on

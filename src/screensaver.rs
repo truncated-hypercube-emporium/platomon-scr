@@ -259,20 +259,28 @@ pub enum Extras {
 }
 
 /// The user's choices from the configuration dialog, stored in the
-/// screensaver's INI file. `None` = pick at random each run.
+/// screensaver's INI file.
+///
+/// With `random` on (the default) every run picks its own look and the look
+/// fields are ignored; with it off, the look fields are used as they are.
+/// The frame-rate cap, CPU budget and burn-in shift always apply.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScrSettings {
-    pub layout: Option<Layout>,
-    pub camera: Option<CameraMode>,
+    /// Master switch: a random look each run.
+    pub random: bool,
+    // --- the look (used when `random` is off)
+    pub layout: Layout,
+    pub camera: CameraMode,
     /// `"off"` or a gradient preset id.
-    pub color: Option<String>,
-    pub color_by: Option<ColorBy>,
-    pub bg_pattern: Option<Pattern>,
-    pub bg_lum: Option<u8>,
-    pub wireframe: Option<bool>,
-    pub stats: Option<bool>,
-    pub fps_invert: Option<bool>,
-    pub extras: Option<Extras>,
+    pub color: String,
+    pub color_by: ColorBy,
+    pub bg_pattern: Pattern,
+    pub bg_lum: u8,
+    pub wireframe: bool,
+    pub stats: bool,
+    pub fps_invert: bool,
+    pub extras: Extras,
+    // --- always applied
     /// Frame-rate cap; `None` = the display's refresh rate.
     pub fps_cap: Option<u32>,
     /// Rendering CPU budget, percent of wall time at full frame rate.
@@ -288,16 +296,17 @@ pub struct ScrSettings {
 impl Default for ScrSettings {
     fn default() -> Self {
         Self {
-            layout: None,
-            camera: None,
-            color: None,
-            color_by: None,
-            bg_pattern: None,
-            bg_lum: None,
-            wireframe: None,
-            stats: None,
-            fps_invert: None,
-            extras: None,
+            random: true,
+            layout: Layout::Rings,
+            camera: CameraMode::Orbit,
+            color: "inferno".into(),
+            color_by: ColorBy::Lum,
+            bg_pattern: Pattern::Checker,
+            bg_lum: 2,
+            wireframe: false,
+            stats: false,
+            fps_invert: false,
+            extras: Extras::None,
             fps_cap: None,
             budget_pct: (RENDER_BUDGET * 100.0).round() as u8,
             shift: true,
@@ -310,122 +319,105 @@ impl Default for ScrSettings {
 
 /// INI section name (`szAppName` in the Win32 screensaver sample).
 pub const INI_SECTION: &str = "platomon";
-pub const RANDOM: &str = "random";
 pub const SHIFT_FRAMES_MAX: u32 = 1_000_000;
 
-fn on_off(v: Option<bool>) -> String {
-    match v {
-        None => RANDOM.into(),
-        Some(true) => "on".into(),
-        Some(false) => "off".into(),
-    }
+fn on_off(v: bool) -> String {
+    if v { "on" } else { "off" }.to_string()
 }
 
-fn parse_on_off(s: &str) -> Option<Option<bool>> {
+fn parse_on_off(s: &str) -> Option<bool> {
     match s {
-        RANDOM => Some(None),
-        "on" => Some(Some(true)),
-        "off" => Some(Some(false)),
+        "on" | "1" | "true" | "yes" => Some(true),
+        "off" | "0" | "false" | "no" => Some(false),
         _ => None,
     }
 }
 
-fn opt_id<T>(v: &Option<T>, id: impl Fn(&T) -> String) -> String {
-    v.as_ref().map_or_else(|| RANDOM.to_string(), id)
-}
-
-fn layout_id(l: &Layout) -> String {
+fn layout_id(l: Layout) -> &'static str {
     match l {
         Layout::Rings => "rings",
         Layout::Sphere => "sphere",
     }
-    .into()
 }
 
-fn camera_id(c: &CameraMode) -> String {
+fn camera_id(c: CameraMode) -> &'static str {
     match c {
         CameraMode::Static => "static",
         CameraMode::Orbit => "orbit",
         CameraMode::Focus => "focus",
     }
-    .into()
 }
 
-fn color_by_id(c: &ColorBy) -> String {
+fn color_by_id(c: ColorBy) -> &'static str {
     match c {
         ColorBy::Lum => "lum",
         ColorBy::Load => "load",
     }
-    .into()
 }
 
-fn extras_id(e: &Extras) -> String {
+fn extras_id(e: Extras) -> &'static str {
     match e {
         Extras::None => "none",
         Extras::Nic => "nic",
         Extras::Disk => "disk",
         Extras::Both => "both",
     }
-    .into()
 }
 
-/// A dialog drop-down: INI key, label, and (INI value, shown text) choices.
+fn parse_extras(v: &str) -> Option<Extras> {
+    match v {
+        "none" => Some(Extras::None),
+        "nic" => Some(Extras::Nic),
+        "disk" => Some(Extras::Disk),
+        "both" => Some(Extras::Both),
+        _ => None,
+    }
+}
+
+/// A dialog drop-down: INI key, label, (INI value, shown text) choices, and
+/// whether it is part of the look (greyed out while the look is random).
 pub struct Choice {
     pub key: &'static str,
     pub label: &'static str,
     pub options: Vec<(String, String)>,
+    pub look: bool,
 }
 
 /// Every drop-down in the configuration dialog, in display order.
 pub fn choices() -> Vec<Choice> {
-    let rnd = || (RANDOM.to_string(), "Random".to_string());
     let opt = |v: &str, t: &str| (v.to_string(), t.to_string());
-    let tri = || vec![rnd(), opt("on", "On"), opt("off", "Off")];
-    let mut colors = vec![rnd(), opt("off", "Off (monochrome)")];
+    let on_off = || vec![opt("on", "On"), opt("off", "Off")];
+    let mut colors = vec![opt("off", "Off (monochrome)")];
     colors.extend(color::PRESETS.iter().map(|(id, _, _)| opt(id, id)));
-    let mut patterns = vec![rnd()];
-    patterns.extend(Pattern::ALL.iter().map(|p| opt(p.id(), p.id())));
-    let mut lums = vec![rnd()];
-    lums.extend((0..=10).map(|l| opt(&l.to_string(), &if l == 0 { "0 (no floor)".into() } else { l.to_string() })));
+    let patterns = Pattern::ALL.iter().map(|p| opt(p.id(), p.id())).collect();
+    let lums = (0..=10).map(|l| opt(&l.to_string(), &if l == 0 { "0 (no floor)".into() } else { l.to_string() })).collect();
     let mut caps = vec![opt("display", "Display refresh rate")];
     caps.extend([30, 60, 75, 90, 120, 144, 165, 240].map(|f| opt(&f.to_string(), &format!("{f} fps"))));
     let budgets = [5, 10, 15, 20, 25, 30, 40, 50].map(|b| opt(&b.to_string(), &format!("{b}%"))).to_vec();
+    let look = |key, label, options| Choice { key, label, options, look: true };
+    let always = |key, label, options| Choice { key, label, options, look: false };
     vec![
-        Choice { key: "layout", label: "Layout", options: vec![rnd(), opt("rings", "Rings"), opt("sphere", "Sphere")] },
-        Choice {
-            key: "camera",
-            label: "Camera",
-            options: vec![rnd(), opt("static", "Static"), opt("orbit", "Orbit"), opt("focus", "Focus on busiest")],
-        },
-        Choice { key: "color", label: "Colour", options: colors },
-        Choice {
-            key: "color_by",
-            label: "Colour source",
-            options: vec![rnd(), opt("lum", "Brightness"), opt("load", "Load per solid")],
-        },
-        Choice { key: "bg_pattern", label: "Background pattern", options: patterns },
-        Choice { key: "bg_lum", label: "Background luminosity", options: lums },
-        Choice { key: "wireframe", label: "Wireframe overlay", options: tri() },
-        Choice { key: "stats", label: "Stats bar", options: tri() },
-        Choice { key: "fps_invert", label: "Inverted frame rate", options: tri() },
-        Choice {
-            key: "extras",
-            label: "Extra metrics",
-            options: vec![
-                rnd(),
-                opt("none", "None"),
-                opt("nic", "Network adapter"),
-                opt("disk", "Disk device"),
-                opt("both", "Both"),
-            ],
-        },
-        Choice { key: "fps_cap", label: "Frame-rate cap", options: caps },
-        Choice { key: "budget", label: "CPU budget", options: budgets },
-        Choice {
-            key: "shift_radius",
-            label: "Burn-in shift range",
-            options: (1..=4).map(|r| opt(&r.to_string(), &format!("\u{b1}{r} px"))).collect(),
-        },
+        look("layout", "Layout", vec![opt("rings", "Rings"), opt("sphere", "Sphere")]),
+        look(
+            "camera",
+            "Camera",
+            vec![opt("static", "Static"), opt("orbit", "Orbit"), opt("focus", "Focus on busiest")],
+        ),
+        look("color", "Colour", colors),
+        look("color_by", "Colour source", vec![opt("lum", "Brightness"), opt("load", "Load per solid")]),
+        look("bg_pattern", "Background pattern", patterns),
+        look("bg_lum", "Background luminosity", lums),
+        look("wireframe", "Wireframe overlay", on_off()),
+        look("stats", "Stats bar", on_off()),
+        look("fps_invert", "Inverted frame rate", on_off()),
+        look(
+            "extras",
+            "Extra metrics",
+            vec![opt("none", "None"), opt("nic", "Network adapter"), opt("disk", "Disk device"), opt("both", "Both")],
+        ),
+        always("fps_cap", "Frame-rate cap", caps),
+        always("budget", "CPU budget", budgets),
+        always("shift_radius", "Burn-in shift range", (1..=4).map(|r| opt(&r.to_string(), &format!("\u{b1}{r} px"))).collect()),
     ]
 }
 
@@ -433,19 +425,20 @@ impl ScrSettings {
     /// `(key, value)` pairs as written to the INI file.
     pub fn to_pairs(&self) -> Vec<(&'static str, String)> {
         vec![
-            ("layout", opt_id(&self.layout, layout_id)),
-            ("camera", opt_id(&self.camera, camera_id)),
-            ("color", opt_id(&self.color, |c| c.clone())),
-            ("color_by", opt_id(&self.color_by, color_by_id)),
-            ("bg_pattern", opt_id(&self.bg_pattern, |p| p.id().to_string())),
-            ("bg_lum", opt_id(&self.bg_lum, |l| l.to_string())),
+            ("random", on_off(self.random)),
+            ("layout", layout_id(self.layout).into()),
+            ("camera", camera_id(self.camera).into()),
+            ("color", self.color.clone()),
+            ("color_by", color_by_id(self.color_by).into()),
+            ("bg_pattern", self.bg_pattern.id().into()),
+            ("bg_lum", self.bg_lum.to_string()),
             ("wireframe", on_off(self.wireframe)),
             ("stats", on_off(self.stats)),
             ("fps_invert", on_off(self.fps_invert)),
-            ("extras", opt_id(&self.extras, extras_id)),
+            ("extras", extras_id(self.extras).into()),
             ("fps_cap", self.fps_cap.map_or_else(|| "display".to_string(), |f| f.to_string())),
             ("budget", self.budget_pct.to_string()),
-            ("shift", if self.shift { "on" } else { "off" }.to_string()),
+            ("shift", on_off(self.shift)),
             ("shift_min_frames", self.shift_min_frames.to_string()),
             ("shift_max_frames", self.shift_max_frames.to_string()),
             ("shift_radius", self.shift_radius.to_string()),
@@ -453,22 +446,11 @@ impl ScrSettings {
     }
 
     /// Read settings through `get(key)`; missing or invalid values fall back
-    /// to the defaults.
+    /// to the defaults, one key at a time.
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
         let d = Self::default();
         let val = |k: &str| get(k).map(|v| v.trim().to_ascii_lowercase()).filter(|v| !v.is_empty());
-        let enum_opt = |k: &str, parse: &dyn Fn(&str) -> bool| -> Option<Option<String>> {
-            let v = val(k)?;
-            if v == RANDOM {
-                Some(None)
-            } else if parse(&v) {
-                Some(Some(v))
-            } else {
-                None
-            }
-        };
-        let preset_ok = |v: &str| v == "off" || color::PRESETS.iter().any(|(id, _, _)| *id == v);
-        let pattern_of = |v: &str| Pattern::ALL.into_iter().find(|p| p.id() == v);
+        let flag = |k: &str, def: bool| val(k).and_then(|v| parse_on_off(&v)).unwrap_or(def);
         let num = |k: &str| val(k).and_then(|v| v.parse::<u32>().ok());
         let shift_min = num("shift_min_frames").filter(|v| (1..=SHIFT_FRAMES_MAX).contains(v)).unwrap_or(d.shift_min_frames);
         let shift_max = num("shift_max_frames")
@@ -476,93 +458,65 @@ impl ScrSettings {
             .unwrap_or(d.shift_max_frames)
             .max(shift_min);
         Self {
-            layout: enum_opt("layout", &|v| v.parse::<Layout>().is_ok())
-                .map_or(d.layout, |o| o.and_then(|v| v.parse().ok())),
-            camera: enum_opt("camera", &|v| v.parse::<CameraMode>().is_ok())
-                .map_or(d.camera, |o| o.and_then(|v| v.parse().ok())),
-            color: enum_opt("color", &preset_ok).unwrap_or(d.color.clone()),
-            color_by: enum_opt("color_by", &|v| v.parse::<ColorBy>().is_ok())
-                .map_or(d.color_by, |o| o.and_then(|v| v.parse().ok())),
-            bg_pattern: enum_opt("bg_pattern", &|v| pattern_of(v).is_some())
-                .map_or(d.bg_pattern, |o| o.and_then(|v| pattern_of(&v))),
-            bg_lum: enum_opt("bg_lum", &|v| v.parse::<u8>().is_ok_and(|l| l <= 10))
-                .map_or(d.bg_lum, |o| o.and_then(|v| v.parse().ok())),
-            wireframe: val("wireframe").and_then(|v| parse_on_off(&v)).unwrap_or(d.wireframe),
-            stats: val("stats").and_then(|v| parse_on_off(&v)).unwrap_or(d.stats),
-            fps_invert: val("fps_invert").and_then(|v| parse_on_off(&v)).unwrap_or(d.fps_invert),
-            extras: enum_opt("extras", &|v| matches!(v, "none" | "nic" | "disk" | "both")).map_or(d.extras, |o| {
-                o.map(|v| match v.as_str() {
-                    "none" => Extras::None,
-                    "nic" => Extras::Nic,
-                    "disk" => Extras::Disk,
-                    _ => Extras::Both,
-                })
-            }),
+            random: flag("random", d.random),
+            layout: val("layout").and_then(|v| v.parse().ok()).unwrap_or(d.layout),
+            camera: val("camera").and_then(|v| v.parse().ok()).unwrap_or(d.camera),
+            color: val("color")
+                .filter(|v| v == "off" || color::PRESETS.iter().any(|(id, _, _)| id == v))
+                .unwrap_or(d.color.clone()),
+            color_by: val("color_by").and_then(|v| v.parse().ok()).unwrap_or(d.color_by),
+            bg_pattern: val("bg_pattern")
+                .and_then(|v| Pattern::ALL.into_iter().find(|p| p.id() == v))
+                .unwrap_or(d.bg_pattern),
+            bg_lum: num("bg_lum").filter(|l| *l <= 10).map_or(d.bg_lum, |l| l as u8),
+            wireframe: flag("wireframe", d.wireframe),
+            stats: flag("stats", d.stats),
+            fps_invert: flag("fps_invert", d.fps_invert),
+            extras: val("extras").and_then(|v| parse_extras(&v)).unwrap_or(d.extras),
             fps_cap: match val("fps_cap").as_deref() {
                 None | Some("display") => None,
                 Some(v) => v.parse::<u32>().ok().filter(|f| (30..=240).contains(f)).or(d.fps_cap),
             },
             budget_pct: num("budget").filter(|b| (1..=100).contains(b)).map_or(d.budget_pct, |b| b as u8),
-            shift: val("shift").and_then(|v| parse_on_off(&v)).flatten().unwrap_or(d.shift),
+            shift: flag("shift", d.shift),
             shift_min_frames: shift_min,
             shift_max_frames: shift_max,
             shift_radius: num("shift_radius").filter(|r| (1..=8).contains(r)).map_or(d.shift_radius, |r| r as u8),
         }
     }
 
-    /// Put the fixed choices on top of a random configuration.
+    /// Unless the look is random, replace the random look with the chosen one.
     pub fn apply(&self, c: &mut Config) {
-        if let Some(l) = self.layout {
-            c.layout = l;
+        if self.random {
+            return;
         }
-        if let Some(m) = self.camera {
-            c.camera = m;
+        c.layout = self.layout;
+        c.camera = self.camera;
+        c.color = self.color.clone();
+        c.color_by = self.color_by;
+        c.bg_pattern = self.bg_pattern;
+        c.bg_lum = self.bg_lum as f32;
+        c.wireframe = self.wireframe;
+        c.show_stats = self.stats;
+        c.fps_invert = self.fps_invert;
+        let mut show: Vec<String> = ["cpu", "ram", "disk", "net", "gpu"].map(String::from).to_vec();
+        if matches!(self.extras, Extras::Nic | Extras::Both) {
+            show.push("nic".into());
         }
-        if let Some(col) = &self.color {
-            c.color = col.clone();
+        if matches!(self.extras, Extras::Disk | Extras::Both) {
+            show.push("disk-dev".into());
         }
-        if let Some(by) = self.color_by {
-            c.color_by = by;
-            // A fixed source with a random "off" still means: use colour.
-            if self.color.is_none() && c.color == "off" {
-                c.color = color::default_for(by).to_string();
-            }
-        }
-        if let Some(p) = self.bg_pattern {
-            c.bg_pattern = p;
-        }
-        if let Some(l) = self.bg_lum {
-            c.bg_lum = l as f32;
-        }
-        if let Some(w) = self.wireframe {
-            c.wireframe = w;
-        }
-        if let Some(s) = self.stats {
-            c.show_stats = s;
-        }
-        if let Some(i) = self.fps_invert {
-            c.fps_invert = i;
-        }
-        if let Some(e) = self.extras {
-            let mut show: Vec<String> = ["cpu", "ram", "disk", "net", "gpu"].map(String::from).to_vec();
-            if matches!(e, Extras::Nic | Extras::Both) {
-                show.push("nic".into());
-            }
-            if matches!(e, Extras::Disk | Extras::Both) {
-                show.push("disk-dev".into());
-            }
-            // Keep the random solids; give new metrics unused ones.
-            c.solids.retain(|k, _| show.contains(k));
-            for m in &show {
-                if !c.solids.contains_key(m) {
-                    let used: Vec<String> = c.solids.values().cloned().collect();
-                    if let Some(k) = SolidKind::ALL.iter().find(|k| !used.iter().any(|u| u == k.id())) {
-                        c.solids.insert(m.clone(), k.id().to_string());
-                    }
+        // Keep the random solids; give new metrics unused ones.
+        c.solids.retain(|k, _| show.contains(k));
+        for m in &show {
+            if !c.solids.contains_key(m) {
+                let used: Vec<String> = c.solids.values().cloned().collect();
+                if let Some(k) = SolidKind::ALL.iter().find(|k| !used.iter().any(|u| u == k.id())) {
+                    c.solids.insert(m.clone(), k.id().to_string());
                 }
             }
-            c.show = show;
         }
+        c.show = show;
     }
 }
 
@@ -684,18 +638,19 @@ mod tests {
     fn settings_roundtrip_and_defaults() {
         let d = ScrSettings::default();
         assert_eq!(ScrSettings::from_lookup(|_| None), d, "missing file = defaults");
-        assert_eq!((d.shift, d.budget_pct, d.fps_cap), (true, 15, None));
+        assert_eq!((d.random, d.shift, d.budget_pct, d.fps_cap), (true, true, 15, None));
         let s = ScrSettings {
-            layout: Some(Layout::Sphere),
-            camera: Some(CameraMode::Focus),
-            color: Some("viridis".into()),
-            color_by: Some(ColorBy::Load),
-            bg_pattern: Some(Pattern::Hex),
-            bg_lum: Some(0),
-            wireframe: Some(true),
-            stats: Some(false),
-            fps_invert: None,
-            extras: Some(Extras::Both),
+            random: false,
+            layout: Layout::Sphere,
+            camera: CameraMode::Focus,
+            color: "viridis".into(),
+            color_by: ColorBy::Load,
+            bg_pattern: Pattern::Hex,
+            bg_lum: 0,
+            wireframe: true,
+            stats: false,
+            fps_invert: true,
+            extras: Extras::Both,
             fps_cap: Some(60),
             budget_pct: 25,
             shift: false,
@@ -706,9 +661,10 @@ mod tests {
         let pairs = s.to_pairs();
         let back = ScrSettings::from_lookup(|k| pairs.iter().find(|(pk, _)| *pk == k).map(|(_, v)| v.clone()));
         assert_eq!(back, s);
-        // junk falls back per key; max < min is raised to min
+        // junk falls back per key (old per-setting "random" values included);
+        // max < min is raised to min
         let j = ScrSettings::from_lookup(lookup(&[
-            ("layout", "cube"),
+            ("layout", "random"),
             ("color", "plaid"),
             ("bg_lum", "11"),
             ("fps_cap", "5"),
@@ -716,23 +672,30 @@ mod tests {
             ("shift_min_frames", "500"),
             ("shift_max_frames", "100"),
             ("wireframe", "ON"),
+            ("random", "off"),
         ]));
-        assert_eq!((j.layout, j.color, j.bg_lum, j.fps_cap, j.budget_pct), (None, None, None, None, 15));
-        assert_eq!((j.shift_min_frames, j.shift_max_frames, j.wireframe), (500, 500, Some(true)));
+        assert_eq!((j.layout, j.color.as_str(), j.bg_lum, j.fps_cap, j.budget_pct), (d.layout, "inferno", 2, None, 15));
+        assert_eq!((j.shift_min_frames, j.shift_max_frames, j.wireframe, j.random), (500, 500, true, false));
     }
 
     #[test]
     fn every_dialog_choice_parses() {
         let keys: Vec<&str> = ScrSettings::default().to_pairs().iter().map(|(k, _)| *k).collect();
+        let looks: Vec<&str> = choices().iter().filter(|c| c.look).map(|c| c.key).collect();
+        assert_eq!(
+            looks,
+            ["layout", "camera", "color", "color_by", "bg_pattern", "bg_lum", "wireframe", "stats", "fps_invert", "extras"]
+        );
         for c in choices() {
             assert!(keys.contains(&c.key), "{} is a settings key", c.key);
+            assert!(c.options.iter().all(|(v, _)| v != "random"), "{}: no per-setting random", c.key);
             for (v, _) in &c.options {
                 let s = ScrSettings::from_lookup(lookup(&[(c.key, v)]));
                 let written = s.to_pairs().into_iter().find(|(k, _)| *k == c.key).unwrap().1;
                 assert_eq!(&written, v, "{}={v} survives a round trip", c.key);
             }
         }
-        // the current default of each choice is one of its options
+        // the default of each choice is one of its options
         for (k, v) in ScrSettings::default().to_pairs() {
             if let Some(c) = choices().into_iter().find(|c| c.key == k) {
                 assert!(c.options.iter().any(|(o, _)| *o == v), "default {k}={v} listed");
@@ -741,36 +704,41 @@ mod tests {
     }
 
     #[test]
-    fn fixed_choices_override_the_random_look() {
-        let s = ScrSettings {
-            layout: Some(Layout::Rings),
-            camera: Some(CameraMode::Static),
-            color: Some("off".into()),
-            wireframe: Some(false),
-            extras: Some(Extras::Disk),
-            bg_lum: Some(0),
+    fn master_toggle_decides_between_random_and_chosen_look() {
+        let chosen = ScrSettings {
+            random: false,
+            layout: Layout::Rings,
+            camera: CameraMode::Static,
+            color: "off".into(),
+            wireframe: false,
+            extras: Extras::Disk,
+            bg_lum: 0,
             fps_cap: Some(60),
             budget_pct: 10,
             ..ScrSettings::default()
         };
-        for seed in 0..40 {
-            let p = plan(&WQHD, seed, &s).unwrap();
+        for seed in 0..3 {
+            let p = plan(&WQHD, seed, &chosen).unwrap();
             let c = &p.config;
             assert_eq!((c.layout, c.camera, c.color.as_str(), c.wireframe), (Layout::Rings, CameraMode::Static, "off", false));
+            assert_eq!((c.bg_pattern, c.show_stats, c.fps_invert), (Pattern::Checker, false, false));
             assert_eq!(c.show, ["cpu", "ram", "disk", "net", "gpu", "disk-dev"]);
             assert_eq!((c.bg_lum, c.fps_max, p.budget), (0.0, 60.0, 0.1));
             c.resolve_slots().unwrap_or_else(|e| panic!("seed {seed}: {e}"));
-            if seed > 3 {
-                break; // plan() renders; a few seeds are enough
-            }
         }
-        // colour source fixed while colour is random: never left monochrome
-        let s = ScrSettings { color_by: Some(ColorBy::Load), ..ScrSettings::default() };
-        for seed in 0..30 {
+        // master toggle on: the look fields are ignored, cap and budget still apply
+        let random = ScrSettings { random: true, ..chosen.clone() };
+        let mut looks = std::collections::HashSet::new();
+        for seed in 0..40 {
             let mut c = randomize(&mut fastrand::Rng::with_seed(seed), &WQHD);
-            s.apply(&mut c);
-            assert!(c.color != "off" && c.color_by == ColorBy::Load);
+            let before = c.clone();
+            random.apply(&mut c);
+            assert_eq!(c, before, "random look untouched");
+            looks.insert(format!("{:?}{:?}{}", c.layout, c.camera, c.color));
         }
+        assert!(looks.len() > 10, "varied looks: {}", looks.len());
+        let p = plan(&WQHD, 1, &random).unwrap();
+        assert_eq!((p.config.fps_max, p.budget), (60.0, 0.1));
     }
 
     #[test]

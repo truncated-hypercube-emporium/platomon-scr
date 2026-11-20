@@ -134,6 +134,7 @@ const COMBOBOX: u16 = 0x0085;
 const IDOK: i32 = 1;
 const IDCANCEL: i32 = 2;
 const ID_COMBO: i32 = 1000;
+const ID_RANDOM: i32 = 1110;
 const ID_SHIFT: i32 = 1100;
 const ID_SHIFT_MIN: i32 = 1101;
 const ID_SHIFT_MAX: i32 = 1102;
@@ -224,12 +225,19 @@ const ID_RADIUS: i32 = ID_COMBO + 99;
 fn build_template() -> Vec<u32> {
     let general = general_choices();
     let row = 15i16;
-    let top = 8i16;
+    let top = 26i16;
     let h_general = top + general.len() as i16 * row;
     let (gy, gh) = (h_general + 4, 52i16);
     let note_y = gy + gh + 6;
     let buttons_y = note_y + 24;
     let mut t = Template::new("platomon screensaver settings", 300, buttons_y + 22);
+    t.item(
+        BS_AUTOCHECKBOX | WS_TABSTOP | WS_GROUP,
+        (10, 8, 280, 12),
+        ID_RANDOM as u16,
+        BUTTON,
+        "&Random look each run (otherwise use the look chosen below)",
+    );
     for (i, c) in general.iter().enumerate() {
         let y = top + i as i16 * row;
         t.item(0, (10, y + 2, 110, 10), ID_STATIC, STATIC, &format!("{}:", c.label));
@@ -255,8 +263,8 @@ fn build_template() -> Vec<u32> {
         (10, note_y, 282, 20),
         ID_STATIC,
         STATIC,
-        "Random settings are picked anew each time the screensaver starts. \
-         Saved to %APPDATA%\\platomon\\screensaver.ini.",
+        "With Random look on, the solids, layout, camera, colours and background are \
+         picked anew each run. Saved to %APPDATA%\\platomon\\screensaver.ini.",
     );
     t.item(BS_PUSHBUTTON | WS_TABSTOP, (10, buttons_y, 60, 14), ID_DEFAULTS as u16, BUTTON, "&Defaults");
     t.item(BS_DEFPUSHBUTTON | WS_TABSTOP, (176, buttons_y, 55, 14), IDOK as u16, BUTTON, "OK");
@@ -280,10 +288,25 @@ unsafe fn fill(h: HWND, s: &ScrSettings) {
     set(ID_RADIUS, &radius_choice());
     // SAFETY: control ids from our template.
     unsafe {
+        CheckDlgButton(h, ID_RANDOM, s.random as u32);
         CheckDlgButton(h, ID_SHIFT, s.shift as u32);
         SetDlgItemInt(h, ID_SHIFT_MIN, s.shift_min_frames, 0);
         SetDlgItemInt(h, ID_SHIFT_MAX, s.shift_max_frames, 0);
+        enable_look(h);
         enable_shift(h);
+    }
+}
+
+/// Grey out the look drop-downs while the look is random.
+unsafe fn enable_look(h: HWND) {
+    // SAFETY: control ids from our template.
+    unsafe {
+        let chosen = (IsDlgButtonChecked(h, ID_RANDOM) != 1) as i32;
+        for (i, c) in general_choices().iter().enumerate() {
+            if c.look {
+                EnableWindow(GetDlgItem(h, ID_COMBO + i as i32), chosen);
+            }
+        }
     }
 }
 
@@ -327,6 +350,9 @@ unsafe fn read(h: HWND) -> Result<ScrSettings, String> {
     if shift && min > max {
         return Err("The first burn-in shift interval must not be larger than the second.".into());
     }
+    // SAFETY: control id from our template.
+    let random = unsafe { IsDlgButtonChecked(h, ID_RANDOM) } == 1;
+    map.push(("random".into(), if random { "on" } else { "off" }.into()));
     map.push(("shift".into(), if shift { "on" } else { "off" }.into()));
     map.push(("shift_min_frames".into(), min.to_string()));
     map.push(("shift_max_frames".into(), max.to_string()));
@@ -382,6 +408,10 @@ pub unsafe extern "system" fn ScreenSaverConfigureDialog(h: HWND, msg: u32, w: u
                         enable_shift(h);
                         1
                     }
+                    ID_RANDOM if code == BN_CLICKED => {
+                        enable_look(h);
+                        1
+                    }
                     _ => 0,
                 }
             }
@@ -419,7 +449,7 @@ mod tests {
         assert!(style & DS_SETFONT != 0 && style & WS_CAPTION != 0);
         let items = w[4] as usize;
         // labels + combos for each general choice, plus the fixed controls
-        assert_eq!(items, general_choices().len() * 2 + 12);
+        assert_eq!(items, general_choices().len() * 2 + 13);
     }
 
     #[test]

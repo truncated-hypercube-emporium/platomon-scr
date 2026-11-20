@@ -2,6 +2,7 @@
 name = "platomon"
 version = "1.2.1"
 edition = "2024"
+default-run = "platomon"
 description = "Platonic-solid ASCII system monitor: five path-traced solids, one per resource"
 license = "MIT OR Apache-2.0"
 
