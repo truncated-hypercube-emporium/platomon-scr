@@ -505,6 +505,7 @@ fn snapshot(cfg: &Config, slots: &[SlotSpec], ratio: Option<f32>, (w, h): (usize
         exposure: cfg.exposure,
         color: cmap.as_ref(),
         levels: &ch.iter().map(|c| c.level).collect::<Vec<_>>(),
+        halo: None,
     };
     let mut overlays = Overlays::new(&scene);
     let mut s = String::new();
@@ -830,6 +831,7 @@ fn run(
             exposure: cfg.exposure,
             color: cmap,
             levels: &levels,
+            halo: None,
         };
         if let Some(view) = renderer.view() {
             let cells = overlays.compose(&view, vp.w, vp.h, &scene, &opt);

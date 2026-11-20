@@ -332,6 +332,12 @@ pub struct ScrSettings {
     /// about 4x the budget.
     pub density: u8,
     pub levels: Levels,
+    /// Sound halo: a wireframe 1.2x the size of each solid that grows and
+    /// shrinks by ±5% of its radius with the default output device's level.
+    pub sound: bool,
+    /// Wide halo swing: the halo shrinks and grows an extra ±25% of the
+    /// radius (0.9x..1.5x instead of 1.15x..1.25x).
+    pub halo_wide: bool,
     /// OLED burn-in protection: move the picture 1 px at random intervals.
     pub shift: bool,
     pub shift_min_frames: u32,
@@ -358,6 +364,8 @@ impl Default for ScrSettings {
             budget_pct: (RENDER_BUDGET * 100.0).round() as u8,
             density: 2,
             levels: Levels::Auto,
+            sound: true,
+            halo_wide: false,
             shift: true,
             shift_min_frames: 600,
             shift_max_frames: 3600,
@@ -369,6 +377,8 @@ impl Default for ScrSettings {
 /// INI section name (`szAppName` in the Win32 screensaver sample).
 pub const INI_SECTION: &str = "platomon";
 pub const SHIFT_FRAMES_MAX: u32 = 1_000_000;
+/// Largest burn-in drift from the centred position, pixels per axis.
+pub const SHIFT_RADIUS_MAX: u8 = 25;
 
 fn on_off(v: bool) -> String {
     if v { "on" } else { "off" }.to_string()
@@ -472,7 +482,17 @@ pub fn choices() -> Vec<Choice> {
             "Luminosity levels",
             vec![opt("auto", "Random (10 or 16)"), opt("10", "10"), opt("16", "16"), opt("32", "32")],
         ),
-        always("shift_radius", "Burn-in shift range", (1..=4).map(|r| opt(&r.to_string(), &format!("\u{b1}{r} px"))).collect()),
+        always("sound", "Sound halo (output device)", on_off()),
+        always(
+            "halo_wide",
+            "Halo size swing",
+            vec![opt("off", "\u{b1}5% of radius"), opt("on", "\u{b1}30% of radius (extra \u{b1}25%)")],
+        ),
+        always(
+            "shift_radius",
+            "Burn-in shift range",
+            (1..=SHIFT_RADIUS_MAX).map(|r| opt(&r.to_string(), &format!("\u{b1}{r} px"))).collect(),
+        ),
     ]
 }
 
@@ -495,6 +515,8 @@ impl ScrSettings {
             ("budget", self.budget_pct.to_string()),
             ("density", self.density.to_string()),
             ("levels", levels_id(self.levels).into()),
+            ("sound", on_off(self.sound)),
+            ("halo_wide", on_off(self.halo_wide)),
             ("shift", on_off(self.shift)),
             ("shift_min_frames", self.shift_min_frames.to_string()),
             ("shift_max_frames", self.shift_max_frames.to_string()),
@@ -537,10 +559,14 @@ impl ScrSettings {
             budget_pct: num("budget").filter(|b| (1..=100).contains(b)).map_or(d.budget_pct, |b| b as u8),
             density: num("density").filter(|v| (1..=2).contains(v)).map_or(d.density, |v| v as u8),
             levels: val("levels").and_then(|v| parse_levels(&v)).unwrap_or(d.levels),
+            sound: flag("sound", d.sound),
+            halo_wide: flag("halo_wide", d.halo_wide),
             shift: flag("shift", d.shift),
             shift_min_frames: shift_min,
             shift_max_frames: shift_max,
-            shift_radius: num("shift_radius").filter(|r| (1..=8).contains(r)).map_or(d.shift_radius, |r| r as u8),
+            shift_radius: num("shift_radius")
+                .filter(|r| (1..=SHIFT_RADIUS_MAX as u32).contains(r))
+                .map_or(d.shift_radius, |r| r as u8),
         }
     }
 
@@ -752,6 +778,8 @@ mod tests {
             budget_pct: 25,
             density: 1,
             levels: Levels::L32,
+            sound: false,
+            halo_wide: true,
             shift: false,
             shift_min_frames: 10,
             shift_max_frames: 20,
@@ -866,5 +894,28 @@ mod tests {
             assert!(one.tick());
             assert!(one.offset().0.abs() <= 1 && one.offset().1.abs() <= 1);
         }
+    }
+
+    #[test]
+    fn shift_range_goes_up_to_25_px() {
+        // every range 1..=25 is offered and survives the INI round trip
+        let c = choices().into_iter().find(|c| c.key == "shift_radius").unwrap();
+        assert_eq!(c.options.len(), 25);
+        assert_eq!(c.options.last().unwrap().1, "\u{b1}25 px");
+        assert_eq!(ScrSettings::from_lookup(lookup(&[("shift_radius", "25")])).shift_radius, 25);
+        assert_eq!(ScrSettings::from_lookup(lookup(&[("shift_radius", "26")])).shift_radius, 2, "beyond the max: default");
+        // a 25 px range drifts that far and no further, 1 px per axis per step
+        let mut p = PixelShift::new(3, 25, 1, 1);
+        let (mut max_x, mut max_y) = (0, 0);
+        let mut last = p.offset();
+        for _ in 0..200_000 {
+            assert!(p.tick());
+            let o = p.offset();
+            assert_eq!(((o.0 - last.0).abs(), (o.1 - last.1).abs()), (1, 1));
+            assert!(o.0.abs() <= 25 && o.1.abs() <= 25, "{o:?}");
+            (max_x, max_y) = (max_x.max(o.0.abs()), max_y.max(o.1.abs()));
+            last = o;
+        }
+        assert_eq!((max_x, max_y), (25, 25), "reaches the edge of the range");
     }
 }

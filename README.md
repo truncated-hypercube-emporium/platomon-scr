@@ -1,4 +1,4 @@
-# platomon 1.2.1
+# platomon 1.3
 
 A terminal system monitor: one path-traced polyhedron per metric, rendered in monochrome ASCII on
 concentric rings. Each solid's scale and spin follow its metric; the frame rate (5–150 fps) follows
@@ -339,8 +339,24 @@ At that resolution expect the adaptive quality to drop to `q-1`/`q-2` and tens o
 
 ## Windows screensaver
 
-`scripts\build-scr.ps1` builds `dist\platomon.scr`, a self-contained screensaver.
-Right-click it › Install (or copy it to `C:\Windows\System32`) and choose it in Screen Saver Settings.
+**Download:** `platomon.scr` and `platomon-config.exe` are attached to the
+[v1.3 release](https://github.com/truncated-hypercube-emporium/platomon-scr/releases/tag/v1.3)
+(64-bit Windows 10/11, no installer, no dependencies). To build them yourself,
+`scripts\build-scr.ps1` writes both to `dist\`.
+
+To install, copy both files to `C:\Windows\System32` (administrator rights needed), or right-click
+`platomon.scr` › Install, then choose **platomon** in Settings › Personalization › Lock screen ›
+Screen saver. `platomon-config.exe` opens the same settings dialog as the Settings… button there.
+
+**New in 1.3:**
+
+- **Sound halo**: a second wireframe of each solid, 1.2x its size, that grows and shrinks with the
+  default output device's level (±5% of the radius, or ±30% with *Halo size swing*) and gets brighter
+  with low frequencies; it updates at the display's refresh rate between full frames.
+- **Faster drawing**: glyph tiles copied straight into the back buffer instead of GDI text calls —
+  a full 2560×1440 frame now takes about 1.5 ms to draw instead of 40–80 ms.
+- **Text density** (default double) and **32 luminosity levels**.
+- **Burn-in shift** range up to ±25 px.
 
 Each run:
 
@@ -350,14 +366,17 @@ Each run:
   gradient, wireframe and inverted fps (the corner legend is never shown);
 - keeps rendering cheap: 1 sample per pixel, 1 bounce, adaptive quality on. A short render test
   measures this machine's speed for the chosen scene, and the text size (Consolas) is chosen so
-  drawing at the full frame rate takes about 15% of the CPU;
-- draws the ASCII frames itself (GDI text, fixed-width cells) in a borderless window covering the
+  rendering at the full frame rate takes about 15% of the CPU (the CPU budget), then halved for
+  double text density; full frames are spaced so rendering stays within that budget;
+- draws the ASCII frames itself (fixed-width Consolas cells) in a borderless window covering the
   whole primary display at (0, 0), taskbar included, with the mouse pointer hidden, and ends on
   any key, click or mouse movement. No console window is involved.
 
 **OLED burn-in protection** (on by default): every N frames, N random within a range (600–3600 by
 default), the whole character grid moves 1 px horizontally and 1 px vertically, drifting within
-±2 px of its centred position, so no pixel shows the same edge for long.
+±2 px of its centred position (settable up to ±25 px per axis), so no pixel shows the same edge for
+long. Near the screen edges, the cells shifted past the edge are cut off and a black strip as wide
+as the shift opens on the other side.
 
 **Settings.** Screen Saver Settings › Settings… (`platomon.scr /c`) and `platomon-config.exe` open
 the same dialog, run by a dialog procedure named `ScreenSaverConfigureDialog` as in the Win32
@@ -365,12 +384,33 @@ screensaver interface. A master **Random look each run** switch (on by default) 
 every time; turn it off to use the look chosen below it instead: layout, camera, colour gradient and
 source, background pattern and luminosity, wireframe, stats bar, inverted frame rate and extra
 metrics (greyed out while the switch is on). The frame-rate cap (the display's refresh rate by
-default), the CPU budget used to size the text, the text density, the number of luminosity levels
-and the burn-in shift (on/off, frame interval, range) always apply.
+default), the CPU budget used to size the text, the text density, the number of luminosity levels,
+the sound halo and the burn-in shift (on/off, frame interval, range) always apply.
 
 **Text density.** The text is first sized so rendering fits the CPU budget, then (with the default
 double density) set at half that height, never below 4 px: twice the characters per axis, about 4x
 the rendering cost of the budget. Choose Standard to keep the budget-sized text.
+
+**Sound halo** (on by default). A second wireframe of every solid, 1.2x its size, follows the
+sound level of the default output device (the one selected in Windows sound settings, read through
+its WASAPI peak meter and followed when you switch devices): it grows to 1.25x the solid's radius
+on loud passages and shrinks to 1.15x in silence. With **Halo size swing** set to ±30% it moves an
+extra 25% of the radius either way, from 0.9x (inside the solid) to 1.5x. Its brightness follows the frequencies being
+played: a loopback capture of the device is split by FFT into 12 bands (20 Hz – 16 kHz), weighted
+so low frequencies count most (half weight at 150 Hz, falling further above), so bass makes the
+halo bright and treble-only or silent passages leave it dim. Both size and brightness are smoothed
+(fast rise, slower fall) and auto-gained over the last few seconds, so quiet material moves them
+as well. The halo is hidden behind nearer solids.
+
+The halo runs at the display's refresh rate (or the frame-rate cap) independently of the full
+frames: between renders only the halo is recomputed, and only the cells it changes are redrawn
+(about 0.5–0.7 ms per halo frame at 2560×1440). Full frames keep rendering within the CPU budget,
+and halo-only frames fill the time between them.
+
+Text is drawn from glyph images rendered once with GDI (ClearType) and tinted per colour, copied
+straight into the back buffer, skipping cells that did not change; only the changed rows are copied
+to the screen. Frame counts and per-stage timings of the last run are written to
+`%LOCALAPPDATA%\platomon\screensaver\last-run-frames.txt`.
 
 **Luminosity levels.** 10, 16 or 32 glyphs from dark to bright; Random keeps the random look's
 choice (usually 16, sometimes 10). The 32-level ramp `` `-.':"~=*+c7ix5ah6HmB80$MWNQg&@`` (after a
@@ -395,10 +435,12 @@ fps_cap=display        ; or 30..240
 budget=15              ; percent
 density=2              ; 1 = standard | 2 = double
 levels=auto            ; auto | 10 | 16 | 32
+sound=on               ; sound halo from the default output device
+halo_wide=off          ; on = halo size swing ±30% of the radius instead of ±5%
 shift=on
 shift_min_frames=600
 shift_max_frames=3600
-shift_radius=2         ; pixels
+shift_radius=2         ; pixels, 1..25
 ```
 
 The settings of the last run, with the measured speed and chosen font, are saved to

@@ -28,16 +28,20 @@ fn main() {
 #[cfg(windows)]
 #[allow(clippy::upper_case_acronyms)] // Win32 names
 mod win {
+    use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
     use platomon::aspect;
+    use platomon::ascii::Ramp;
+    use platomon::audio::{Envelope, OutputMeter, bass_weighted};
+    use platomon::config::Config;
     use platomon::clock::FrameClock;
     use platomon::collector::Collector;
     use platomon::color::{self, ColorMap};
     use platomon::metrics::{MetricsState, activity_score};
-    use platomon::overlay::{OverlayOptions, Overlays};
+    use platomon::overlay::{Halo, OverlayOptions, Overlays, halo_factor, halo_lum};
     use platomon::render::{QualityGovernor, Renderer};
     use platomon::scrconfig;
     use platomon::screensaver::{self, Display, PixelShift, Plan};
@@ -86,6 +90,29 @@ mod win {
         top: i32,
         right: i32,
         bottom: i32,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct BITMAPINFOHEADER {
+        size: u32,
+        width: i32,
+        height: i32,
+        planes: u16,
+        bit_count: u16,
+        compression: u32,
+        size_image: u32,
+        x_ppm: i32,
+        y_ppm: i32,
+        clr_used: u32,
+        clr_important: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct BITMAPINFO {
+        header: BITMAPINFOHEADER,
+        colors: [u32; 1],
     }
 
     #[repr(C)]
@@ -157,8 +184,16 @@ mod win {
         fn SelectObject(dc: HDC, obj: HGDIOBJ) -> HGDIOBJ;
         fn DeleteObject(obj: HGDIOBJ) -> i32;
         fn CreateCompatibleDC(dc: HDC) -> HDC;
-        fn CreateCompatibleBitmap(dc: HDC, w: i32, h: i32) -> HGDIOBJ;
         fn DeleteDC(dc: HDC) -> i32;
+        fn CreateDIBSection(
+            dc: HDC,
+            info: *const BITMAPINFO,
+            usage: u32,
+            bits: *mut *mut std::ffi::c_void,
+            section: isize,
+            offset: u32,
+        ) -> HGDIOBJ;
+        fn GdiFlush() -> i32;
         fn BitBlt(dst: HDC, x: i32, y: i32, w: i32, h: i32, src: HDC, sx: i32, sy: i32, rop: u32) -> i32;
         fn SetTextColor(dc: HDC, c: u32) -> u32;
         fn SetBkColor(dc: HDC, c: u32) -> u32;
@@ -217,17 +252,12 @@ mod win {
     const GRACE: Duration = Duration::from_millis(1500);
     /// Longest sleep between message pumps while waiting for a frame.
     const SLICE: Duration = Duration::from_millis(5);
+    const DIB_RGB_COLORS: u32 = 0;
 
     static QUIT: AtomicBool = AtomicBool::new(false);
 
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
-    }
-
-    /// `0xRRGGBB` → GDI `COLORREF` (`0x00BBGGRR`).
-    fn colorref(c: u32) -> u32 {
-        let c = if c == color::NONE { FOREGROUND } else { c };
-        ((c & 0xff) << 16) | (c & 0xff00) | ((c >> 16) & 0xff)
     }
 
     fn message(text: &str, error: bool) {
@@ -286,6 +316,108 @@ mod win {
         }
     }
 
+    /// A top-down 32-bit DIB section: GDI can draw into it and we can write
+    /// its pixels (`0x00RRGGBB`) directly.
+    fn dib(dc: HDC, w: i32, h: i32) -> (HGDIOBJ, *mut u32) {
+        let info = BITMAPINFO {
+            header: BITMAPINFOHEADER {
+                size: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                width: w,
+                height: -h,
+                planes: 1,
+                bit_count: 32,
+                ..Default::default()
+            },
+            colors: [0],
+        };
+        let mut bits = std::ptr::null_mut();
+        // SAFETY: valid header (BI_RGB, top-down) and out pointer.
+        let bmp = unsafe { CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, 0, 0) };
+        (bmp, bits as *mut u32)
+    }
+
+    /// Glyph images rendered once with GDI (ClearType, white on black), then
+    /// tinted per colour: drawing a cell is a copy of `cw × ch` pixels instead
+    /// of a GDI text call per colour run.
+    struct Tiles {
+        dc: HDC,
+        bmp: HGDIOBJ,
+        bits: *mut u32,
+        cw: i32,
+        ch: i32,
+        /// Per-channel ink coverage of each glyph (white text on black).
+        coverage: HashMap<u16, Vec<u32>>,
+        tinted: HashMap<(u16, u32), Vec<u32>>,
+    }
+
+    impl Tiles {
+        /// Tinted tiles kept before the cache is emptied (bounded memory).
+        const MAX_TINTED: usize = 8192;
+
+        fn new(mem: HDC, font: HGDIOBJ, cw: i32, ch: i32) -> Self {
+            // SAFETY: a memory DC with its own DIB and the shared font;
+            // released in Drop.
+            unsafe {
+                let dc = CreateCompatibleDC(mem);
+                let (bmp, bits) = dib(mem, cw, ch);
+                SelectObject(dc, bmp);
+                SelectObject(dc, font);
+                SetTextColor(dc, 0x00FF_FFFF);
+                SetBkColor(dc, 0);
+                Self { dc, bmp, bits, cw, ch, coverage: HashMap::new(), tinted: HashMap::new() }
+            }
+        }
+
+        fn render(&mut self, u: u16) -> Vec<u32> {
+            let n = (self.cw * self.ch) as usize;
+            if self.bits.is_null() {
+                return vec![0; n];
+            }
+            let r = RECT { left: 0, top: 0, right: self.cw, bottom: self.ch };
+            let dx = [self.cw];
+            // SAFETY: one UTF-16 unit and one advance; the DIB holds `n`
+            // pixels, read after GdiFlush.
+            unsafe {
+                ExtTextOutW(self.dc, 0, 0, ETO_OPAQUE, &r, &u, 1, dx.as_ptr());
+                GdiFlush();
+                std::slice::from_raw_parts(self.bits, n).iter().map(|p| p & 0x00FF_FFFF).collect()
+            }
+        }
+
+        /// The `cw × ch` pixels of glyph `u` in colour `rgb` (`0xRRGGBB`).
+        fn tile(&mut self, u: u16, rgb: u32) -> &[u32] {
+            if !self.tinted.contains_key(&(u, rgb)) {
+                if !self.coverage.contains_key(&u) {
+                    let c = self.render(u);
+                    self.coverage.insert(u, c);
+                }
+                if self.tinted.len() >= Self::MAX_TINTED {
+                    self.tinted.clear();
+                }
+                let (cr, cg, cb) = ((rgb >> 16) & 0xff, (rgb >> 8) & 0xff, rgb & 0xff);
+                let t = self.coverage[&u]
+                    .iter()
+                    .map(|&p| {
+                        let (r, g, b) = ((p >> 16) & 0xff, (p >> 8) & 0xff, p & 0xff);
+                        (((r * cr + 127) / 255) << 16) | (((g * cg + 127) / 255) << 8) | ((b * cb + 127) / 255)
+                    })
+                    .collect();
+                self.tinted.insert((u, rgb), t);
+            }
+            &self.tinted[&(u, rgb)]
+        }
+    }
+
+    impl Drop for Tiles {
+        fn drop(&mut self) {
+            // SAFETY: handles created in `new`, released once.
+            unsafe {
+                DeleteDC(self.dc);
+                DeleteObject(self.bmp);
+            }
+        }
+    }
+
     /// Borderless, topmost window over the whole primary display, with a
     /// back buffer and a fixed-width font.
     struct Screen {
@@ -305,6 +437,19 @@ mod win {
         y0: i32,
         /// Burn-in shift, added to (x0, y0).
         shift: (i32, i32),
+        /// The back buffer's pixels (`w × h`, top-down).
+        bits: *mut u32,
+        tiles: Tiles,
+        /// What each grid cell shows now (glyph, colour), to skip unchanged
+        /// cells; `None` = unknown (redraw).
+        shown: Vec<Option<(u16, u32)>>,
+        /// GDI drew into the back buffer since the last direct write.
+        gdi_pending: bool,
+        /// Per grid row, the columns redrawn since the last present
+        /// (`lo..hi`; empty when `lo >= hi`).
+        spans: Vec<(usize, usize)>,
+        /// The whole buffer changed (cleared): present all of it.
+        all_dirty: bool,
     }
 
     impl Screen {
@@ -351,8 +496,13 @@ mod win {
 
                 let dc = GetDC(hwnd);
                 let mem = CreateCompatibleDC(dc);
-                let bitmap = CreateCompatibleBitmap(dc, w, h);
+                let (bitmap, bits) = dib(dc, w, h);
                 ReleaseDC(hwnd, dc);
+                if bits.is_null() {
+                    DeleteDC(mem);
+                    DestroyWindow(hwnd);
+                    return Err("cannot create the screen buffer".into());
+                }
                 SelectObject(mem, bitmap);
                 let font = CreateFontW(
                     font_px as i32,
@@ -385,7 +535,28 @@ mod win {
                 let rows = (h / ch).max(1) as usize;
                 let x0 = (w - cols as i32 * cw) / 2;
                 let y0 = (h - rows as i32 * ch) / 2;
-                Ok(Self { hwnd, mem, bitmap, font, w, h, cw, ch, cols, rows, x0, y0, shift: (0, 0) })
+                let tiles = Tiles::new(mem, font, cw, ch);
+                Ok(Self {
+                    hwnd,
+                    mem,
+                    bitmap,
+                    font,
+                    w,
+                    h,
+                    cw,
+                    ch,
+                    cols,
+                    rows,
+                    x0,
+                    y0,
+                    shift: (0, 0),
+                    bits,
+                    tiles,
+                    shown: vec![None; cols * rows],
+                    gdi_pending: true,
+                    spans: vec![(usize::MAX, 0); rows],
+                    all_dirty: true,
+                })
             }
         }
 
@@ -398,48 +569,104 @@ mod win {
             unsafe {
                 FillRect(self.mem, &full, GetStockObject(BLACK_BRUSH));
             }
+            self.gdi_pending = true;
+            self.all_dirty = true;
+            self.shown.fill(None);
         }
 
         fn char_aspect(&self) -> f32 {
             self.cw as f32 / self.ch as f32
         }
 
-        /// Draw one row of cells at grid row `row`, colour runs at a time.
-        fn draw_row(&self, row: usize, cells: &[char], colors: Option<&[u32]>, buf: &mut Vec<u16>, dx: &mut Vec<i32>) {
-            let y = self.y0 + self.shift.1 + row as i32 * self.ch;
-            let mut start = 0;
-            while start < cells.len() {
-                let col = colors.map_or(color::NONE, |c| c[start]);
-                let mut end = start + 1;
-                while end < cells.len() && colors.map_or(color::NONE, |c| c[end]) == col {
-                    end += 1;
-                }
-                buf.clear();
-                dx.clear();
-                for &c in &cells[start..end] {
-                    // One UTF-16 unit per cell keeps the grid aligned.
-                    let u = if (c as u32) < 0x1_0000 { c as u16 } else { b'?' as u16 };
-                    buf.push(u);
-                    dx.push(self.cw);
-                }
-                let x = self.x0 + self.shift.0 + start as i32 * self.cw;
-                let r = RECT { left: x, top: y, right: x + (end - start) as i32 * self.cw, bottom: y + self.ch };
-                // SAFETY: buffers hold `end - start` entries; DC is ours.
-                unsafe {
-                    SetTextColor(self.mem, colorref(col));
-                    ExtTextOutW(self.mem, x, y, ETO_OPAQUE, &r, buf.as_ptr(), buf.len() as u32, dx.as_ptr());
-                }
-                start = end;
+        /// Draw one row of cells at grid row `row` (unchanged cells are skipped).
+        fn draw_row(&mut self, row: usize, cells: &[char], colors: Option<&[u32]>) {
+            for (k, &c) in cells.iter().enumerate() {
+                self.draw_cell(row, k, c, colors.map_or(color::NONE, |v| v[k]));
             }
         }
 
-        fn present(&self) {
-            // SAFETY: our window and back buffer.
+        /// Redraw the `dirty` cells (indices into a `w`-wide grid).
+        fn draw_dirty(&mut self, dirty: &[usize], w: usize, chars: &[char], colors: Option<&[u32]>) {
+            for &c in dirty {
+                self.draw_cell(c / w, c % w, chars[c], colors.map_or(color::NONE, |v| v[c]));
+            }
+        }
+
+        /// Draw glyph `c` in `col` at grid (`row`, `col_i`), unless the cell
+        /// already shows it: a copy of its tinted tile, clipped to the buffer.
+        fn draw_cell(&mut self, row: usize, col_i: usize, c: char, col: u32) {
+            if row >= self.rows || col_i >= self.cols {
+                return;
+            }
+            // One UTF-16 unit per cell keeps the grid aligned.
+            let u = if (c as u32) < 0x1_0000 { c as u16 } else { b'?' as u16 };
+            let rgb = if col == color::NONE { FOREGROUND } else { col & 0x00FF_FFFF };
+            let gi = row * self.cols + col_i;
+            if self.shown[gi] == Some((u, rgb)) {
+                return;
+            }
+            self.shown[gi] = Some((u, rgb));
+            let s = &mut self.spans[row];
+            *s = (s.0.min(col_i), s.1.max(col_i + 1));
+            if self.gdi_pending {
+                // SAFETY: no arguments; makes earlier GDI drawing visible
+                // before writing the pixels directly.
+                unsafe { GdiFlush() };
+                self.gdi_pending = false;
+            }
+            let (cw, ch, w, h) = (self.cw, self.ch, self.w, self.h);
+            let x = self.x0 + self.shift.0 + col_i as i32 * cw;
+            let y = self.y0 + self.shift.1 + row as i32 * ch;
+            let (x_lo, x_hi) = (x.max(0), (x + cw).min(w));
+            if x_hi <= x_lo {
+                return;
+            }
+            let tile = self.tiles.tile(u, rgb);
+            for ty in 0..ch {
+                let py = y + ty;
+                if py < 0 || py >= h {
+                    continue;
+                }
+                let src = &tile[(ty * cw + (x_lo - x)) as usize..(ty * cw + (x_hi - x)) as usize];
+                // SAFETY: `py` in 0..h and `x_lo..x_hi` within 0..w: inside
+                // the w × h DIB; `src` has exactly `x_hi - x_lo` pixels.
+                unsafe {
+                    let dst = self.bits.add((py * w + x_lo) as usize);
+                    std::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len());
+                }
+            }
+        }
+
+        /// Copy what changed since the last present to the window: the
+        /// redrawn part of each row, or everything when most rows changed.
+        fn present(&mut self) {
+            let touched = self.spans.iter().filter(|s| s.0 < s.1).count();
+            if touched == 0 && !self.all_dirty {
+                return;
+            }
+            // SAFETY: our window and back buffer; rects are clipped to both.
             unsafe {
                 let dc = GetDC(self.hwnd);
-                BitBlt(dc, 0, 0, self.w, self.h, self.mem, 0, 0, SRCCOPY);
+                if self.all_dirty || touched * 4 > self.rows * 3 {
+                    BitBlt(dc, 0, 0, self.w, self.h, self.mem, 0, 0, SRCCOPY);
+                } else {
+                    for (row, &(lo, hi)) in self.spans.iter().enumerate() {
+                        if lo >= hi {
+                            continue;
+                        }
+                        let x = self.x0 + self.shift.0;
+                        let y = self.y0 + self.shift.1 + row as i32 * self.ch;
+                        let (l, t) = ((x + lo as i32 * self.cw).max(0), y.max(0));
+                        let (r, b) = ((x + hi as i32 * self.cw).min(self.w), (y + self.ch).min(self.h));
+                        if r > l && b > t {
+                            BitBlt(dc, l, t, r - l, b - t, self.mem, l, t, SRCCOPY);
+                        }
+                    }
+                }
                 ReleaseDC(self.hwnd, dc);
             }
+            self.spans.fill((usize::MAX, 0));
+            self.all_dirty = false;
         }
 
         fn pump(&self) {
@@ -487,7 +714,7 @@ mod win {
         let specs: Vec<_> = slots.iter().map(|s| s.metric.clone()).collect();
         let anim = screensaver::anim_params(&cfg);
         let base = screensaver::render_settings(&cfg, cfg.char_aspect);
-        let ramp = platomon::ascii::Ramp::new(&cfg.ramp);
+        let ramp = Ramp::new(&cfg.ramp);
 
         let collector = Collector::spawn(cfg.poll_hz);
         let mut scene = screensaver::build_scene(&cfg, &slots);
@@ -498,7 +725,44 @@ mod win {
         let mut governor = QualityGovernor::default();
         let mut overlays = Overlays::new(&scene);
         let mut levels: Vec<f32> = Vec::new();
-        let (mut buf, mut dx) = (Vec::new(), Vec::new());
+        let mut sound = s.sound.then(|| SoundHalo::new(s.halo_wide));
+        // Halo-only frames between renders, at the frame-rate cap (the
+        // display's refresh rate unless capped lower).
+        let halo_every = Duration::from_secs_f32(1.0 / cfg.fps_max.max(1.0));
+        let mut next_halo: Option<Instant> = None;
+        // Rendering CPU budget (share of wall time with all cores rendering).
+        let budget = plan.budget.clamp(0.01, 1.0);
+        let mut render_avg = 0.0f32;
+        let mut last_full: Option<Instant> = None;
+        // Frame counts for last-run-frames.txt (written on exit).
+        let (mut full_frames, mut halo_frames, mut halo_cells) = (0u64, 0u64, 0u64);
+        // Seconds spent per stage: render, compose, draw (GDI text), present,
+        // halo-only frame.
+        let mut spent = [0.0f64; 5];
+        // Burn-in shift: largest drift reached per axis, and moves made.
+        let (mut shift_reach, mut shift_moves) = ((0i32, 0i32), 0u64);
+        let report = |full: u64, halo: u64, cells: u64, secs: f32, spent: &[f64; 5], sound: Option<&SoundHalo>, shift: ((i32, i32), u64)| {
+            let ms = |s: f64, n: u64| s * 1e3 / n.max(1) as f64;
+            let halo_line = sound.filter(|s| s.range.0 <= s.range.1).map_or_else(
+                || "sound halo off\n".to_string(),
+                |s| format!("halo size {:.3}x..{:.3}x of radius (wide {})\n", s.range.0, s.range.1, s.wide),
+            );
+            let shift_line = format!("burn-in shift {} moves, reached {} px x, {} px y\n", shift.1, shift.0.0, shift.0.1);
+            let text = halo_line + &shift_line + &format!(
+                "seconds {secs:.1}\nfull frames {full} ({:.1}/s)\nhalo-only frames {halo} ({:.1}/s)\n\
+                 redrawn cells per halo frame {:.0}\n\
+                 full frame ms: render {:.2}, compose {:.2}, draw {:.2}, present {:.2}\nhalo frame ms {:.3}\n",
+                full as f32 / secs.max(1e-3),
+                halo as f32 / secs.max(1e-3),
+                cells as f32 / halo.max(1) as f32,
+                ms(spent[0], full),
+                ms(spent[1], full),
+                ms(spent[2], full),
+                ms(spent[3], full),
+                ms(spent[4], halo),
+            );
+            let _ = std::fs::write(data_dir().join("last-run-frames.txt"), text);
+        };
 
         let area_rows = screen.rows.saturating_sub(cfg.show_stats as usize).max(1);
         let vp = aspect::viewport(screen.cols, area_rows, None, cfg.aspect_mode, cfg.char_aspect);
@@ -507,26 +771,56 @@ mod win {
 
         loop {
             screen.pump();
-            if QUIT.load(Ordering::SeqCst) {
-                return Ok(());
-            }
-            if let Some(p) = cursor() {
+            let moved = cursor().is_some_and(|p| {
                 if started.elapsed() < GRACE {
                     origin = Some(p);
-                } else if let Some(o) = origin
-                    && ((p.0 - o.0).abs() > MOVE_PX || (p.1 - o.1).abs() > MOVE_PX)
-                {
-                    return Ok(());
+                    false
+                } else {
+                    origin.is_some_and(|o| (p.0 - o.0).abs() > MOVE_PX || (p.1 - o.1).abs() > MOVE_PX)
                 }
+            });
+            if moved || QUIT.load(Ordering::SeqCst) {
+                let secs = started.elapsed().as_secs_f32();
+                report(full_frames, halo_frames, halo_cells, secs, &spent, sound.as_ref(), (shift_reach, shift_moves));
+                return Ok(());
             }
             let now = Instant::now();
-            let deadline = fps.next_deadline();
+            // Full frames keep rendering within the CPU budget: at most one
+            // per `render time / budget`; halo-only frames fill the gaps.
+            let gap = Duration::from_secs_f32((render_avg / budget).min(1.0));
+            let deadline = fps.next_deadline().max(last_full.map_or(now, |t| t + gap));
             if now < deadline {
-                std::thread::sleep((deadline - now).min(SLICE));
+                if let (Some(sh), Some(at)) = (sound.as_mut(), next_halo)
+                    && now >= at
+                    && deadline - now > halo_every / 2
+                {
+                    // Halo-only frame: same picture, the halo moved; redraw
+                    // just the cells that changed.
+                    // Keep a steady cadence; after a stall, restart it from now.
+                    let next = at + halo_every;
+                    next_halo = Some(if next > now { next } else { now + halo_every });
+                    let th = Instant::now();
+                    if let Some(view) = renderer.view() {
+                        let opt = options(&cfg, &ramp, cmap.as_ref(), &levels, Some(sh.next()));
+                        let u = overlays.update_halo(&view, vp.w, vp.h, &scene, &opt);
+                        screen.draw_dirty(u.dirty, vp.w, u.chars, u.colors);
+                        screen.present();
+                        halo_frames += 1;
+                        halo_cells += u.dirty.len() as u64;
+                    }
+                    spent[4] += th.elapsed().as_secs_f64();
+                    continue;
+                }
+                let wake = next_halo.filter(|_| sound.is_some()).map_or(deadline, |h| h.min(deadline));
+                std::thread::sleep(wake.saturating_duration_since(now).min(SLICE));
                 continue;
             }
 
             let dt = fps.begin_frame();
+            // A full frame also updates the halo: the next halo-only frame
+            // is one refresh interval after this one starts.
+            let frame_start = Instant::now();
+            last_full = Some(frame_start);
             if let Some(raw) = collector.latest() {
                 metrics.ingest(&raw);
             }
@@ -536,43 +830,105 @@ mod win {
             scene.update(&channels, &anim, dt);
             levels.clear();
             levels.extend(channels.iter().map(|c| if c.available { c.level } else { 0.0 }));
+            let halo = sound.as_mut().map(SoundHalo::next);
 
             if let Some(sh) = shift.as_mut()
                 && sh.tick()
             {
                 screen.set_shift(sh.offset());
+                let o = sh.offset();
+                shift_reach = (shift_reach.0.max(o.0.abs()), shift_reach.1.max(o.1.abs()));
+                shift_moves += 1;
             }
 
             let settings = if cfg.adaptive_quality { governor.apply(base) } else { base };
             let t0 = Instant::now();
             renderer.render(&scene, vp.w, vp.h, &settings);
+            let t1 = Instant::now();
+            spent[0] += (t1 - t0).as_secs_f64();
+            let r = (t1 - t0).as_secs_f32();
+            render_avg = if render_avg == 0.0 { r } else { 0.9 * render_avg + 0.1 * r };
             if let Some(view) = renderer.view() {
-                let opt = OverlayOptions {
-                    wireframe: cfg.wireframe,
-                    legend: None,
-                    labels: &[],
-                    char_aspect: cfg.char_aspect,
-                    ramp: &ramp,
-                    exposure: cfg.exposure,
-                    color: cmap.as_ref(),
-                    levels: &levels,
-                };
+                let opt = options(&cfg, &ramp, cmap.as_ref(), &levels, halo);
                 let cells = overlays.compose(&view, vp.w, vp.h, &scene, &opt);
+                let t2 = Instant::now();
+                spent[1] += (t2 - t1).as_secs_f64();
                 // No picture-ratio framing: the viewport is the grid's top `area_rows`.
                 for row in 0..vp.h {
                     let r = row * vp.w..(row + 1) * vp.w;
-                    screen.draw_row(row, &cells.chars[r.clone()], cells.colors.map(|c| &c[r]), &mut buf, &mut dx);
+                    screen.draw_row(row, &cells.chars[r.clone()], cells.colors.map(|c| &c[r]));
                 }
+                spent[2] += t2.elapsed().as_secs_f64();
             }
             if cfg.show_stats {
                 let extra = if governor.level() > 0 { format!(" | q-{}", governor.level()) } else { String::new() };
                 let line = ui::stats_line_fit(&metrics.readings(), fps.achieved_fps(), fps.target_fps(), &extra, screen.cols);
                 let mut chars: Vec<char> = line.chars().collect();
                 chars.resize(screen.cols, ' ');
-                screen.draw_row(screen.rows - 1, &chars, None, &mut buf, &mut dx);
+                screen.draw_row(screen.rows - 1, &chars, None);
             }
+            let tp = Instant::now();
             screen.present();
+            spent[3] += tp.elapsed().as_secs_f64();
             governor.update(t0.elapsed().as_secs_f32(), fps.target_fps(), dt);
+            next_halo = Some(frame_start + halo_every);
+            full_frames += 1;
+        }
+    }
+
+    /// The default output device's level (halo size) and bass-weighted
+    /// spectrum (halo brightness), each smoothed and auto-gained.
+    struct SoundHalo {
+        meter: OutputMeter,
+        size: Envelope,
+        bass: Envelope,
+        last: Instant,
+        /// Extra ±25% size swing.
+        wide: bool,
+        /// Smallest and largest size used, for the run log.
+        range: (f32, f32),
+    }
+
+    impl SoundHalo {
+        fn new(wide: bool) -> Self {
+            Self {
+                meter: OutputMeter::spawn(),
+                size: Envelope::new(),
+                bass: Envelope::new(),
+                last: Instant::now(),
+                wide,
+                range: (f32::MAX, f32::MIN),
+            }
+        }
+
+        fn next(&mut self) -> Halo {
+            let dt = self.last.elapsed().as_secs_f32();
+            self.last = Instant::now();
+            let size = self.size.update(self.meter.take_peak(), dt);
+            let bass = self.bass.update(bass_weighted(&self.meter.bands()), dt);
+            let factor = halo_factor(size, self.wide);
+            self.range = (self.range.0.min(factor), self.range.1.max(factor));
+            Halo { factor, lum: halo_lum(bass) }
+        }
+    }
+
+    fn options<'a>(
+        cfg: &'a Config,
+        ramp: &'a Ramp,
+        color: Option<&'a ColorMap>,
+        levels: &'a [f32],
+        halo: Option<Halo>,
+    ) -> OverlayOptions<'a> {
+        OverlayOptions {
+            wireframe: cfg.wireframe,
+            legend: None,
+            labels: &[],
+            char_aspect: cfg.char_aspect,
+            ramp,
+            exposure: cfg.exposure,
+            color,
+            levels,
+            halo,
         }
     }
 
