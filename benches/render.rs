@@ -102,6 +102,9 @@ fn bench(c: &mut Criterion) {
         levels: &[],
         halo: None,
         halo_factors: &[],
+        tags: false,
+        tag_labels: &[],
+        tag_ink: platomon::color::NONE,
     };
     c.bench_function("wqhd_640x240_overlays_wireframe_legend", |b| {
         b.iter(|| {

@@ -725,6 +725,10 @@ mod win {
         let mut governor = QualityGovernor::default();
         let mut overlays = Overlays::new(&scene);
         let mut levels: Vec<f32> = Vec::new();
+        // Solid tags: one short metric label per solid, refreshed every full frame.
+        let tags_on = s.tags;
+        let tag_ink = s.tag_color.resolve(cmap.as_ref().map(|m| &m.gradient));
+        let mut tag_labels: Vec<String> = Vec::new();
         let mut sound = s.sound.then(|| {
             let places = if s.halo_bands {
                 let kinds: Vec<_> = scene.solids.iter().map(|i| i.poly.kind()).collect();
@@ -824,7 +828,7 @@ mod win {
                     let th = Instant::now();
                     if let Some(view) = renderer.view() {
                         let hl = sh.next();
-                        let opt = options(&cfg, &ramp, cmap.as_ref(), &levels, Some(hl), &sh.factors);
+                        let opt = options(&cfg, &ramp, cmap.as_ref(), &levels, Some(hl), &sh.factors, tags_on.then_some((&tag_labels[..], tag_ink)));
                         let u = overlays.update_halo(&view, vp.w, vp.h, &scene, &opt);
                         screen.draw_dirty(u.dirty, vp.w, u.chars, u.colors);
                         screen.present();
@@ -853,6 +857,10 @@ mod win {
             scene.update(&channels, &anim, dt);
             levels.clear();
             levels.extend(channels.iter().map(|c| if c.available { c.level } else { 0.0 }));
+            if tags_on {
+                tag_labels.clear();
+                tag_labels.extend(metrics.readings().iter().map(|r| ui::short_label(r)));
+            }
             let halo = sound.as_mut().map(SoundHalo::next);
 
             if let Some(sh) = shift.as_mut()
@@ -873,7 +881,7 @@ mod win {
             render_avg = if render_avg == 0.0 { r } else { 0.9 * render_avg + 0.1 * r };
             if let Some(view) = renderer.view() {
                 let factors = sound.as_ref().map_or(&[][..], |s| &s.factors[..]);
-                let opt = options(&cfg, &ramp, cmap.as_ref(), &levels, halo, factors);
+                let opt = options(&cfg, &ramp, cmap.as_ref(), &levels, halo, factors, tags_on.then_some((&tag_labels[..], tag_ink)));
                 let cells = overlays.compose(&view, vp.w, vp.h, &scene, &opt);
                 let t2 = Instant::now();
                 spent[1] += (t2 - t1).as_secs_f64();
@@ -972,6 +980,8 @@ mod win {
         levels: &'a [f32],
         halo: Option<Halo>,
         halo_factors: &'a [f32],
+        // Tag labels and colour, when tags are on.
+        tags: Option<(&'a [String], u32)>,
     ) -> OverlayOptions<'a> {
         OverlayOptions {
             wireframe: cfg.wireframe,
@@ -984,6 +994,9 @@ mod win {
             levels,
             halo,
             halo_factors,
+            tags: tags.is_some(),
+            tag_labels: tags.map_or(&[][..], |t| t.0),
+            tag_ink: tags.map_or(color::NONE, |t| t.1),
         }
     }
 

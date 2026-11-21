@@ -172,6 +172,12 @@ pub struct Ground {
     /// Accumulated scroll, world units.
     travelled: Vec2,
     angle: f32,
+    /// Per-frame constants for [`Ground::pattern_coords`], refreshed by
+    /// [`Ground::advance`] instead of recomputed for every pixel: sine and
+    /// cosine of `-angle`, and the current [`Ground::offset`].
+    frame_sin: f32,
+    frame_cos: f32,
+    frame_offset: Vec2,
 }
 
 impl Ground {
@@ -181,7 +187,7 @@ impl Ground {
             Spin::Ccw => TAU / p.rotate_period.max(0.1),
             Spin::Cw => -TAU / p.rotate_period.max(0.1),
         };
-        Self {
+        let mut g = Self {
             enabled: p.lum > 0.0,
             base: albedo_for_lum(p.lum),
             contrast: p.contrast.clamp(0.0, 1.0),
@@ -195,7 +201,17 @@ impl Ground {
             time: 0.0,
             travelled: Vec2::ZERO,
             angle: 0.0,
-        }
+            frame_sin: 0.0,
+            frame_cos: 1.0,
+            frame_offset: Vec2::ZERO,
+        };
+        g.refresh_frame();
+        g
+    }
+
+    fn refresh_frame(&mut self) {
+        (self.frame_sin, self.frame_cos) = (-self.angle).sin_cos();
+        self.frame_offset = self.offset();
     }
 
     pub fn mean_albedo(&self) -> f32 {
@@ -211,6 +227,7 @@ impl Ground {
         self.time += dt;
         self.travelled += self.scroll * dt;
         self.angle = (self.angle + self.rot_rate * dt).rem_euclid(TAU);
+        self.refresh_frame();
     }
 
     /// Current translation of the pattern (scroll + sway), world units.
@@ -222,9 +239,12 @@ impl Ground {
 
     /// Pattern-space coordinates (tile units) of a world point on the ground.
     /// The pattern is rotated by `angle` about the pivot, then translated.
+    #[inline]
     pub fn pattern_coords(&self, x: f32, z: f32) -> Vec2 {
-        let d = rotate_xz(Vec2::new(x, z) - self.pivot, -self.angle);
-        (d - self.offset()) * self.inv_scale
+        let v = Vec2::new(x, z) - self.pivot;
+        let (s, c) = (self.frame_sin, self.frame_cos);
+        let d = Vec2::new(v.x * c + v.y * s, v.y * c - v.x * s);
+        (d - self.frame_offset) * self.inv_scale
     }
 
     /// Albedo at ground point `p`, hit at distance `t` (for anti-alias fading).

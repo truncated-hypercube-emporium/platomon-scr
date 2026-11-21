@@ -372,6 +372,8 @@ pub struct Overlays {
     halo_cells: Vec<usize>,
     scratch: Vec<usize>,
     dirty: Vec<usize>,
+    tags: TagState,
+    journal: Journal,
 }
 
 /// What to draw this frame.
@@ -392,6 +394,280 @@ pub struct OverlayOptions<'a> {
     /// Per-slot halo sizes overriding `halo.factor` (empty = all solids use
     /// `halo.factor`).
     pub halo_factors: &'a [f32],
+    /// Solid tags: each solid's label floats at a fixed place on screen with
+    /// a leader line to the solid ([`TagState`]), on top of everything.
+    pub tags: bool,
+    /// One tag text per slot (falls back to the solid's name).
+    pub tag_labels: &'a [String],
+    /// Tag colour when colour is on ([`color::NONE`] = default text colour;
+    /// see [`color::TagColor`]).
+    pub tag_ink: u32,
+}
+
+// ------------------------------------------------------------------ tags
+
+/// Where one solid's tag sits. The text stays put while the solid moves;
+/// only its leader line follows.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TagAnchor {
+    /// Text row.
+    y: usize,
+    /// Column of the text's attaching end (the end nearest the solid).
+    x: usize,
+    /// Text runs right from `x` (the solid started to its left), else left.
+    rightward: bool,
+}
+
+/// Underscores either side of a tag's label (`__RAM 42%__`).
+const TAG_RULE: &str = "__";
+/// Columns reserved per tag when laying them out (labels change length).
+const TAG_MIN_W: usize = 14;
+/// Tags are laid out clear of this multiple of a full-size solid's radius
+/// (room for a grown halo).
+const TAG_CLEAR: f32 = 1.35;
+
+/// Tag layout (fixed once per grid size and solid count) and the cells the
+/// tags covered last frame, with what lay under them.
+#[derive(Debug, Clone, Default)]
+struct TagState {
+    key: (usize, usize, usize),
+    anchors: Vec<TagAnchor>,
+    /// (cell, glyph, colour) under each tag cell drawn last.
+    under: Vec<(usize, char, u32)>,
+    /// Per-cell stamp: cells already in `under` this frame.
+    stamp: Vec<u32>,
+    epoch: u32,
+}
+
+impl TagState {
+    fn begin(&mut self, n: usize) {
+        self.under.clear();
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 || self.stamp.len() != n {
+            self.stamp.clear();
+            self.stamp.resize(n, 0);
+            self.epoch = 1;
+        }
+    }
+}
+
+/// Records each changed cell's previous glyph and colour once, so
+/// [`Overlays::update_halo`] can report exactly what changed on screen.
+#[derive(Debug, Clone, Default)]
+struct Journal {
+    on: bool,
+    epoch: u32,
+    stamp: Vec<u32>,
+    saved: Vec<(usize, char, u32)>,
+}
+
+impl Journal {
+    fn begin(&mut self, n: usize) {
+        self.on = true;
+        self.saved.clear();
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 || self.stamp.len() != n {
+            self.stamp.clear();
+            self.stamp.resize(n, 0);
+            self.epoch = 1;
+        }
+    }
+
+    #[inline]
+    fn touch(&mut self, c: usize, cells: &[char], colors: &[u32]) {
+        if self.on && self.stamp[c] != self.epoch {
+            self.stamp[c] = self.epoch;
+            self.saved.push((c, cells[c], colors.get(c).copied().unwrap_or(color::NONE)));
+        }
+    }
+}
+
+/// Screen radius (rows) of a sphere of `radius` around `center`, and its
+/// projected centre.
+fn screen_circle(frame: &FrameView<'_>, center: Vec3A, radius: f32) -> Option<((f32, f32), f32)> {
+    let proj = frame.proj;
+    let c = proj.project(center)?;
+    let up = proj.project(center + proj.cam.up * radius)?;
+    Some((c, (up.1 - c.1).abs().max(0.5)))
+}
+
+/// Tags sit on an ellipse this far from the picture's centre toward its
+/// edges (0 = centre, 1 = edge).
+pub const TAG_RING: f32 = 0.75;
+/// The arc of that ellipse the tags spread over, degrees (0 = right,
+/// 90 = top, 180 = left): the upper part, so tags sit above the solids.
+const TAG_ARC: (f32, f32) = (165.0, 15.0);
+
+/// Place the tags around the periphery: on the upper arc of an ellipse
+/// [`TAG_RING`] of the way from the centre to the edges, in the solids'
+/// left-to-right order (so leader lines don't cross), each at least two
+/// rows above its solid (at full size, halo included); tags don't overlap.
+fn layout_tags(frame: &FrameView<'_>, w: usize, h: usize, scene: &Scene, labels: &[String]) -> Vec<TagAnchor> {
+    let n = scene.solids.len();
+    let (hw, hh) = (w as f32 * 0.5, h as f32 * 0.5);
+    // Leave room for the solid at full size with a grown halo, wherever its
+    // size is now.
+    let circle = |i: usize| {
+        let r = scene.solids[i].scale.max(scene.max_radius) * TAG_CLEAR;
+        screen_circle(frame, scene.full_size_center(i), r).unwrap_or(((hw, hh), 1.0))
+    };
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| circle(a).0.0.total_cmp(&circle(b).0.0));
+    let mut placed: Vec<(usize, usize, usize)> = Vec::new(); // (row, col0, col1)
+    let mut anchors = vec![TagAnchor { y: 0, x: 0, rightward: true }; n];
+    for (k, &i) in order.iter().enumerate() {
+        let ((_, cy), r) = circle(i);
+        let f = if n == 1 { 0.5 } else { k as f32 / (n - 1) as f32 };
+        let theta = (TAG_ARC.0 + (TAG_ARC.1 - TAG_ARC.0) * f).to_radians();
+        let ex = hw + TAG_RING * hw * theta.cos();
+        // on the ring, but never lower than two rows above the solid's top
+        let ey = (hh - TAG_RING * hh * theta.sin()).min(cy - r - 2.0);
+        let label_w = labels.get(i).map_or(0, |l| l.chars().count());
+        let tw = (label_w.max(TAG_MIN_W - 2 * TAG_RULE.len()) + 2 * TAG_RULE.len()).min(w.max(1));
+        // Text runs outward from the end the leader attaches to.
+        let rightward = ex >= hw;
+        let x = if rightward {
+            (ex.round().max(0.0) as usize).min(w.saturating_sub(tw))
+        } else {
+            (ex.round().max(0.0) as usize).max(tw.saturating_sub(1)).min(w.saturating_sub(1))
+        };
+        let (c0, c1) = if rightward { (x, x + tw - 1) } else { (x + 1 - tw.min(x + 1), x) };
+        let clash = |y: usize, placed: &[(usize, usize, usize)]| {
+            placed.iter().any(|&(py, p0, p1)| py.abs_diff(y) < 2 && c0 <= p1 + 1 && p0 <= c1 + 1)
+        };
+        // Clear of other tags: move up two rows at a time (staying above the
+        // solid), and only if the top is reached, down.
+        let start = (ey.round().max(0.0) as usize).min(h.saturating_sub(1));
+        let mut y = start;
+        let mut step = 0;
+        while clash(y, &placed) && step < h {
+            step += 2;
+            // past the top: rows below the start, 2 apart
+            y = start.checked_sub(step).unwrap_or(step);
+            if y >= h {
+                break;
+            }
+        }
+        let y = y.min(h.saturating_sub(1));
+        placed.push((y, c0, c1));
+        anchors[i] = TagAnchor { y, x, rightward };
+    }
+    anchors
+}
+
+/// Width / height of a cell in the frame's projection.
+fn frame_aspect(frame: &FrameView<'_>) -> f32 {
+    let p = frame.proj;
+    // a unit step right vs up at the same depth, in cells
+    let o = p.cam.pos + p.cam.forward * 10.0;
+    match (p.project(o), p.project(o + p.cam.right), p.project(o + p.cam.up)) {
+        (Some(a), Some(b), Some(c)) => ((c.1 - a.1).abs() / (b.0 - a.0).abs().max(1e-6)).clamp(0.05, 20.0),
+        _ => 0.5,
+    }
+}
+
+/// Draw every solid's tag and leader line on top of `cells`, remembering
+/// what lay under them in `t.under`.
+#[allow(clippy::too_many_arguments)]
+fn draw_tags(
+    t: &mut TagState,
+    j: &mut Journal,
+    cells: &mut [char],
+    colors: &mut [u32],
+    halo_mask: &[bool],
+    wire_mask: Option<&[bool]>,
+    frame: &FrameView<'_>,
+    w: usize,
+    h: usize,
+    scene: &Scene,
+    opt: &OverlayOptions<'_>,
+) {
+    t.under.clear();
+    let n = scene.solids.len();
+    if !opt.tags || n == 0 || w < 4 || h < 2 || cells.len() < w * h || frame.ids.len() < w * h {
+        return;
+    }
+    t.begin(w * h);
+    if t.key != (w, h, n) || t.anchors.len() != n {
+        t.anchors = layout_tags(frame, w, h, scene, opt.tag_labels);
+        t.key = (w, h, n);
+    }
+    let color_on = colors.len() == cells.len();
+    let ink = opt.tag_ink;
+    let aspect = frame_aspect(frame);
+    let sizes = opt.halo_sizes();
+    let mut text_cells: Vec<usize> = Vec::new();
+    let put = |c: usize, ch: char, t: &mut TagState, j: &mut Journal, cells: &mut [char], colors: &mut [u32]| {
+        j.touch(c, cells, colors);
+        if t.stamp[c] != t.epoch {
+            t.stamp[c] = t.epoch;
+            t.under.push((c, cells[c], if color_on { colors[c] } else { color::NONE }));
+        }
+        cells[c] = ch;
+        if color_on {
+            colors[c] = ink;
+        }
+    };
+    for (i, inst) in scene.solids.iter().enumerate() {
+        let a = t.anchors[i];
+        let label = opt.tag_labels.get(i).cloned().unwrap_or_else(|| inst.poly.kind().id().to_string());
+        let text: Vec<char> = format!("{TAG_RULE}{label}{TAG_RULE}").chars().filter(|c| !c.is_control()).collect();
+        // Text cells, clipped to the row.
+        text_cells.clear();
+        let len = text.len();
+        let x0 = if a.rightward { a.x as isize } else { a.x as isize + 1 - len as isize };
+        for (k, &ch) in text.iter().enumerate() {
+            let x = x0 + k as isize;
+            if x >= 0 && (x as usize) < w && a.y < h {
+                text_cells.push(a.y * w + x as usize);
+                put(a.y * w + x as usize, ch, t, j, cells, colors);
+            }
+        }
+        // Leader line from beside the attaching end toward the solid's
+        // centre, stopping at its halo / wireframe / surface.
+        let factor = sizes.as_ref().map_or(1.0, |s| s.get(i).or(s.last()).copied().unwrap_or(1.0));
+        let Some(((cx, cy), r)) = screen_circle(frame, inst.center, inst.scale * factor.max(1.0)) else { continue };
+        let below = cy > a.y as f32 + 0.5;
+        let sx = if a.rightward { a.x as f32 - 1.0 } else { a.x as f32 + 1.0 } + 0.5;
+        let sy = a.y as f32 + if below { 1.0 } else { 0.0 } + 0.5;
+        let (dx, dy) = (cx - sx, cy - sy);
+        // Horizontal runs continue the tag's underline (`-` is a shading glyph).
+        let ch = match slope_char(dx, dy, aspect) {
+            '-' => '_',
+            c => c,
+        };
+        // One glyph per row for diagonal and vertical strokes (a 45° line
+        // crosses two columns per row: `/` steps two columns at a time),
+        // one per column for horizontal ones.
+        let steps = if ch == '_' { dx.abs() } else { dy.abs() }.ceil().max(1.0) as usize;
+        let mut last = usize::MAX;
+        for s in 0..=steps {
+            let f = s as f32 / steps as f32;
+            let (x, y) = (sx + dx * f, sy + dy * f);
+            if x < 0.0 || y < 0.0 || x >= w as f32 || y >= h as f32 {
+                break;
+            }
+            let c = y as usize * w + x as usize;
+            if c == last {
+                continue;
+            }
+            last = c;
+            // distance to the centre in rows (columns scaled by the aspect)
+            let d = ((x - cx) * aspect).hypot(y - cy);
+            if d <= r * 1.05 {
+                let edge = frame.ids[c] as usize == i
+                    || (sizes.is_some() && halo_mask.get(c).copied().unwrap_or(false))
+                    || wire_mask.is_some_and(|m| m.get(c).copied().unwrap_or(false));
+                if edge || d <= r * 0.35 {
+                    break;
+                }
+            }
+            if text_cells.contains(&c) {
+                continue;
+            }
+            put(c, ch, t, j, cells, colors);
+        }
+    }
 }
 
 impl OverlayOptions<'_> {
@@ -546,6 +822,8 @@ impl Overlays {
             halo_cells: Vec::new(),
             scratch: Vec::new(),
             dirty: Vec::new(),
+            tags: TagState::default(),
+            journal: Journal::default(),
         }
     }
 
@@ -565,6 +843,18 @@ impl Overlays {
         self.dirty.clear();
         let color_on = opt.color.is_some();
         if self.base.len() == w * h && self.cells.len() == w * h && self.halo_mask.len() == w * h {
+            // Every write goes through the journal, which keeps each cell's
+            // on-screen value from before this update.
+            self.journal.begin(w * h);
+            let colors: &mut [u32] = if color_on && self.colors.len() == w * h { &mut self.colors } else { &mut [] };
+            // Lift last frame's tags off the picture.
+            for &(c, g, k) in &self.tags.under {
+                self.journal.touch(c, &self.cells, colors);
+                self.cells[c] = g;
+                if let Some(slot) = colors.get_mut(c) {
+                    *slot = k;
+                }
+            }
             for &c in &self.halo_cells {
                 self.halo_mask[c] = false;
             }
@@ -576,20 +866,38 @@ impl Overlays {
             let lum_on = opt.halo.map_or(0.0, |hl| hl.lum);
             for &c in self.halo_cells.iter().chain(&fresh) {
                 let l = if self.halo_mask[c] { lum_on } else { self.base[c] };
-                let g = opt.ramp.glyph(l);
-                let col = opt.color.map(|cm| cell_color(cm, frame, opt.ramp, opt.levels, c, l));
-                let changed = self.cells[c] != g || col.is_some_and(|k| self.colors.get(c) != Some(&k));
-                if changed {
-                    self.cells[c] = g;
-                    if let (Some(k), Some(slot)) = (col, self.colors.get_mut(c)) {
-                        *slot = k;
-                    }
-                    self.dirty.push(c);
+                self.journal.touch(c, &self.cells, colors);
+                self.cells[c] = opt.ramp.glyph(l);
+                if let Some(slot) = colors.get_mut(c) {
+                    *slot = opt.color.map_or(color::NONE, |cm| cell_color(cm, frame, opt.ramp, opt.levels, c, l));
                 }
             }
-            self.dirty.sort_unstable();
-            self.dirty.dedup();
             self.scratch = std::mem::replace(&mut self.halo_cells, fresh);
+            // Tags back on top; their leader lines follow the halo.
+            let wire = opt.wireframe.then_some(&self.mask[..]).filter(|m| m.len() == w * h);
+            draw_tags(
+                &mut self.tags,
+                &mut self.journal,
+                &mut self.cells,
+                colors,
+                &self.halo_mask,
+                wire,
+                frame,
+                w,
+                h,
+                scene,
+                opt,
+            );
+            let (cells, colors) = (&self.cells, &*colors);
+            self.dirty.extend(
+                self.journal
+                    .saved
+                    .iter()
+                    .filter(|&&(c, g, k)| cells[c] != g || colors.get(c).is_some_and(|&now| now != k))
+                    .map(|s| s.0),
+            );
+            self.journal.on = false;
+            self.dirty.sort_unstable();
         }
         HaloUpdate {
             dirty: &self.dirty,
@@ -690,6 +998,11 @@ impl Overlays {
             };
             draw_legend(&mut g, panel, &self.wires, scene, opt, &icon_ink);
         }
+        // Tags float above everything, the legend included.
+        self.journal.on = false;
+        let colors: &mut [u32] = if opt.color.is_some() && self.colors.len() == w * h { &mut self.colors } else { &mut [] };
+        let wire = opt.wireframe.then_some(&self.mask[..]).filter(|m| m.len() == w * h);
+        draw_tags(&mut self.tags, &mut self.journal, &mut self.cells, colors, &self.halo_mask, wire, frame, w, h, scene, opt);
         Cells { chars: &self.cells, colors: opt.color.is_some().then_some(&self.colors[..]) }
     }
 }
@@ -859,6 +1172,9 @@ mod tests {
             levels: &levels,
             halo,
             halo_factors: &[],
+            tags: false,
+            tag_labels: &[],
+            tag_ink: color::NONE,
         };
         let out = o.compose(&view, W, H, &scene, &opt);
         (plain, out.chars.to_vec(), out.colors.map(<[u32]>::to_vec), view.ids.to_vec())
@@ -917,6 +1233,151 @@ mod tests {
         let col = text.lines().nth(row).unwrap().find("CPU 4%").unwrap();
         assert_eq!(cols[row * W + col], color::NONE, "label text in default colour");
         assert!(cols.contains(&0xff0000), "slot 4 (full load) icon drawn in the last stop");
+    }
+
+    fn tag_opts<'a>(ramp: &'a Ramp, labels: &'a [String], halo: Option<Halo>, wireframe: bool) -> OverlayOptions<'a> {
+        OverlayOptions {
+            wireframe,
+            legend: None,
+            labels,
+            char_aspect: 0.5,
+            ramp,
+            exposure: 1.0,
+            color: None,
+            levels: &[],
+            halo,
+            halo_factors: &[],
+            tags: true,
+            tag_labels: labels,
+            tag_ink: color::NONE,
+        }
+    }
+
+    /// Row and column of `needle` in the grid.
+    fn find(chars: &[char], w: usize, needle: &str) -> Option<(usize, usize)> {
+        chars.chunks(w).enumerate().find_map(|(y, r)| r.iter().collect::<String>().find(needle).map(|x| (y, x)))
+    }
+
+    #[test]
+    fn tags_stay_put_and_lead_to_their_solids() {
+        let (w, h) = (160, 60);
+        let anim = AnimParams::default();
+        let mut scene = Scene::demo(&anim);
+        let labels: Vec<String> = ["CPU 12%", "RAM 40%", "GPU 3%", "DSK 1.0M", "NET 0.2M"].map(String::from).to_vec();
+        let ramp = Ramp::default();
+        let mut r = Renderer::new();
+        let mut ov = Overlays::new(&scene);
+        let mut first = Vec::new();
+        for step in 0..3 {
+            r.render(&scene, w, h, &RenderSettings { spp: 1, ..RenderSettings::default() });
+            let view = r.view().unwrap();
+            let opt = tag_opts(&ramp, &labels, None, false);
+            let chars = ov.compose(&view, w, h, &scene, &opt).chars.to_vec();
+            let at: Vec<(usize, usize)> = labels
+                .iter()
+                .map(|l| find(&chars, w, &format!("{TAG_RULE}{l}{TAG_RULE}")).unwrap_or_else(|| panic!("tag {l} drawn")))
+                .collect();
+            if step == 0 {
+                first = at.clone();
+                // tags sit in the periphery, about TAG_RING of the way out,
+                // and above their solids
+                for (i, (&(ty, tx), l)) in at.iter().zip(&labels).enumerate() {
+                    let text_w = l.len() + 2 * TAG_RULE.len();
+                    let mid = tx as f32 + text_w as f32 * 0.5;
+                    let (u, v) = ((mid - w as f32 * 0.5) / (w as f32 * 0.5), (ty as f32 + 0.5 - h as f32 * 0.5) / (h as f32 * 0.5));
+                    let ring = u.hypot(v);
+                    assert!((0.6..=1.0).contains(&ring), "{l}: at {ring:.2} of the way out (row {ty}, col {tx})");
+                    assert!(v < 0.0, "{l}: in the upper half");
+                    let full = screen_circle(&view, scene.full_size_center(i), scene.max_radius).unwrap();
+                    assert!((ty as f32) < full.0.1 - full.1, "{l} (row {ty}) is above its solid (top {:.1})", full.0.1 - full.1);
+                }
+                // left-to-right order follows the solids
+                let mut by_solid: Vec<usize> = (0..5).collect();
+                by_solid.sort_by(|&a, &b| {
+                    let xa = screen_circle(&view, scene.full_size_center(a), 1.0).unwrap().0.0;
+                    let xb = screen_circle(&view, scene.full_size_center(b), 1.0).unwrap().0.0;
+                    xa.total_cmp(&xb)
+                });
+                let xs: Vec<usize> = by_solid.iter().map(|&i| at[i].1 + labels[i].len() / 2).collect();
+                assert!(xs.windows(2).all(|p| p[0] <= p[1]), "tags ordered like their solids: {xs:?}");
+                // no two tags on the same row overlap
+                for (a, la) in at.iter().zip(&labels) {
+                    for (b, lb) in at.iter().zip(&labels) {
+                        if a != b && a.0 == b.0 {
+                            let (ea, eb) = (a.1 + la.len() + 4, b.1 + lb.len() + 4);
+                            assert!(ea <= b.1 || eb <= a.1, "{la} and {lb} overlap");
+                        }
+                    }
+                }
+            } else {
+                assert_eq!(at, first, "tag text stays where it was while the solids move");
+            }
+            // each leader line ends next to its solid: some line glyph lies
+            // within a few cells of the solid's projected outline
+            for (i, s) in scene.solids.iter().enumerate() {
+                let ((cx, cy), rr) = screen_circle(&view, s.center, s.scale).unwrap();
+                let near = (0..w * h).any(|c| {
+                    let (x, y) = ((c % w) as f32 + 0.5, (c / w) as f32 + 0.5);
+                    let d = ((x - cx) * 0.5).hypot(y - cy);
+                    matches!(chars[c], '/' | '\\' | '|' | '_') && d <= rr * 1.05 + 1.5 && d >= rr * 0.3
+                });
+                assert!(near, "solid {i}'s leader reaches it");
+            }
+            // move the solids (camera and spin) for the next step
+            let ch = vec![crate::metrics::Channel { available: true, level: 0.9, spin_y: 0.9, spin_x: 0.3, activity: 0.9 }; 5];
+            scene.update(&ch, &anim, 0.8);
+        }
+    }
+
+    #[test]
+    fn tags_cover_the_picture_and_go_with_the_option() {
+        let scene = Scene::demo(&AnimParams::default());
+        let (w, h) = (W, H);
+        let mut r = Renderer::new();
+        r.render(&scene, w, h, &RenderSettings { spp: 1, ..RenderSettings::default() });
+        let view = r.view().unwrap();
+        let ramp = Ramp::default();
+        let labels: Vec<String> = (0..5).map(|i| format!("S{i}")).collect();
+        let mut off = tag_opts(&ramp, &labels, None, false);
+        off.tags = false;
+        let plain = Overlays::new(&scene).compose(&view, w, h, &scene, &off).chars.to_vec();
+        let tagged = Overlays::new(&scene).compose(&view, w, h, &scene, &tag_opts(&ramp, &labels, None, false)).chars.to_vec();
+        assert!(find(&plain, w, "__S0__").is_none());
+        let (y, x) = find(&tagged, w, "__S0__").unwrap();
+        // the text replaces whatever was rendered there
+        let row: String = tagged[y * w + x..y * w + x + 6].iter().collect();
+        assert_eq!(row, "__S0__");
+        assert!(tagged.iter().zip(&plain).filter(|(a, b)| a != b).count() > 5 * 6);
+    }
+
+    #[test]
+    fn halo_only_updates_keep_tags_and_match_a_full_compose() {
+        let scene = Scene::demo(&AnimParams::default());
+        let (w, h) = (W, H);
+        let mut r = Renderer::new();
+        r.render(&scene, w, h, &RenderSettings { spp: 1, ..RenderSettings::default() });
+        let view = r.view().unwrap();
+        let ramp = Ramp::default();
+        let labels: Vec<String> = (0..5).map(|i| format!("SOLID {i}")).collect();
+        for wireframe in [false, true] {
+            let mut inc = Overlays::new(&scene);
+            let steps = [1.15, 1.45, 1.45, 1.2, 1.0, 1.5];
+            let opt = |f: f32| tag_opts(&ramp, &labels, Some(Halo { factor: f, lum: 0.9 }), wireframe);
+            let mut chars = inc.compose(&view, w, h, &scene, &opt(steps[0])).chars.to_vec();
+            for (k, &f) in steps.iter().enumerate().skip(1) {
+                let u = inc.update_halo(&view, w, h, &scene, &opt(f));
+                for &c in u.dirty {
+                    chars[c] = u.chars[c];
+                }
+                assert!(u.dirty.windows(2).all(|p| p[0] < p[1]), "ascending, no repeats");
+                if k == 2 {
+                    assert!(u.dirty.is_empty(), "same halo again: nothing to redraw");
+                }
+                let full = Overlays::new(&scene).compose(&view, w, h, &scene, &opt(f)).chars.to_vec();
+                assert_eq!(chars, full, "step {k} (wireframe {wireframe})");
+                assert!(find(&chars, w, "__SOLID 3__").is_some(), "tags survive halo frames");
+            }
+        }
     }
 
     #[test]
@@ -997,6 +1458,9 @@ mod tests {
                 levels: &levels,
                 halo,
                 halo_factors: &[],
+                tags: false,
+                tag_labels: &[],
+                tag_ink: color::NONE,
             };
             let steps = [
                 Some(Halo { factor: 1.15, lum: 0.2 }),
@@ -1049,6 +1513,9 @@ mod tests {
             levels: &[],
             halo: Some(Halo { factor: 1.2, lum: 1.0 }),
             halo_factors: f,
+            tags: false,
+            tag_labels: &[],
+            tag_ink: color::NONE,
         };
         let calm: &'static [f32] = &[1.15; 5];
         let base = Overlays::new(&scene).compose(&view, W, H, &scene, &opt(calm)).chars.to_vec();

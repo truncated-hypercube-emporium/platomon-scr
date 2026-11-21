@@ -1,4 +1,4 @@
-# platomon 1.3.1
+# platomon 1.3.2
 
 A terminal system monitor: one path-traced polyhedron per metric, rendered in monochrome ASCII on
 concentric rings. Each solid's scale and spin follow its metric; the frame rate (5–150 fps) follows
@@ -340,7 +340,7 @@ At that resolution expect the adaptive quality to drop to `q-1`/`q-2` and tens o
 ## Windows screensaver
 
 **Download:** `platomon.scr` and `platomon-config.exe` are attached to the
-[v1.3.1 release](https://github.com/truncated-hypercube-emporium/platomon-scr/releases/tag/v1.3.1)
+[v1.3.2 release](https://github.com/truncated-hypercube-emporium/platomon-scr/releases/tag/v1.3.2)
 (64-bit Windows 10/11, no installer, no dependencies). To build them yourself,
 `scripts\build-scr.ps1` writes both to `dist\`.
 
@@ -349,6 +349,23 @@ To install, copy both files to `C:\Windows\System32` (administrator rights neede
 Screen saver. `platomon-config.exe` opens the same settings dialog as the Settings… button there.
 The `install` folder has both files and `install-platomon-scr.bat`, which moves them there (asking for
 administrator rights).
+
+**New in 1.3.2:**
+
+- **Solid tags** (on by default; *Solid tags* in the dialog): each solid's metric (`__RAM 42%__`)
+  floats at a fixed place around the upper edge of the picture, on a ring 75% of the way from the
+  centre to the edges, above its solid and in the solids' left-to-right order. A leader line (`/`,
+  `\`, `|` or `_`) follows the solid as it moves and stops at its halo, wireframe or surface. Tags
+  are drawn over everything and redrawn on halo-only frames too.
+- **Tag colour** (*Tag colour*): the complementary hue of the colour theme (default), a tint of the
+  theme itself, or white; every choice is lifted to at least 11:1 contrast against the black
+  background. Monochrome tags use the normal text colour.
+- **About twice as fast with a background plane**: rays skip solids they cannot reach (bounding
+  spheres), and two per-frame lookup tables list the solids each screen tile can show and the
+  solids that can shadow each part of the ground; ground bounce and light-sampling directions come
+  from precomputed tables. A 640×240 frame with 16 solids and a checkerboard renders in about
+  6.1 ms instead of 14 ms (`cargo run --release --example ground_bench`). With the same CPU budget
+  the screensaver uses the gain for smaller text (more cells) and a higher frame rate.
 
 **New in 1.3.1:**
 
@@ -456,6 +473,8 @@ levels=auto            ; auto | 10 | 16 | 32
 sound=on               ; sound halo from the default output device
 halo_wide=off          ; on = halo size swing ±30% of the radius instead of ±5%
 halo_bands=on          ; on = each solid's halo follows its frequency band; off = overall level
+tags=on                ; solid tags with leader lines
+tag_color=complement   ; complement | theme | white | #RRGGBB (lifted to stay readable)
 shift=on
 shift_min_frames=600
 shift_max_frames=3600

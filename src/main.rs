@@ -36,7 +36,7 @@ enum ListWhat {
 /// Platonic-solid ASCII system monitor.
 ///
 /// One path-traced solid per metric, on concentric rings. Keys: s = stats bar,
-/// l = legend, w = wireframe, q / Esc / Ctrl-C = quit.
+/// l = legend, w = wireframe, t = tags, q / Esc / Ctrl-C = quit.
 #[derive(Parser, Debug)]
 #[command(name = "platomon", version, about, long_about = None)]
 struct Cli {
@@ -124,6 +124,12 @@ struct Cli {
     /// Overlay each solid's wireframe in inverted luminosity (key w).
     #[arg(long)]
     wireframe: bool,
+    /// Tag each solid with its metric: the text floats at a fixed place with a line to the solid (key t).
+    #[arg(long)]
+    tags: bool,
+    /// Tag colour with a gradient: theme, complement (default), white or #RRGGBB; lifted to stay readable.
+    #[arg(long, value_name = "MODE|#RRGGBB")]
+    tag_color: Option<String>,
 
     // ---- colour
     /// Colour gradient: off, a preset (see --list gradients) or hex stops like "#000:#f80:#fff".
@@ -236,6 +242,13 @@ fn apply_cli(cfg: &mut Config, cli: &Cli) -> Result<(), String> {
     }
     if cli.wireframe {
         cfg.wireframe = true;
+    }
+    if cli.tags {
+        cfg.tags = true;
+    }
+    if let Some(c) = &cli.tag_color {
+        c.parse::<platomon::color::TagColor>().map_err(|e| format!("--tag-color: {e}"))?;
+        cfg.tag_color = c.clone();
     }
     if cli.fps_invert {
         cfg.fps_invert = true;
@@ -507,6 +520,9 @@ fn snapshot(cfg: &Config, slots: &[SlotSpec], ratio: Option<f32>, (w, h): (usize
         levels: &ch.iter().map(|c| c.level).collect::<Vec<_>>(),
         halo: None,
         halo_factors: &[],
+        tags: cfg.tags,
+        tag_labels: &labels,
+        tag_ink: cfg.tag_ink(cmap.as_ref()),
     };
     let mut overlays = Overlays::new(&scene);
     let mut s = String::new();
@@ -726,7 +742,10 @@ fn run(
     let legend = cfg.legend_params();
     let mut show_legend = cfg.legend;
     let mut wireframe = cfg.wireframe;
+    let mut tags = cfg.tags;
+    let tag_ink = cfg.tag_ink(cmap);
     let mut labels: Vec<String> = Vec::new();
+    let mut tag_labels: Vec<String> = Vec::new();
 
     loop {
         // Wait for the frame deadline, staying responsive to input. Input is
@@ -757,6 +776,7 @@ fn run(
                     }
                     Action::ToggleLegend => show_legend = !show_legend,
                     Action::ToggleWireframe => wireframe = !wireframe,
+                    Action::ToggleTags => tags = !tags,
                     Action::Resize(w, h) => {
                         (cols, rows) = (w, h);
                         need_clear = true;
@@ -823,6 +843,10 @@ fn run(
         if show_legend {
             legend_labels(&readings, legend.size, &mut labels);
         }
+        if tags {
+            tag_labels.clear();
+            tag_labels.extend(readings.iter().map(|r| ui::short_label(r)));
+        }
         let opt = OverlayOptions {
             wireframe,
             legend: show_legend.then_some(&legend),
@@ -834,6 +858,9 @@ fn run(
             levels: &levels,
             halo: None,
             halo_factors: &[],
+            tags,
+            tag_labels: &tag_labels,
+            tag_ink,
         };
         if let Some(view) = renderer.view() {
             let cells = overlays.compose(&view, vp.w, vp.h, &scene, &opt);

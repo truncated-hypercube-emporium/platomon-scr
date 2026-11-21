@@ -342,6 +342,11 @@ pub struct ScrSettings {
     /// spectrum, the simplest solid to the bass and the most complex to the
     /// treble; off = every halo follows the overall level.
     pub halo_bands: bool,
+    /// Solid tags: each solid's metric floats at a fixed place on screen,
+    /// with a line to the solid that stops at its halo or wireframe.
+    pub tags: bool,
+    /// Tag colour with a colour gradient on (always lifted to stay readable).
+    pub tag_color: crate::color::TagColor,
     /// OLED burn-in protection: move the picture 1 px at random intervals.
     pub shift: bool,
     pub shift_min_frames: u32,
@@ -371,6 +376,8 @@ impl Default for ScrSettings {
             sound: true,
             halo_wide: false,
             halo_bands: true,
+            tags: true,
+            tag_color: crate::color::TagColor::Complement,
             shift: true,
             shift_min_frames: 600,
             shift_max_frames: 3600,
@@ -501,6 +508,12 @@ pub fn choices() -> Vec<Choice> {
                 opt("off", "Overall level (all solids together)"),
             ],
         ),
+        always("tags", "Solid tags (metric + leader line)", on_off()),
+        always(
+            "tag_color",
+            "Tag colour",
+            crate::color::TagColor::CHOICES.iter().map(|c| opt(&c.id(), c.describe())).collect(),
+        ),
         always(
             "shift_radius",
             "Burn-in shift range",
@@ -531,6 +544,8 @@ impl ScrSettings {
             ("sound", on_off(self.sound)),
             ("halo_wide", on_off(self.halo_wide)),
             ("halo_bands", on_off(self.halo_bands)),
+            ("tags", on_off(self.tags)),
+            ("tag_color", self.tag_color.id()),
             ("shift", on_off(self.shift)),
             ("shift_min_frames", self.shift_min_frames.to_string()),
             ("shift_max_frames", self.shift_max_frames.to_string()),
@@ -576,6 +591,8 @@ impl ScrSettings {
             sound: flag("sound", d.sound),
             halo_wide: flag("halo_wide", d.halo_wide),
             halo_bands: flag("halo_bands", d.halo_bands),
+            tags: flag("tags", d.tags),
+            tag_color: val("tag_color").and_then(|v| v.parse().ok()).unwrap_or(d.tag_color),
             shift: flag("shift", d.shift),
             shift_min_frames: shift_min,
             shift_max_frames: shift_max,
@@ -729,11 +746,14 @@ mod tests {
         assert_eq!((cols2, rows2), (465, 144));
         assert_eq!(apply_density(&WQHD, FONT_MIN, 2).0, FONT_FLOOR);
         assert_eq!(apply_density(&WQHD, 5, 2).0, FONT_FLOOR, "never below the floor");
-        // the plan uses it: same seed, density 2 ⇒ half the font (or the floor)
-        let one = plan(&WQHD, 5, &ScrSettings { density: 1, ..ScrSettings::default() }).unwrap();
+        // the plan uses it: density 2 ⇒ half the font (or the floor) of the
+        // budget size from the plan's own speed test (two separate speed
+        // tests can differ, so compare against the same measurement)
         let two = plan(&WQHD, 5, &ScrSettings::default()).unwrap();
-        assert_eq!(two.font_px, ((one.font_px as f32 / 2.0).round() as i16).max(FONT_FLOOR));
-        assert!(two.est_grid.0 > one.est_grid.0 && two.est_grid.1 > one.est_grid.1);
+        let (budget_px, ..) = font_height(&WQHD, two.config.fps_max, two.sec_per_cell, two.budget);
+        let one = apply_density(&WQHD, budget_px, 1);
+        assert_eq!(two.font_px, ((budget_px as f32 / 2.0).round() as i16).max(FONT_FLOOR));
+        assert!(two.font_px == FONT_FLOOR || (two.est_grid.0 > one.1 && two.est_grid.1 > one.2));
     }
 
     #[test]
@@ -796,6 +816,8 @@ mod tests {
             sound: false,
             halo_wide: true,
             halo_bands: false,
+            tags: false,
+            tag_color: crate::color::TagColor::Theme,
             shift: false,
             shift_min_frames: 10,
             shift_max_frames: 20,
