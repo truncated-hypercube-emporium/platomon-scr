@@ -15,8 +15,10 @@ pub mod overlay;
 #[cfg(all(windows, feature = "screensaver"))]
 pub mod scrconfig;
 pub mod screensaver;
+pub mod scrlog;
 #[cfg(windows)]
 pub mod winconsole;
 pub mod render;
 pub mod scene;
+pub mod tiles;
 pub mod ui;

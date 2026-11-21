@@ -28,7 +28,6 @@ fn main() {
 #[cfg(windows)]
 #[allow(clippy::upper_case_acronyms)] // Win32 names
 mod win {
-    use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
@@ -39,11 +38,12 @@ mod win {
     use platomon::config::Config;
     use platomon::clock::FrameClock;
     use platomon::collector::Collector;
-    use platomon::color::{self, ColorMap};
+    use platomon::color::{self, ColorBy, ColorMap};
     use platomon::metrics::{MetricsState, activity_score};
-    use platomon::overlay::{Halo, OverlayOptions, Overlays, halo_factor, halo_lum};
+    use platomon::overlay::{Halo, OverlayOptions, Overlays, halo_factor, halo_lum, halo_reach};
     use platomon::render::{QualityGovernor, Renderer};
     use platomon::scrconfig;
+    use platomon::tiles::TileCache;
     use platomon::screensaver::{self, Display, PixelShift, Plan};
     use platomon::ui;
 
@@ -345,15 +345,12 @@ mod win {
         bits: *mut u32,
         cw: i32,
         ch: i32,
-        /// Per-channel ink coverage of each glyph (white text on black).
-        coverage: HashMap<u16, Vec<u32>>,
-        tinted: HashMap<(u16, u32), Vec<u32>>,
+        /// Tinted (glyph, colour) tiles, from each glyph's per-channel ink
+        /// coverage (white text on black).
+        cache: TileCache,
     }
 
     impl Tiles {
-        /// Tinted tiles kept before the cache is emptied (bounded memory).
-        const MAX_TINTED: usize = 8192;
-
         fn new(mem: HDC, font: HGDIOBJ, cw: i32, ch: i32) -> Self {
             // SAFETY: a memory DC with its own DIB and the shared font;
             // released in Drop.
@@ -364,47 +361,30 @@ mod win {
                 SelectObject(dc, font);
                 SetTextColor(dc, 0x00FF_FFFF);
                 SetBkColor(dc, 0);
-                Self { dc, bmp, bits, cw, ch, coverage: HashMap::new(), tinted: HashMap::new() }
+                Self { dc, bmp, bits, cw, ch, cache: TileCache::new((cw * ch).max(0) as usize) }
             }
         }
 
-        fn render(&mut self, u: u16) -> Vec<u32> {
-            let n = (self.cw * self.ch) as usize;
-            if self.bits.is_null() {
+        fn render(dc: HDC, bits: *mut u32, cw: i32, ch: i32, u: u16) -> Vec<u32> {
+            let n = (cw * ch) as usize;
+            if bits.is_null() {
                 return vec![0; n];
             }
-            let r = RECT { left: 0, top: 0, right: self.cw, bottom: self.ch };
-            let dx = [self.cw];
+            let r = RECT { left: 0, top: 0, right: cw, bottom: ch };
+            let dx = [cw];
             // SAFETY: one UTF-16 unit and one advance; the DIB holds `n`
             // pixels, read after GdiFlush.
             unsafe {
-                ExtTextOutW(self.dc, 0, 0, ETO_OPAQUE, &r, &u, 1, dx.as_ptr());
+                ExtTextOutW(dc, 0, 0, ETO_OPAQUE, &r, &u, 1, dx.as_ptr());
                 GdiFlush();
-                std::slice::from_raw_parts(self.bits, n).iter().map(|p| p & 0x00FF_FFFF).collect()
+                std::slice::from_raw_parts(bits, n).iter().map(|p| p & 0x00FF_FFFF).collect()
             }
         }
 
         /// The `cw × ch` pixels of glyph `u` in colour `rgb` (`0xRRGGBB`).
         fn tile(&mut self, u: u16, rgb: u32) -> &[u32] {
-            if !self.tinted.contains_key(&(u, rgb)) {
-                if !self.coverage.contains_key(&u) {
-                    let c = self.render(u);
-                    self.coverage.insert(u, c);
-                }
-                if self.tinted.len() >= Self::MAX_TINTED {
-                    self.tinted.clear();
-                }
-                let (cr, cg, cb) = ((rgb >> 16) & 0xff, (rgb >> 8) & 0xff, rgb & 0xff);
-                let t = self.coverage[&u]
-                    .iter()
-                    .map(|&p| {
-                        let (r, g, b) = ((p >> 16) & 0xff, (p >> 8) & 0xff, p & 0xff);
-                        (((r * cr + 127) / 255) << 16) | (((g * cg + 127) / 255) << 8) | ((b * cb + 127) / 255)
-                    })
-                    .collect();
-                self.tinted.insert((u, rgb), t);
-            }
-            &self.tinted[&(u, rgb)]
+            let (dc, bits, cw, ch) = (self.dc, self.bits, self.cw, self.ch);
+            self.cache.tile(u, rgb, |u| Self::render(dc, bits, cw, ch, u))
         }
     }
 
@@ -730,14 +710,13 @@ mod win {
         let tag_ink = s.tag_color.resolve(cmap.as_ref().map(|m| &m.gradient));
         let tag_blocks = s.tag_text.blocks(plan.font_px);
         let mut tag_labels: Vec<String> = Vec::new();
-        let mut sound = s.sound.then(|| {
-            let places = if s.halo_bands {
-                let kinds: Vec<_> = scene.solids.iter().map(|i| i.poly.kind()).collect();
-                frequency_gradient(&kinds)
-            } else {
-                Vec::new()
-            };
-            SoundHalo::new(s.halo_wide, places)
+        // Sound: the halo, and/or the solids' colours by their frequency band.
+        let halo_on = s.sound;
+        let color_sound = cfg.color_by == ColorBy::Sound && cmap.as_ref().is_some_and(|m| m.solid.is_some());
+        let mut sound = (halo_on || color_sound).then(|| {
+            let kinds: Vec<_> = scene.solids.iter().map(|i| i.poly.kind()).collect();
+            let places = if s.halo_bands { frequency_gradient(&kinds) } else { Vec::new() };
+            SoundHalo::new(s.halo_swing as f32 / 100.0, places, color_sound.then(|| frequency_gradient(&kinds)))
         });
         // Halo-only frames between renders, at the frame-rate cap (the
         // display's refresh rate unless capped lower).
@@ -760,7 +739,7 @@ mod win {
             let halo_line = sound.filter(|s| s.range.0 <= s.range.1).map_or_else(
                 || "sound halo off\n".to_string(),
                 |s| {
-                    let mut t = format!("halo size {:.3}x..{:.3}x of radius (wide {})\n", s.range.0, s.range.1, s.wide);
+                    let mut t = format!("halo size {:.3}x..{:.3}x of radius (swing ±{:.0}%)\n", s.range.0, s.range.1, s.swing * 100.0);
                     if s.solid.places().is_empty() {
                         t += "halo bounce: overall level\n";
                     } else {
@@ -808,7 +787,7 @@ mod win {
             });
             if moved || QUIT.load(Ordering::SeqCst) {
                 let secs = started.elapsed().as_secs_f32();
-                report(full_frames, halo_frames, halo_cells, secs, &spent, sound.as_ref(), (shift_reach, shift_moves));
+                report(full_frames, halo_frames, halo_cells, secs, &spent, sound.as_ref().filter(|_| halo_on), (shift_reach, shift_moves));
                 return Ok(());
             }
             let now = Instant::now();
@@ -817,7 +796,7 @@ mod win {
             let gap = Duration::from_secs_f32((render_avg / budget).min(1.0));
             let deadline = fps.next_deadline().max(last_full.map_or(now, |t| t + gap));
             if now < deadline {
-                if let (Some(sh), Some(at)) = (sound.as_mut(), next_halo)
+                if let (Some(sh), Some(at)) = (sound.as_mut().filter(|_| halo_on), next_halo)
                     && now >= at
                     && deadline - now > halo_every / 2
                 {
@@ -839,7 +818,7 @@ mod win {
                     spent[4] += th.elapsed().as_secs_f64();
                     continue;
                 }
-                let wake = next_halo.filter(|_| sound.is_some()).map_or(deadline, |h| h.min(deadline));
+                let wake = next_halo.filter(|_| halo_on).map_or(deadline, |h| h.min(deadline));
                 std::thread::sleep(wake.saturating_duration_since(now).min(SLICE));
                 continue;
             }
@@ -856,13 +835,16 @@ mod win {
             let channels = metrics.channels();
             fps.update_target(activity_score(&channels, &weights), dt);
             scene.update(&channels, &anim, dt);
-            levels.clear();
-            levels.extend(channels.iter().map(|c| if c.available { c.level } else { 0.0 }));
+            scene.color_values(cfg.color_by, &channels, &mut levels);
             if tags_on {
                 tag_labels.clear();
                 tag_labels.extend(metrics.readings().iter().map(|r| ui::short_label(r)));
             }
-            let halo = sound.as_mut().map(SoundHalo::next);
+            let halo = sound.as_mut().map(SoundHalo::next).filter(|_| halo_on);
+            if color_sound && let Some(sh) = &sound {
+                levels.clear();
+                levels.extend_from_slice(&sh.tones);
+            }
 
             if let Some(sh) = shift.as_mut()
                 && sh.tick()
@@ -881,7 +863,7 @@ mod win {
             let r = (t1 - t0).as_secs_f32();
             render_avg = if render_avg == 0.0 { r } else { 0.9 * render_avg + 0.1 * r };
             if let Some(view) = renderer.view() {
-                let factors = sound.as_ref().map_or(&[][..], |s| &s.factors[..]);
+                let factors = sound.as_ref().filter(|_| halo_on).map_or(&[][..], |s| &s.factors[..]);
                 let opt = options(&cfg, &ramp, cmap.as_ref(), &levels, halo, factors, tags_on.then_some((&tag_labels[..], tag_ink, tag_blocks)));
                 let cells = overlays.compose(&view, vp.w, vp.h, &scene, &opt);
                 let t2 = Instant::now();
@@ -918,8 +900,8 @@ mod win {
         size: Envelope,
         bass: Envelope,
         last: Instant,
-        /// Extra ±25% size swing.
-        wide: bool,
+        /// Size swing, share of the radius either way.
+        swing: f32,
         /// Per-solid levels from their places on the gradient (0 = bass,
         /// 1 = treble); no places = one size for all.
         solid: SolidLevels,
@@ -932,23 +914,29 @@ mod win {
         /// Per-solid sum of sizes over `updates` frames (average for the log).
         solid_sum: Vec<f64>,
         updates: u64,
+        /// Colour by sound: each solid's band loudness (places on the
+        /// frequency gradient), and this frame's levels 0..=1.
+        tone: Option<SolidLevels>,
+        tones: Vec<f32>,
     }
 
     impl SoundHalo {
-        fn new(wide: bool, places: Vec<f32>) -> Self {
+        fn new(swing: f32, places: Vec<f32>, tone_places: Option<Vec<f32>>) -> Self {
             let n = places.len();
             Self {
                 meter: OutputMeter::spawn(),
                 size: Envelope::new(),
                 bass: Envelope::new(),
                 last: Instant::now(),
-                wide,
+                swing,
                 solid: SolidLevels::new(places),
                 factors: Vec::with_capacity(n),
                 range: (f32::MAX, f32::MIN),
                 solid_range: vec![(f32::MAX, f32::MIN); n],
                 solid_sum: vec![0.0; n],
                 updates: 0,
+                tone: tone_places.map(SolidLevels::new),
+                tones: Vec::new(),
             }
         }
 
@@ -958,19 +946,23 @@ mod win {
             let bands = self.meter.bands();
             let size = self.size.update(self.meter.take_peak(), dt);
             let bass = self.bass.update(bass_weighted(&bands), dt);
-            let factor = halo_factor(size, self.wide);
+            let factor = halo_factor(size, self.swing);
             self.range = (self.range.0.min(factor), self.range.1.max(factor));
             self.factors.clear();
             self.updates += 1;
             for (&l, r) in self.solid.update(&bands, dt).iter().zip(&mut self.solid_range) {
-                let f = halo_factor(l, self.wide);
+                let f = halo_factor(l, self.swing);
                 *r = (r.0.min(f), r.1.max(f));
                 self.factors.push(f);
             }
             for (s, &f) in self.solid_sum.iter_mut().zip(&self.factors) {
                 *s += f as f64;
             }
-            Halo { factor, lum: halo_lum(bass) }
+            if let Some(t) = self.tone.as_mut() {
+                self.tones.clear();
+                self.tones.extend_from_slice(t.update(&bands, dt));
+            }
+            Halo { factor, lum: halo_lum(bass), reach: halo_reach(self.swing) }
         }
     }
 

@@ -1,4 +1,4 @@
-# platomon 1.3.23
+# platomon 1.4.0
 
 A terminal system monitor: one path-traced polyhedron per metric, rendered in monochrome ASCII on
 concentric rings. Each solid's scale and spin follow its metric; the frame rate (5–150 fps) follows
@@ -38,7 +38,7 @@ platomon [OPTIONS]
 | `--aspect` | `fill`, preset or `W:H` | `fill` |
 | `--aspect-mode` | `letterbox\|crop` | `letterbox` |
 | **Camera** | | |
-| `--camera` | `static\|orbit\|focus` (focus: glide toward the busiest solid) | `static` |
+| `--camera` | `static\|orbit\|focus\|tilt\|resonance` (focus: glide toward the busiest solid; tilt: orbit while rising 20–80° and back; resonance: orbit with three 20° waves per turn) | `static` |
 | `--focus-zoom` | `0..1`: 0 = only turn toward the busiest solid, 1 = close-up | 0.6 |
 | `--focus-tau` | glide time constant, seconds | 1.5 |
 | `--orbit-period` | seconds per revolution | 60 |
@@ -49,7 +49,7 @@ platomon [OPTIONS]
 | `--seed` | `U64`, makes `random` repeatable | random |
 | **Background** | | |
 | `--bg-lum` | `0..10`: 5 = original, **0 = no background surface** | 5 |
-| `--bg-pattern` | `solid\|checker\|diamond\|brick\|triangles\|hex\|radial` | `solid` |
+| `--bg-pattern` | `solid\|checker\|diamond\|brick\|triangles\|hex\|radial\|quasicrystal` | `solid` |
 | `--bg-contrast` | `0..1`, tile tone spread around `--bg-lum` | 0.5 |
 | `--bg-scale` | tile size, world units (a full-size solid is 2 across) | 1.0 |
 | `--bg-scroll` | `DX:DZ` world units/s, e.g. `0.5:0` or `-0.2:0.3` | `0:0` |
@@ -57,6 +57,8 @@ platomon [OPTIONS]
 | `--bg-sway-period` | seconds per sway cycle | 10 |
 | `--bg-rotate` | `off\|cw\|ccw`, about the camera's focal point (seen from above) | `off` |
 | `--bg-rotate-period` | seconds per revolution | 60 |
+| `--bg-waves` | quasicrystal: plane waves, 3..24 (its rotational symmetry) | 7 |
+| `--bg-wave-speed` | quasicrystal: wave phase speed, radians/s (0 = still, negative = reverse) | 0.6 |
 | **Overlays** | | |
 | `--legend` | flag: corner panel with a wireframe of each solid and its metric | off |
 | `--legend-size` | `1..5` font size: 1–2 terminal text, 3–5 block letters (1–3 cells per font pixel); icons grow with it | 2 |
@@ -65,8 +67,9 @@ platomon [OPTIONS]
 | `--wireframe` | flag: each solid's visible edges drawn in inverted luminosity | off |
 | **Colour** | | |
 | `--color` | `off`, a preset (`--list gradients`) or 2+ hex stops, e.g. `"#000:#f80:#fff"` | `off` |
-| `--color-by` | `lum` (brightness → gradient) or `load` (each solid by its metric) | `lum` |
-| `--color-depth` | `24bit` or `256` (xterm palette, for older terminals) | `24bit` |
+| `--color-by` | `lum` (brightness → gradient), `load` (each solid by its metric) or `spin` (each solid by its spin speed and direction) | `lum` |
+| `--colors` | palette size: `16`, `32`, `64` or `128` colours per gradient | `16` |
+| `--bg-color` | background colouring, independent of the solids: `auto`, `off`, `match` (the solids' gradient by brightness) or a gradient of its own | `auto` |
 | `--color-reverse` | flag: run the gradient backwards | off |
 
 Any `--legend-*` option turns the legend on. `--color-by` or `--color-reverse` without `--color`
@@ -84,6 +87,21 @@ position: `--focus-zoom 0` stays at overview distance and only turns, `1` comes 
 To stop the camera darting between near-equal metrics, a new solid must lead the current one by 5
 percentage points for a full second before the camera switches.
 
+### Tilt camera
+
+`--camera tilt` orbits like `orbit` (one turn per `--orbit-period`, direction from `--orbit-dir`)
+and at the same time lifts along a vertical arc over the orbit point, from 20° to 80° elevation
+above the look-at point (never straight down at the floor), at the overview distance throughout.
+The rise takes one orbital period, easing in and out; at each end it holds for half a period while
+the orbit carries on, then travels back. It starts on its way up at the overview's elevation.
+
+### Resonance camera
+
+`--camera resonance` orbits on a third-order (3:1) disc resonance: while it circles once, its
+elevation rises and falls sinusoidally three times over a 20° range centred on the overview's
+elevation, and its distance breathes ±8% in step, so the closed path is a three-lobed rosette that
+repeats every orbit.
+
 ### Sphere layout
 
 `--layout sphere` places the solids on concentric spherical shells instead of rings on the ground.
@@ -95,14 +113,31 @@ centres rather than resting on the ground.
 
 ### Colour
 
-Colour is off by default (pure monochrome). `--color GRADIENT` maps each cell through a gradient,
-using one of two sources:
+Colour is off by default (pure monochrome). `--color GRADIENT` samples a gradient into a fixed
+palette of `--colors` 16 (default), 32, 64 or 128 colours, and every coloured cell takes one of
+them. The solids' colour comes from one of these sources:
 
-- `--color-by lum`: the cell's brightness, so dark glyphs take the first stop and bright glyphs the
-  last. One colour per glyph level, so colour changes only where the glyph does.
+- `--color-by lum`: the cell's brightness, so dark cells take the first stop and bright cells the
+  last. With 16 colours and the 16-glyph ramp that is one colour per glyph; larger palettes add
+  steps between glyph levels (smoother, but more cells change colour from frame to frame).
 - `--color-by load`: each solid takes the colour at its metric's load (idle = first stop, full =
-  last stop), shaded by brightness. The background and legend text keep the terminal's default
-  colour; legend icons take their solid's colour.
+  last stop), shaded by brightness. Legend icons take their solid's colour.
+- `--color-by spin`: each solid by its spin as seen from the camera. The middle of the gradient is
+  still (or spinning edge-on), toward the last stop is faster counter-clockwise, toward the first
+  stop faster clockwise; shaded by brightness.
+- `sound` (screensaver only): each solid by the loudness of its own frequency band of the default
+  output device, low frequencies on the simplest solids and high frequencies on the most complex
+  (the same placement as *Halo bounce by frequency*); shaded by brightness.
+
+For the shaded sources the palette is positions along the gradient × brightness shades: 16 colours
+are 8 positions × 2 shades, larger palettes have 4 shades (8, 16 or 32 positions).
+
+`--bg-color` maps the background (floor and sky) on its own, always by brightness: `auto` (default)
+colours it with the solids' gradient when they are coloured by brightness and leaves it uncoloured
+otherwise, `off` leaves it uncoloured, `match` uses the solids' gradient whatever colours the
+solids, and a preset or hex stops give it a gradient of its own (in its own palette of the same
+size). With `--color off` and a background gradient only the background is coloured. Legend text
+keeps the terminal's default colour.
 
 | Gradient | Colours |
 |---|---|
@@ -121,7 +156,8 @@ using one of two sources:
 
 Custom gradients take two or more hex stops (`#rgb` or `#rrggbb`, `#` optional), evenly spaced,
 separated by `:`, `,`, `;`, `/` or spaces. Colour escapes add to the bytes written per frame,
-so very large grids on slow consoles may lose some fps; `--color-depth 256` is a little shorter.
+so very large grids on slow consoles may lose some fps. (24-bit colour and `--color-depth` were
+removed: a `color_depth` key in an older config file is ignored.)
 
 ### Luminosity levels
 
@@ -165,6 +201,7 @@ each other. With `--bg-pattern solid` (the default) motion has nothing visible t
 | `triangles` | squares split on the diagonal, alternating |
 | `hex` | hexagonal tiles, three tones |
 | `radial` | rings × 12 sectors around the focal point |
+| `quasicrystal` | `--bg-waves` plane waves at evenly spaced angles, summed and folded into bands: a never-repeating, many-fold symmetric tiling that flows (`--bg-wave-speed`) |
 
 ### Legend and wireframe
 
@@ -278,6 +315,8 @@ platomon --bg-lum 0 --camera orbit                                     # no floo
 platomon --bg-lum 8 --bg-pattern checker --bg-contrast 0.8 --bg-scale 2
 platomon --bg-pattern hex --bg-scale 1.2 --bg-scroll 0.3:0.3           # three-tone hexes drifting diagonally
 platomon --bg-pattern brick --bg-sway 0.6 --bg-sway-period 6           # floor swaying in a slow circle
+platomon --bg-pattern quasicrystal --bg-lum 7 --bg-contrast 1 --bg-scale 3   # flowing 7-fold quasicrystal floor
+platomon --bg-pattern quasicrystal --bg-waves 5 --bg-wave-speed 0 --bg-rotate ccw  # still Penrose-like 5-fold floor, turning
 platomon --bg-pattern triangles --bg-scale 0.6 --bg-contrast 1 --bg-scroll -0.5:0
 platomon --bg-pattern radial --bg-rotate ccw --bg-rotate-period 20 --camera orbit --orbit-dir cw   # floor and camera turn against each other
 platomon --bg-pattern diamond --bg-rotate cw --bg-rotate-period 30 --bg-scroll 0.4:0 --bg-sway 0.5 # rotate, scroll and sway at once
@@ -288,11 +327,15 @@ platomon --bg-pattern diamond --bg-rotate cw --bg-rotate-period 30 --bg-scroll 0
 ```
 platomon --camera focus                                                # glide toward the busiest solid
 platomon --camera focus --focus-zoom 1 --focus-tau 3                   # slow, full close-ups
+platomon --camera tilt --orbit-period 40                               # orbit, rising 20-80 degrees over 40 s
+platomon --camera resonance --orbit-period 60                          # three 20-degree waves per minute-long orbit
 platomon --layout sphere --show "cpu,ram,disk,net,gpu,nic,disk-dev"    # one shell of 7
 platomon --layout sphere --ring cpu=0 --ring ram=1 --ring disk=1 --ring net=1 --ring gpu=1   # CPU at the centre of a shell
 platomon --color inferno                                               # brightness through inferno
 platomon --color-by load                                               # each solid green → red with its load (traffic)
-platomon --color viridis --color-by load --color-depth 256             # 256-colour terminals
+platomon --color viridis --color-by load --colors 64                   # 64-colour palette
+platomon --color plasma --color-by spin --bg-color ice                 # solids by spin, floor in ice
+platomon --color-by load --bg-color off                                # solids only, background uncoloured
 platomon --color "#001020:#0080ff:#ffffff" --bg-lum 1                  # custom three-stop gradient
 platomon --layout sphere --camera focus --color-by load --legend --wireframe   # everything at once
 ```
@@ -340,7 +383,7 @@ At that resolution expect the adaptive quality to drop to `q-1`/`q-2` and tens o
 ## Windows screensaver
 
 **Download:** `platomon.scr` and `platomon-config.exe` are attached to the
-[v1.3.23 release](https://github.com/truncated-hypercube-emporium/platomon-scr/releases/tag/v1.3.23)
+[v1.4 release](https://github.com/truncated-hypercube-emporium/platomon-scr/releases/tag/v1.4)
 (64-bit Windows 10/11, no installer, no dependencies). To build them yourself,
 `scripts\build-scr.ps1` writes both to `dist\`.
 
@@ -349,6 +392,18 @@ To install, copy both files to `C:\Windows\System32` (administrator rights neede
 Screen saver. `platomon-config.exe` opens the same settings dialog as the Settings… button there.
 The `install` folder has both files and `install-platomon-scr.bat`, which moves them there (asking for
 administrator rights).
+
+**New in 1.4:**
+
+- **Tilt camera**: orbits while rising from 20° to 80° elevation in one orbital period, holding half a period at each end, then back (*Camera* › Tilt, `--camera tilt`).
+- **Resonance camera**: orbits on a third-order disc resonance, three sinusoidal 20° rises and falls per turn with the distance breathing in step (*Camera* › Resonance, `--camera resonance`).
+- **Palettes instead of 24-bit colour**: 16 (default), 32, 64 or 128 colours per gradient (*Palette size*, `--colors`).
+- **New colour sources**: each solid by its **spin** (speed and direction seen from the camera) or by the **sound** of its own frequency band, low frequencies on the simplest solids and high on the most complex.
+- **Background colour on its own**: auto, off, the solids' gradient, or a gradient of its own (*Background colour*, `--bg-color`).
+- **Settings dialog**: check boxes and sliders, one-word option names, a *Tuning* dialog of numeric sliders, a **configuration log** of the last 10 OKs (each titled with a random word; `+` keeps one for good in `configuration.log`), and *Set as default*.
+- **Halo size swing** is ±10% (was ±5%), ±30% or the new ±60%.
+- **Faster colour**: a palette-sized tile cache, a single glyph-and-colour pass and a tone-curve table make the colour pipeline 35–45% faster.
+- **Quasicrystal background** (`quasicrystal` pattern, with wave count and flow speed settings), and tags no longer cover the legend.
 
 **New in 1.3.23:**
 
@@ -387,7 +442,7 @@ administrator rights).
 **New in 1.3:**
 
 - **Sound halo**: a second wireframe of each solid, 1.2x its size, that grows and shrinks with the
-  default output device's level (±5% of the radius, or ±30% with *Halo size swing*) and gets brighter
+  default output device's level (±10%, ±30% or ±60% of the radius with *Halo size swing*) and gets brighter
   with low frequencies; it updates at the display's refresh rate between full frames.
 - **Faster drawing**: glyph tiles copied straight into the back buffer instead of GDI text calls —
   a full 2560×1440 frame now takes about 1.5 ms to draw instead of 40–80 ms.
@@ -398,7 +453,7 @@ Each run:
 
 - reads the primary display's resolution and refresh rate, and caps the frame rate at the refresh rate;
 - picks a random look: metrics (the five main ones, plus `nic`/`disk-dev` at random), solids,
-  rings or sphere, static/orbit/focus camera, background luminosity, pattern and motion, colour
+  rings or sphere, static/orbit/focus/tilt/resonance camera, background luminosity, pattern and motion, colour
   gradient, wireframe and inverted fps (the corner legend is never shown);
 - keeps rendering cheap: 1 sample per pixel, 1 bounce, adaptive quality on. A short render test
   measures this machine's speed for the chosen scene, and the text size (Consolas) is chosen so
@@ -418,10 +473,29 @@ as the shift opens on the other side.
 the same dialog, run by a dialog procedure named `ScreenSaverConfigureDialog` as in the Win32
 screensaver interface. A master **Random look each run** switch (on by default) picks the look anew
 every time; turn it off to use the look chosen below it instead: layout, camera, colour gradient and
-source, background pattern and luminosity, wireframe, stats bar, inverted frame rate and extra
+source, background colour, background pattern and luminosity, wireframe, stats bar, inverted frame rate and extra
 metrics (greyed out while the switch is on). The frame-rate cap (the display's refresh rate by
 default), the CPU budget used to size the text, the text density, the number of luminosity levels,
-the sound halo and the burn-in shift (on/off, frame interval, range) always apply.
+the palette size, the sound halo and tags, and the burn-in shift (on/off, frame interval, range)
+always apply. On/off settings are check boxes, settings with three or more numeric steps are
+sliders showing their value, and drop-downs show each option by its leading word.
+
+**Tuning.** *Tuning…* opens a second dialog of sliders for numeric values: orbit period and bob,
+focus zoom and glide, floor contrast, tile size, sway and its period, floor turn period, smallest
+and largest solid size, idle and fastest spin, and exposure. Moving a slider sets that value for
+every run (random look or not); *×* or *Reset all* returns it to auto (the random look's or the
+default value). Set values are saved as `tune_<name>` keys; the button shows how many are set.
+
+**Configuration log.** Each OK adds an entry to the log on the right, titled with a random English
+word and the time, holding the settings as written to the INI file and the arguments the dialog
+was launched with. Pick an entry to see them; *Load into dialog* puts its settings back in the
+controls (saved only with OK). The newest 10 entries are kept; the `+` beside an entry keeps it
+(the button turns to `−`, which lets it go again) and saves it to `configuration.log` beside the
+settings file, and kept entries are never dropped. The log itself is `config-log.ini`.
+
+**Defaults.** *Set as default* saves the dialog's current settings as your defaults (in
+`configuration.log`); *Defaults* then loads them (or the built-in defaults when none are saved), and a
+first run with no settings file starts from them.
 
 **Text density.** The text is first sized so rendering fits the CPU budget, then (with the default
 double density) set at half that height, never below 4 px: twice the characters per axis, about 4x
@@ -429,16 +503,17 @@ the rendering cost of the budget. Choose Standard to keep the budget-sized text.
 
 **Sound halo** (on by default). A second wireframe of every solid, 1.2x its size, follows the
 sound level of the default output device (the one selected in Windows sound settings, read through
-its WASAPI peak meter and followed when you switch devices): it grows to 1.25x the solid's radius
-on loud passages and shrinks to 1.15x in silence. With **Halo size swing** set to ±30% it moves an
-extra 25% of the radius either way, from 0.9x (inside the solid) to 1.5x. Its brightness follows the frequencies being
+its WASAPI peak meter and followed when you switch devices): it grows to 1.3x the solid's radius
+on loud passages and shrinks to 1.1x in silence (±10%, the default). **Halo size swing** can widen
+that to ±30% (0.9x, inside the solid, to 1.5x) or ±60% (0.6x to 1.8x); tags keep clear of the
+largest halo the swing allows. Its brightness follows the frequencies being
 played: a loopback capture of the device is split by FFT into 12 bands (20 Hz – 16 kHz), weighted
 so low frequencies count most (half weight at 150 Hz, falling further above), so bass makes the
 halo bright and treble-only or silent passages leave it dim. Both size and brightness are smoothed
 (fast rise, slower fall) and auto-gained over the last few seconds, so quiet material moves them
 as well. The halo is hidden behind nearer solids.
 
-**Halo bounce by frequency** (on by default; *Halo bounce source* in the dialog). Each solid's halo
+**Halo bounce by frequency** (on by default). Each solid's halo
 size follows its own slice of the spectrum instead of the overall level. Solids are ranked by
 complexity (edge count, faces breaking ties) and placed on a log gradient from the simplest in the
 scene (the bass, 20 Hz) to the most complex (the treble, 16 kHz): with the five Platonic solids the
@@ -458,6 +533,23 @@ straight into the back buffer, skipping cells that did not change; only the chan
 to the screen. Frame counts and per-stage timings of the last run are written to
 `%LOCALAPPDATA%\platomon\screensaver\last-run-frames.txt`.
 
+**Colour palettes.** Colour uses a fixed palette of 16 (default), 32, 64 or 128 colours sampled
+from the gradient (*Palette size*, always applied). Besides brightness and load, the solids can be
+coloured by their **spin** (speed and direction as seen from the camera) or by **sound**: each solid
+by the loudness of its own frequency band, the simplest solids the bass and the most complex the
+treble (this runs the output-device meter even with the halo off; a random look picks sound only
+when the sound halo is on). *Background colour* maps the floor and sky independently of the solids:
+by brightness through the solids' gradient, a gradient of its own, or uncoloured.
+
+Because every colour is a palette entry, the tinted glyph tiles are few and stay cached. Measured at
+640×240 cells with 16 solids over 90 animated frames (`cargo run --release --example color_bench`):
+colouring by load used about 4,000 colours a frame with 24-bit colour and missed the tile cache 45
+times a frame; with 16 colours it uses 16 and misses about 1.5 times. Together with a faster tile
+cache (one packed key, one pixel arena), a single pass that picks each cell's glyph and colour, and a
+table for the tone curve (within 2e-6 of the exact curve), the colour pipeline takes 2.7–3.0 ms
+per frame (compose + draw) at 16 colours, down from 4.2–4.6 ms. Larger palettes cost almost nothing to
+compose; colouring by brightness at 64 or 128 colours redraws more cells (finer steps change more
+often), about +0.9–1.0 ms of drawing per frame.
 **Tag text.** On small text (cells under 10 px tall) tags switch to three-row block letters drawn
 with ordinary glyphs (`_ | / \ ( )`), which stay readable where single letters are only a few pixels
 high; *Tag text* can also keep one line always, or use block letters always. Each tag is a solid box
@@ -475,9 +567,11 @@ INI file through `WritePrivateProfileString`: `%APPDATA%\platomon\screensaver.in
 [platomon]
 random=on              ; on = random look each run; off = use the look below
 layout=rings           ; rings | sphere
-camera=orbit           ; static | orbit | focus
+camera=orbit           ; static | orbit | focus | tilt | resonance
 color=inferno          ; off | inferno | viridis | ... (see --list gradients)
-color_by=lum           ; lum | load
+color_by=lum           ; lum | load | spin | sound
+bg_color=auto          ; auto | off | match | a gradient preset (background, by brightness)
+colors=16              ; 16 | 32 | 64 | 128 (palette size; always applies)
 bg_pattern=checker     ; solid | checker | diamond | brick | triangles | hex | radial
 bg_lum=2               ; 0..10
 wireframe=off          ; on | off
@@ -489,11 +583,12 @@ budget=15              ; percent
 density=2              ; 1 = standard | 2 = double
 levels=16              ; 8 | 16 | 32 (older auto -> 16, 10 -> 8)
 sound=on               ; sound halo from the default output device
-halo_wide=off          ; on = halo size swing ±30% of the radius instead of ±5%
+halo_swing=10          ; halo size swing, percent of the radius: 10 | 30 | 60 (older halo_wide on -> 30)
 halo_bands=on          ; on = each solid's halo follows its frequency band; off = overall level
 tags=on                ; solid tags with leader lines
 tag_color=complement   ; complement | theme | white | #RRGGBB (lifted to stay readable)
 tag_text=auto          ; auto (block letters under 10 px) | line | blocks
+tune_orbit_period=45   ; Tuning values (only those set): tune_<name>, see Tuning above
 shift=on
 shift_min_frames=600
 shift_max_frames=3600

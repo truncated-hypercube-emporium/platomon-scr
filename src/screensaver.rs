@@ -79,9 +79,11 @@ pub fn randomize(rng: &mut fastrand::Rng, d: &Display) -> Config {
 
     // camera
     c.camera = match rng.u8(0..20) {
-        0..=4 => CameraMode::Static,
-        5..=13 => CameraMode::Orbit,
-        _ => CameraMode::Focus,
+        0..=2 => CameraMode::Static,
+        3..=8 => CameraMode::Orbit,
+        9..=13 => CameraMode::Focus,
+        14..=16 => CameraMode::Tilt,
+        _ => CameraMode::Resonance,
     };
     c.orbit_period = range(rng, 40.0, 120.0).round();
     c.orbit_dir = OrbitDir::Random;
@@ -103,12 +105,25 @@ pub fn randomize(rng: &mut fastrand::Rng, d: &Display) -> Config {
     }
     c.bg_rotate = [Spin::Off, Spin::Cw, Spin::Ccw][rng.usize(0..3)];
     c.bg_rotate_period = range(rng, 25.0, 90.0).round();
+    c.bg_waves = rng.u32(5..=12);
+    c.bg_wave_speed = (range(rng, 0.2, 1.2) * 10.0).round() / 10.0;
 
     // colour
     if rng.u8(0..10) >= 3 {
         let presets: Vec<&str> = color::PRESETS.iter().map(|p| p.0).filter(|id| *id != "grey").collect();
         c.color = presets[rng.usize(0..presets.len())].to_string();
-        c.color_by = if rng.u8(0..10) < 4 { ColorBy::Load } else { ColorBy::Lum };
+        c.color_by = match rng.u8(0..20) {
+            0..=7 => ColorBy::Lum,
+            8..=12 => ColorBy::Load,
+            13..=15 => ColorBy::Spin,
+            _ => ColorBy::Sound,
+        };
+        c.bg_color = match rng.u8(0..20) {
+            0..=11 => color::BG_COLOR_DEFAULT.to_string(),
+            12..=14 => "match".to_string(),
+            15..=16 => "off".to_string(),
+            _ => presets[rng.usize(0..presets.len())].to_string(),
+        };
         c.color_reverse = rng.u8(0..20) < 3;
     }
 
@@ -224,6 +239,15 @@ pub fn plan(d: &Display, seed: u64, s: &ScrSettings) -> Result<Plan, String> {
     let mut rng = fastrand::Rng::with_seed(seed);
     let mut config = randomize(&mut rng, d);
     s.apply(&mut config);
+    // A random look colours by sound only when the sound halo (and so the
+    // output-device meter) is on.
+    if s.random && !s.sound && config.color_by == ColorBy::Sound {
+        config.color_by = ColorBy::Load;
+    }
+    config.colors = s.colors;
+    for &(k, v) in &s.tuning {
+        set_tunable(&mut config, k, v);
+    }
     config.fps_max = match s.fps_cap {
         Some(f) => (f as f32).clamp(FPS_CAP.0, FPS_CAP.1),
         None => fps_for(d),
@@ -349,8 +373,15 @@ pub struct ScrSettings {
     /// `"off"` or a gradient preset id.
     pub color: String,
     pub color_by: ColorBy,
+    /// Background colouring, independent of the solids: `auto`, `off`,
+    /// `match` or a gradient preset id.
+    pub bg_color: String,
     pub bg_pattern: Pattern,
     pub bg_lum: u8,
+    /// Quasicrystal background: plane waves (its rotational symmetry).
+    pub bg_waves: u32,
+    /// Quasicrystal background: wave phase speed, radians/s (0 = still).
+    pub bg_wave_speed: f32,
     pub wireframe: bool,
     pub stats: bool,
     pub fps_invert: bool,
@@ -365,12 +396,14 @@ pub struct ScrSettings {
     /// about 4x the budget.
     pub density: u8,
     pub levels: Levels,
+    /// Palette size: 16, 32, 64 or 128 colours per gradient.
+    pub colors: usize,
     /// Sound halo: a wireframe 1.2x the size of each solid that grows and
     /// shrinks by ±5% of its radius with the default output device's level.
     pub sound: bool,
-    /// Wide halo swing: the halo shrinks and grows an extra ±25% of the
-    /// radius (0.9x..1.5x instead of 1.15x..1.25x).
-    pub halo_wide: bool,
+    /// Halo size swing, percent of the radius either way: 10 (1.1x..1.3x),
+    /// 30 (0.9x..1.5x) or 60 (0.6x..1.8x).
+    pub halo_swing: u8,
     /// Frequency gradient: each solid's halo bounces to its own part of the
     /// spectrum, the simplest solid to the bass and the most complex to the
     /// treble; off = every halo follows the overall level.
@@ -382,6 +415,9 @@ pub struct ScrSettings {
     pub tag_color: crate::color::TagColor,
     /// One line, or three-row block letters on small text.
     pub tag_text: TagText,
+    /// Tuning overrides from the Tuning dialog: (key, value) for each
+    /// [`TUNABLES`] entry the user has set, applied every run.
+    pub tuning: Vec<(&'static str, f32)>,
     /// OLED burn-in protection: move the picture 1 px at random intervals.
     pub shift: bool,
     pub shift_min_frames: u32,
@@ -398,8 +434,11 @@ impl Default for ScrSettings {
             camera: CameraMode::Orbit,
             color: "inferno".into(),
             color_by: ColorBy::Lum,
+            bg_color: color::BG_COLOR_DEFAULT.into(),
             bg_pattern: Pattern::Checker,
             bg_lum: 2,
+            bg_waves: crate::scene::ground::WAVES_DEFAULT,
+            bg_wave_speed: crate::scene::ground::WAVE_SPEED_DEFAULT,
             wireframe: false,
             stats: false,
             fps_invert: false,
@@ -408,12 +447,14 @@ impl Default for ScrSettings {
             budget_pct: (RENDER_BUDGET * 100.0).round() as u8,
             density: 2,
             levels: Levels::L16,
+            colors: color::DEFAULT_COLORS,
             sound: true,
-            halo_wide: false,
+            halo_swing: 10,
             halo_bands: true,
             tags: true,
             tag_color: crate::color::TagColor::Complement,
             tag_text: TagText::Auto,
+            tuning: Vec::new(),
             shift: true,
             shift_min_frames: 600,
             shift_max_frames: 3600,
@@ -425,6 +466,177 @@ impl Default for ScrSettings {
 /// INI section name (`szAppName` in the Win32 screensaver sample).
 pub const INI_SECTION: &str = "platomon";
 pub const SHIFT_FRAMES_MAX: u32 = 1_000_000;
+/// Halo size swings offered, percent of the radius either way.
+pub const HALO_SWING_PCT: [u8; 3] = [10, 30, 60];
+
+/// A numeric setting the Tuning dialog edits with a slider.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Tunable {
+    /// Config field.
+    pub key: &'static str,
+    /// INI key (`tune_<field>`).
+    pub ini: &'static str,
+    pub label: &'static str,
+    pub min: f32,
+    pub max: f32,
+    pub step: f32,
+    /// Tooltip text.
+    pub help: &'static str,
+}
+
+impl Tunable {
+    /// Number of steps from `min` to `max` (slider positions 0..=steps).
+    pub fn steps(&self) -> u32 {
+        ((self.max - self.min) / self.step).round() as u32
+    }
+
+    pub fn value_at(&self, pos: u32) -> f32 {
+        let v = self.min + self.step * pos.min(self.steps()) as f32;
+        // tidy float noise (0.30000001 → 0.3)
+        (v * 1000.0).round() / 1000.0
+    }
+
+    pub fn pos_of(&self, v: f32) -> u32 {
+        (((v - self.min) / self.step).round().max(0.0) as u32).min(self.steps())
+    }
+
+    /// `v` clamped to the range and rounded to a step.
+    pub fn snap(&self, v: f32) -> f32 {
+        self.value_at(self.pos_of(v))
+    }
+
+    /// `v` as shown beside the slider.
+    pub fn show(&self, v: f32) -> String {
+        if self.step >= 1.0 {
+            format!("{v:.0}")
+        } else if self.step >= 0.1 {
+            format!("{v:.1}")
+        } else {
+            format!("{v:.2}")
+        }
+    }
+}
+
+macro_rules! tunable {
+    ($key:literal, $label:literal, $min:expr, $max:expr, $step:expr, $help:literal) => {
+        Tunable { key: $key, ini: concat!("tune_", $key), label: $label, min: $min, max: $max, step: $step, help: $help }
+    };
+}
+
+/// Every numeric setting in the Tuning dialog. A set value applies every
+/// run (random look or not); unset ones keep the random or default value.
+pub const TUNABLES: [Tunable; 14] = [
+    tunable!("orbit_period", "Orbit period (s)", 15.0, 180.0, 5.0, "Seconds per camera orbit (orbit, tilt and resonance cameras). Tilt also takes one period per rise or fall."),
+    tunable!("orbit_bob", "Orbit bob", 0.0, 1.0, 0.05, "How far the orbiting camera rises and falls twice per turn, in world units."),
+    tunable!("focus_zoom", "Focus zoom", 0.0, 1.0, 0.05, "Focus camera: 0 only turns toward the busiest solid, 1 comes in to a close-up."),
+    tunable!("focus_tau", "Focus glide (s)", 0.25, 5.0, 0.25, "Focus camera: how long its glides take (smoothing time constant)."),
+    tunable!("bg_contrast", "Floor contrast", 0.0, 1.0, 0.05, "How far the floor pattern's tones spread around its brightness."),
+    tunable!("bg_scale", "Floor tile size", 0.3, 4.0, 0.1, "Size of the floor pattern's tiles (the quasicrystal's wavelength), in world units."),
+    tunable!("bg_sway", "Floor sway", 0.0, 2.0, 0.05, "How far the floor pattern sways in a slow circle; 0 holds it still."),
+    tunable!("bg_sway_period", "Sway period (s)", 3.0, 30.0, 1.0, "Seconds per floor sway cycle."),
+    tunable!("bg_rotate_period", "Floor turn period (s)", 10.0, 180.0, 5.0, "Seconds per turn when the floor pattern rotates."),
+    tunable!("min_scale", "Smallest solid size", 0.2, 1.0, 0.05, "Size of a solid whose metric is idle, as a share of full size."),
+    tunable!("max_scale", "Largest solid size", 0.5, 1.5, 0.05, "Size of a solid whose metric is at full load."),
+    tunable!("idle_spin", "Idle spin (rad/s)", 0.0, 1.0, 0.05, "How fast a solid spins when its metric is idle."),
+    tunable!("max_spin", "Fastest spin (rad/s)", 0.5, 8.0, 0.25, "How fast a solid spins at full load."),
+    tunable!("exposure", "Exposure", 0.3, 3.0, 0.1, "Overall picture brightness before it is turned into glyphs."),
+];
+
+/// Set config field `key` (a [`TUNABLES`] key) to `v`.
+pub fn set_tunable(c: &mut Config, key: &str, v: f32) {
+    match key {
+        "orbit_period" => c.orbit_period = v,
+        "orbit_bob" => c.orbit_bob = v,
+        "focus_zoom" => c.focus_zoom = v,
+        "focus_tau" => c.focus_tau = v,
+        "bg_contrast" => c.bg_contrast = v,
+        "bg_scale" => c.bg_scale = v,
+        "bg_sway" => c.bg_sway = v,
+        "bg_sway_period" => c.bg_sway_period = v,
+        "bg_rotate_period" => c.bg_rotate_period = v,
+        "min_scale" => c.min_scale = v,
+        "max_scale" => c.max_scale = v,
+        "idle_spin" => c.idle_spin = v,
+        "max_spin" => c.max_spin = v,
+        "exposure" => c.exposure = v,
+        _ => {}
+    }
+}
+
+/// Config field `key`'s value (a [`TUNABLES`] key).
+pub fn get_tunable(c: &Config, key: &str) -> f32 {
+    match key {
+        "orbit_period" => c.orbit_period,
+        "orbit_bob" => c.orbit_bob,
+        "focus_zoom" => c.focus_zoom,
+        "focus_tau" => c.focus_tau,
+        "bg_contrast" => c.bg_contrast,
+        "bg_scale" => c.bg_scale,
+        "bg_sway" => c.bg_sway,
+        "bg_sway_period" => c.bg_sway_period,
+        "bg_rotate_period" => c.bg_rotate_period,
+        "min_scale" => c.min_scale,
+        "max_scale" => c.max_scale,
+        "idle_spin" => c.idle_spin,
+        "max_spin" => c.max_spin,
+        "exposure" => c.exposure,
+        _ => f32::NAN,
+    }
+}
+
+/// Tooltip text for a dialog setting (`key` as in [`choices`], plus the
+/// dialog's own controls); empty when there is none.
+pub fn help(key: &str) -> &'static str {
+    match key {
+        "random" => "On: every run picks a new random look (layout, camera, colours, background...). Off: the look chosen in the Look group is used every time.",
+        "layout" => "Rings: the solids stand in rings on the floor. Sphere: they float on concentric spherical shells.",
+        "camera" => "Static: a fixed overview. Orbit: circles the solids. Focus: glides toward the busiest solid. Tilt: orbits while rising from 20 to 80 degrees and back, pausing half an orbit at each end. Resonance: orbits with three 20-degree rises and falls per turn.",
+        "color" => "The colour gradient, or Off for plain monochrome text.",
+        "color_by" => "What picks each solid's colour. Brightness: how lit the cell is. Load: the solid's metric. Spin: its spin speed and direction seen from the camera. Sound: the loudness of its own frequency band (bass on simple solids, treble on complex ones).",
+        "bg_color" => "Colouring of the floor and sky, separate from the solids. Auto: by brightness when the solids are. Off: uncoloured. Match: the solids' gradient by brightness. Or a gradient of its own.",
+        "bg_pattern" => "The floor's pattern. Quasicrystal is a flowing, never-repeating wave pattern.",
+        "bg_lum" => "Floor brightness, 0 (no floor) to 10.",
+        "bg_waves" => "Quasicrystal floor: the number of plane waves, which sets its rotational symmetry (7 = sevenfold).",
+        "bg_wave_speed" => "Quasicrystal floor: how fast its waves flow.",
+        "wireframe" => "Draw the edges of every solid over its shading.",
+        "stats" => "A line of metric readings and frame rate along the bottom of the screen.",
+        "fps_invert" => "Normally a busy machine animates faster; inverted, it slows down when busy.",
+        "extras" => "Extra solids for a network adapter and/or a disk device, beside CPU, RAM, disk, network and GPU.",
+        "fps_cap" => "Highest frame rate: the display's refresh rate, or a lower fixed cap.",
+        "budget" => "Share of CPU time the rendering may use; the text size is chosen so it fits.",
+        "density" => "Double halves the text height (twice the characters per axis) at about 4x the rendering cost.",
+        "levels" => "How many glyphs from dark to bright: 8, 16 or 32.",
+        "colors" => "Colours per gradient: 16, 32, 64 or 128. More gives smoother colour; brightness colouring then redraws more cells each frame.",
+        "sound" => "A second wireframe around each solid that swells and shrinks with the sound of the default output device.",
+        "halo_swing" => "How far the sound halo grows and shrinks around 1.2x the solid's size: +-10%, +-30% or +-60% of its radius.",
+        "halo_bands" => "On: each solid's halo follows its own frequency band, simple solids the bass and complex ones the treble. Off: every halo follows the overall level.",
+        "tags" => "A label with each solid's metric, joined to it by a short line.",
+        "tag_color" => "Tag colour with a gradient on: complementary to the theme, a tint of the theme, or white. Always kept readable.",
+        "tag_text" => "Auto: three-row block letters when the text is under 10 px tall. Line: always one line. Blocks: always block letters.",
+        "shift" => "OLED burn-in protection: move the whole picture by one pixel at random intervals.",
+        "shift_min_frames" => "Fewest frames between burn-in shifts.",
+        "shift_max_frames" => "Most frames between burn-in shifts.",
+        "shift_radius" => "How far, in pixels, the picture may drift from centre.",
+        _ => "",
+    }
+}
+
+/// A dialog option's shown text: long descriptions shortened to their
+/// leading word ("Resonance: orbit, 3 waves ..." → "Resonance").
+pub fn short_label(label: &str) -> String {
+    if label.chars().count() > 10 && label.contains(' ') {
+        let first = label.split_whitespace().next().unwrap_or(label);
+        first.trim_end_matches([':', ',', '(']).to_string()
+    } else {
+        label.to_string()
+    }
+}
+/// Quasicrystal wave counts offered in the dialog.
+pub const WAVES_CHOICE_MIN: u32 = 3;
+pub const WAVES_CHOICE_MAX: u32 = 12;
+/// Quasicrystal flow speeds offered in the dialog: (radians/s, shown text).
+pub const WAVE_SPEEDS: [(&str, &str); 5] =
+    [("0", "Still"), ("0.3", "Slow"), ("0.6", "Medium"), ("1.2", "Fast"), ("2.4", "Very fast")];
 /// Largest burn-in drift from the centred position, pixels per axis.
 pub const SHIFT_RADIUS_MAX: u8 = 25;
 
@@ -444,21 +656,6 @@ fn layout_id(l: Layout) -> &'static str {
     match l {
         Layout::Rings => "rings",
         Layout::Sphere => "sphere",
-    }
-}
-
-fn camera_id(c: CameraMode) -> &'static str {
-    match c {
-        CameraMode::Static => "static",
-        CameraMode::Orbit => "orbit",
-        CameraMode::Focus => "focus",
-    }
-}
-
-fn color_by_id(c: ColorBy) -> &'static str {
-    match c {
-        ColorBy::Lum => "lum",
-        ColorBy::Load => "load",
     }
 }
 
@@ -496,8 +693,16 @@ pub fn choices() -> Vec<Choice> {
     let on_off = || vec![opt("on", "On"), opt("off", "Off")];
     let mut colors = vec![opt("off", "Off (monochrome)")];
     colors.extend(color::PRESETS.iter().map(|(id, _, _)| opt(id, id)));
+    let mut bg_colors = vec![
+        opt("auto", "Auto (by brightness when the solids are)"),
+        opt("off", "Off (uncoloured)"),
+        opt("match", "Match (the solids' gradient, by brightness)"),
+    ];
+    bg_colors.extend(color::PRESETS.iter().map(|(id, _, _)| opt(id, id)));
     let patterns = Pattern::ALL.iter().map(|p| opt(p.id(), p.id())).collect();
     let lums = (0..=10).map(|l| opt(&l.to_string(), &if l == 0 { "0 (no floor)".into() } else { l.to_string() })).collect();
+    let waves = (WAVES_CHOICE_MIN..=WAVES_CHOICE_MAX).map(|n| opt(&n.to_string(), &format!("{n}-fold"))).collect();
+    let speeds = WAVE_SPEEDS.iter().map(|&(v, t)| opt(v, t)).collect();
     let mut caps = vec![opt("display", "Display refresh rate")];
     caps.extend([30, 60, 75, 90, 120, 144, 165, 240].map(|f| opt(&f.to_string(), &format!("{f} fps"))));
     let budgets = [5, 10, 15, 20, 25, 30, 40, 50].map(|b| opt(&b.to_string(), &format!("{b}%"))).to_vec();
@@ -508,12 +713,30 @@ pub fn choices() -> Vec<Choice> {
         look(
             "camera",
             "Camera",
-            vec![opt("static", "Static"), opt("orbit", "Orbit"), opt("focus", "Focus on busiest")],
+            vec![
+                opt("static", "Static"),
+                opt("orbit", "Orbit"),
+                opt("focus", "Focus on busiest"),
+                opt("tilt", "Tilt: orbit, rising 20-80 degrees and back"),
+                opt("resonance", "Resonance: orbit, 3 waves of 20 degrees per turn"),
+            ],
         ),
         look("color", "Colour", colors),
-        look("color_by", "Colour source", vec![opt("lum", "Brightness"), opt("load", "Load per solid")]),
+        look(
+            "color_by",
+            "Colour source (solids)",
+            vec![
+                opt("lum", "Brightness"),
+                opt("load", "Load per solid"),
+                opt("spin", "Spin speed and direction"),
+                opt("sound", "Sound: frequency band per solid"),
+            ],
+        ),
+        look("bg_color", "Background colour", bg_colors),
         look("bg_pattern", "Background pattern", patterns),
         look("bg_lum", "Background luminosity", lums),
+        look("bg_waves", "Quasicrystal waves (symmetry)", waves),
+        look("bg_wave_speed", "Quasicrystal flow", speeds),
         look("wireframe", "Wireframe overlay", on_off()),
         look("stats", "Stats bar", on_off()),
         look("fps_invert", "Inverted frame rate", on_off()),
@@ -530,21 +753,19 @@ pub fn choices() -> Vec<Choice> {
             "Luminosity levels",
             vec![opt("8", "8"), opt("16", "16"), opt("32", "32")],
         ),
-        always("sound", "Sound halo (output device)", on_off()),
         always(
-            "halo_wide",
+            "colors",
+            "Palette size",
+            color::PALETTE_SIZES.iter().map(|n| opt(&n.to_string(), &format!("{n} colours"))).collect(),
+        ),
+        always("sound", "Sound halo", on_off()),
+        always(
+            "halo_swing",
             "Halo size swing",
-            vec![opt("off", "\u{b1}5% of radius"), opt("on", "\u{b1}30% of radius (extra \u{b1}25%)")],
+            HALO_SWING_PCT.iter().map(|p| opt(&p.to_string(), &format!("\u{b1}{p}%"))).collect(),
         ),
-        always(
-            "halo_bands",
-            "Halo bounce source",
-            vec![
-                opt("on", "Frequency by solid (simple = bass, complex = treble)"),
-                opt("off", "Overall level (all solids together)"),
-            ],
-        ),
-        always("tags", "Solid tags (metric + leader line)", on_off()),
+        always("halo_bands", "Halo bounce by frequency", on_off()),
+        always("tags", "Solid tags", on_off()),
         always(
             "tag_color",
             "Tag colour",
@@ -554,9 +775,9 @@ pub fn choices() -> Vec<Choice> {
             "tag_text",
             "Tag text",
             vec![
-                opt("auto", "Block letters when text is under 10 px"),
-                opt("line", "Always one line"),
-                opt("blocks", "Always block letters (3 lines)"),
+                opt("auto", "Auto (block letters under 10 px)"),
+                opt("line", "Line (always one line)"),
+                opt("blocks", "Blocks (always 3-line block letters)"),
             ],
         ),
         always(
@@ -570,14 +791,27 @@ pub fn choices() -> Vec<Choice> {
 impl ScrSettings {
     /// `(key, value)` pairs as written to the INI file.
     pub fn to_pairs(&self) -> Vec<(&'static str, String)> {
+        let mut v = self.look_pairs();
+        // Tuning: every key, empty when not set (so saving clears it).
+        for t in &TUNABLES {
+            let set = self.tuning.iter().find(|(k, _)| *k == t.key).map(|&(_, x)| t.show(x));
+            v.push((t.ini, set.unwrap_or_default()));
+        }
+        v
+    }
+
+    fn look_pairs(&self) -> Vec<(&'static str, String)> {
         vec![
             ("random", on_off(self.random)),
             ("layout", layout_id(self.layout).into()),
-            ("camera", camera_id(self.camera).into()),
+            ("camera", self.camera.id().into()),
             ("color", self.color.clone()),
-            ("color_by", color_by_id(self.color_by).into()),
+            ("color_by", self.color_by.id().into()),
+            ("bg_color", self.bg_color.clone()),
             ("bg_pattern", self.bg_pattern.id().into()),
             ("bg_lum", self.bg_lum.to_string()),
+            ("bg_waves", self.bg_waves.to_string()),
+            ("bg_wave_speed", self.bg_wave_speed.to_string()),
             ("wireframe", on_off(self.wireframe)),
             ("stats", on_off(self.stats)),
             ("fps_invert", on_off(self.fps_invert)),
@@ -586,8 +820,9 @@ impl ScrSettings {
             ("budget", self.budget_pct.to_string()),
             ("density", self.density.to_string()),
             ("levels", levels_id(self.levels).into()),
+            ("colors", self.colors.to_string()),
             ("sound", on_off(self.sound)),
-            ("halo_wide", on_off(self.halo_wide)),
+            ("halo_swing", self.halo_swing.to_string()),
             ("halo_bands", on_off(self.halo_bands)),
             ("tags", on_off(self.tags)),
             ("tag_color", self.tag_color.id()),
@@ -619,10 +854,18 @@ impl ScrSettings {
                 .filter(|v| v == "off" || color::PRESETS.iter().any(|(id, _, _)| id == v))
                 .unwrap_or(d.color.clone()),
             color_by: val("color_by").and_then(|v| v.parse().ok()).unwrap_or(d.color_by),
+            bg_color: val("bg_color")
+                .filter(|v| ["auto", "off", "match"].contains(&v.as_str()) || color::PRESETS.iter().any(|(id, _, _)| id == v))
+                .unwrap_or(d.bg_color.clone()),
             bg_pattern: val("bg_pattern")
                 .and_then(|v| Pattern::ALL.into_iter().find(|p| p.id() == v))
                 .unwrap_or(d.bg_pattern),
             bg_lum: num("bg_lum").filter(|l| *l <= 10).map_or(d.bg_lum, |l| l as u8),
+            bg_waves: num("bg_waves").filter(|n| (WAVES_CHOICE_MIN..=WAVES_CHOICE_MAX).contains(n)).unwrap_or(d.bg_waves),
+            bg_wave_speed: val("bg_wave_speed")
+                .and_then(|v| v.parse::<f32>().ok())
+                .filter(|v| v.is_finite() && (-20.0..=20.0).contains(v))
+                .unwrap_or(d.bg_wave_speed),
             wireframe: flag("wireframe", d.wireframe),
             stats: flag("stats", d.stats),
             fps_invert: flag("fps_invert", d.fps_invert),
@@ -634,8 +877,19 @@ impl ScrSettings {
             budget_pct: num("budget").filter(|b| (1..=100).contains(b)).map_or(d.budget_pct, |b| b as u8),
             density: num("density").filter(|v| (1..=2).contains(v)).map_or(d.density, |v| v as u8),
             levels: val("levels").and_then(|v| parse_levels(&v)).unwrap_or(d.levels),
+            colors: num("colors").map(|n| n as usize).filter(|n| color::PALETTE_SIZES.contains(n)).unwrap_or(d.colors),
             sound: flag("sound", d.sound),
-            halo_wide: flag("halo_wide", d.halo_wide),
+            halo_swing: num("halo_swing")
+                .and_then(|p| HALO_SWING_PCT.into_iter().find(|&q| q as u32 == p))
+                .or_else(|| val("halo_wide").and_then(|v| parse_on_off(&v)).map(|w| if w { 30 } else { 10 }))
+                .unwrap_or(d.halo_swing),
+            tuning: TUNABLES
+                .iter()
+                .filter_map(|t| {
+                    let v = val(t.ini)?.parse::<f32>().ok().filter(|v| v.is_finite())?;
+                    Some((t.key, t.snap(v)))
+                })
+                .collect(),
             halo_bands: flag("halo_bands", d.halo_bands),
             tags: flag("tags", d.tags),
             tag_color: val("tag_color").and_then(|v| v.parse().ok()).unwrap_or(d.tag_color),
@@ -658,8 +912,11 @@ impl ScrSettings {
         c.camera = self.camera;
         c.color = self.color.clone();
         c.color_by = self.color_by;
+        c.bg_color = self.bg_color.clone();
         c.bg_pattern = self.bg_pattern;
         c.bg_lum = self.bg_lum as f32;
+        c.bg_waves = self.bg_waves;
+        c.bg_wave_speed = self.bg_wave_speed;
         c.wireframe = self.wireframe;
         c.show_stats = self.stats;
         c.fps_invert = self.fps_invert;
@@ -868,9 +1125,12 @@ mod tests {
             layout: Layout::Sphere,
             camera: CameraMode::Focus,
             color: "viridis".into(),
-            color_by: ColorBy::Load,
+            color_by: ColorBy::Spin,
+            bg_color: "ice".into(),
             bg_pattern: Pattern::Hex,
             bg_lum: 0,
+            bg_waves: 5,
+            bg_wave_speed: 0.0,
             wireframe: true,
             stats: false,
             fps_invert: true,
@@ -879,8 +1139,10 @@ mod tests {
             budget_pct: 25,
             density: 1,
             levels: Levels::L32,
+            colors: 64,
             sound: false,
-            halo_wide: true,
+            halo_swing: 60,
+            tuning: vec![("orbit_period", 45.0), ("max_spin", 2.5)],
             halo_bands: false,
             tags: false,
             tag_color: crate::color::TagColor::Theme,
@@ -916,7 +1178,7 @@ mod tests {
         let looks: Vec<&str> = choices().iter().filter(|c| c.look).map(|c| c.key).collect();
         assert_eq!(
             looks,
-            ["layout", "camera", "color", "color_by", "bg_pattern", "bg_lum", "wireframe", "stats", "fps_invert", "extras"]
+            ["layout", "camera", "color", "color_by", "bg_color", "bg_pattern", "bg_lum", "bg_waves", "bg_wave_speed", "wireframe", "stats", "fps_invert", "extras"]
         );
         for c in choices() {
             assert!(keys.contains(&c.key), "{} is a settings key", c.key);
@@ -933,6 +1195,33 @@ mod tests {
                 assert!(c.options.iter().any(|(o, _)| *o == v), "default {k}={v} listed");
             }
         }
+    }
+
+    #[test]
+    fn tuning_applies_every_run_and_snaps_to_its_steps() {
+        for random in [true, false] {
+            let s = ScrSettings { random, tuning: vec![("orbit_period", 45.0), ("bg_scale", 2.0), ("exposure", 1.3)], ..ScrSettings::default() };
+            for seed in 0..5 {
+                let c = plan(&WQHD, seed, &s).unwrap().config;
+                assert_eq!((c.orbit_period, c.bg_scale, c.exposure), (45.0, 2.0, 1.3), "random {random} seed {seed}");
+            }
+        }
+        // out of range or off-step values from the INI snap to the slider
+        let s = ScrSettings::from_lookup(lookup(&[("tune_orbit_period", "47"), ("tune_max_spin", "99"), ("tune_bg_sway", "x")]));
+        assert_eq!(s.tuning, vec![("orbit_period", 45.0), ("max_spin", 8.0)]);
+        for t in TUNABLES {
+            assert_eq!(t.value_at(0), t.min, "{}", t.key);
+            assert!((t.value_at(t.steps()) - t.max).abs() < 1e-4, "{}", t.key);
+            let d = get_tunable(&Config::default(), t.key);
+            assert!(d.is_finite() && (t.min..=t.max).contains(&d), "{}: default {d} inside the slider", t.key);
+            let mut c = Config::default();
+            set_tunable(&mut c, t.key, t.max);
+            assert_eq!(get_tunable(&c, t.key), t.max, "{}", t.key);
+        }
+        // the old on/off halo key still reads: on = 30%, off = 10%
+        assert_eq!(ScrSettings::from_lookup(lookup(&[("halo_wide", "on")])).halo_swing, 30);
+        assert_eq!(ScrSettings::from_lookup(lookup(&[("halo_wide", "off")])).halo_swing, 10);
+        assert_eq!(ScrSettings::from_lookup(lookup(&[("halo_swing", "60"), ("halo_wide", "off")])).halo_swing, 60);
     }
 
     #[test]

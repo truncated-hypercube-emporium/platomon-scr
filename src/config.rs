@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use crate::aspect::AspectMode;
 use crate::clock::FpsCurve;
-use crate::color::{ColorBy, ColorDepth, ColorMap, Gradient};
+use crate::color::{self, ColorBy, ColorMap, Gradient};
 use crate::scene::Layout;
 use crate::metrics::{MetricKind, MetricSpec};
 use crate::overlay::{LEGEND_SIZE_MAX, LEGEND_SIZE_MIN, LegendParams, LegendPos};
@@ -109,10 +109,19 @@ pub struct Config {
     /// `off`, a gradient preset (`inferno`, `viridis`, `traffic`, ...) or hex
     /// stops like `"#000:#f80:#fff"`.
     pub color: String,
-    /// `lum`: colour by brightness; `load`: each solid by its metric's load.
+    /// `lum`: colour by brightness; `load`: each solid by its metric's load;
+    /// `spin`: by its spin speed and direction; `sound`: by the loudness of
+    /// its own frequency band (screensaver only).
     pub color_by: ColorBy,
-    /// `24bit` or `256`.
-    pub color_depth: ColorDepth,
+    /// Palette size: 16, 32, 64 or 128 colours per gradient.
+    pub colors: usize,
+    /// Background colouring: `auto`, `off`, `match` (the solids' gradient by
+    /// brightness) or a gradient of its own (preset or hex stops).
+    pub bg_color: String,
+    /// Removed (24-bit colour is gone; see `colors`). Still accepted so older
+    /// config files load; ignored.
+    #[serde(skip_serializing)]
+    pub color_depth: Option<String>,
     pub color_reverse: bool,
 
     // --- layout ---
@@ -156,6 +165,10 @@ pub struct Config {
     pub bg_rotate: Spin,
     /// Seconds per revolution.
     pub bg_rotate_period: f32,
+    /// Quasicrystal pattern: number of plane waves (3..=24; its symmetry).
+    pub bg_waves: u32,
+    /// Quasicrystal pattern: wave phase speed, radians/s (0 = still).
+    pub bg_wave_speed: f32,
 
     // --- animation ---
     pub min_scale: f32,
@@ -212,7 +225,9 @@ impl Default for Config {
             tag_blocks: false,
             color: "off".to_string(),
             color_by: ColorBy::Lum,
-            color_depth: ColorDepth::True,
+            colors: color::DEFAULT_COLORS,
+            bg_color: color::BG_COLOR_DEFAULT.into(),
+            color_depth: None,
             color_reverse: false,
             layout: Layout::Rings,
             focus_zoom: 0.6,
@@ -233,6 +248,8 @@ impl Default for Config {
             bg_sway_period: 10.0,
             bg_rotate: Spin::Off,
             bg_rotate_period: 60.0,
+            bg_waves: crate::scene::ground::WAVES_DEFAULT,
+            bg_wave_speed: crate::scene::ground::WAVE_SPEED_DEFAULT,
             min_scale: 0.45,
             max_scale: 1.0,
             max_spin: 3.0,
@@ -278,7 +295,10 @@ impl Config {
     }
 
     pub fn from_toml(text: &str) -> Result<Self, String> {
-        toml::from_str(text).map_err(|e| e.to_string())
+        let mut c: Self = toml::from_str(text).map_err(|e| e.to_string())?;
+        c.colors = color::palette_size(c.colors);
+        c.color_depth = None;
+        Ok(c)
     }
 
     /// Load from an explicit path (must exist), else the default path if it
@@ -302,6 +322,7 @@ impl Config {
 
     /// Clamp everything into a usable range. Never fails.
     pub fn sanitize(&mut self) {
+        self.colors = color::palette_size(self.colors);
         let d = Self::default();
         self.fps_min = finite_or(self.fps_min, d.fps_min).max(1.0);
         self.fps_max = finite_or(self.fps_max, d.fps_max).max(self.fps_min);
@@ -339,6 +360,8 @@ impl Config {
         self.bg_sway = finite_or(self.bg_sway, d.bg_sway).clamp(0.0, 100.0);
         self.bg_sway_period = finite_or(self.bg_sway_period, d.bg_sway_period).clamp(0.5, 86_400.0);
         self.bg_rotate_period = finite_or(self.bg_rotate_period, d.bg_rotate_period).clamp(0.5, 86_400.0);
+        self.bg_waves = self.bg_waves.clamp(crate::scene::ground::WAVES_MIN, crate::scene::ground::WAVES_MAX);
+        self.bg_wave_speed = finite_or(self.bg_wave_speed, d.bg_wave_speed).clamp(-20.0, 20.0);
         for v in [&mut self.orbit_radius, &mut self.orbit_height] {
             *v = v.filter(|x| x.is_finite()).map(|x| x.clamp(0.5, 500.0));
         }
@@ -375,6 +398,8 @@ impl Config {
             sway_period: self.bg_sway_period,
             rotate: self.bg_rotate,
             rotate_period: self.bg_rotate_period,
+            waves: self.bg_waves,
+            wave_speed: self.bg_wave_speed,
         }
     }
 
@@ -387,12 +412,14 @@ impl Config {
 
     /// The colour mapping, or `None` for monochrome (`color = "off"`).
     pub fn color_map(&self) -> Result<Option<ColorMap>, String> {
-        if matches!(self.color.trim().to_ascii_lowercase().as_str(), "off" | "none" | "mono") {
-            return Ok(None);
-        }
-        let g = Gradient::parse(&self.color)?;
-        let gradient = if self.color_reverse { g.reversed() } else { g };
-        Ok(Some(ColorMap { gradient, by: self.color_by, depth: self.color_depth }))
+        let solid = if matches!(self.color.trim().to_ascii_lowercase().as_str(), "off" | "none" | "mono") {
+            None
+        } else {
+            let g = Gradient::parse(&self.color)?;
+            Some(if self.color_reverse { g.reversed() } else { g })
+        };
+        let bg = color::bg_gradient(&self.bg_color, solid.as_ref(), self.color_by)?;
+        Ok(ColorMap::new(solid, self.color_by, self.colors, bg))
     }
 
     pub fn legend_params(&self) -> LegendParams {
@@ -572,10 +599,15 @@ mod tests {
         )
         .unwrap();
         let m = c.color_map().unwrap().unwrap();
-        assert_eq!((m.by, m.depth), (ColorBy::Load, ColorDepth::Ansi256));
+        assert_eq!((m.by, m.size, m.bg.is_none()), (ColorBy::Load, 16, true), "old color_depth ignored, 16 colours");
         assert_eq!(m.gradient.sample(0.0, 1.0), 0xfde725, "reversed: starts at viridis' yellow");
         assert_eq!((c.layout, c.camera, c.focus_zoom), (Layout::Sphere, CameraMode::Focus, 0.9));
         assert!(Config { color: "plaid".into(), ..Config::default() }.color_map().is_err());
+        // palette size snaps to an offered one; the background maps on its own
+        let c2 = Config::from_toml("color = \"off\"\nbg_color = \"ice\"\ncolors = 100\n").unwrap();
+        let m2 = c2.color_map().unwrap().unwrap();
+        assert_eq!((c2.colors, m2.solid.is_none(), m2.bg.as_ref().map(|p| p.len())), (128, true, Some(128)));
+        assert!(Config { bg_color: "plaid".into(), ..Config::default() }.color_map().is_err());
         assert!(Config::from_toml("layout = \"cube\"").is_err());
         let back = Config::from_toml(&c.to_toml()).unwrap();
         assert_eq!(back, c);

@@ -39,12 +39,12 @@ fn time(r: &mut Renderer, s: &Scene, w: usize, h: usize, rs: &RenderSettings, fr
 
 fn main() {
     let frames: usize = std::env::args().nth(1).and_then(|a| a.parse().ok()).unwrap_or(60);
-    // The screensaver renders 1 spp, 1 bounce; density 2 on 2560×1440 ≈ 640×240 cells.
+    // The screensaver renders 1 spp, 1 bounce; density 2 on 2560Ã—1440 â‰ˆ 640Ã—240 cells.
     let rs = RenderSettings { spp: 1, trace: TraceSettings { bounces: 1, ..TraceSettings::default() }, ..RenderSettings::default() };
     let cases: Vec<(&str, GroundParams)> = {
         let p = |pattern, rotate| GroundParams { lum: 5.0, pattern, contrast: 0.6, scale: 1.5, rotate, rotate_period: 30.0, ..GroundParams::default() };
         let mut v = vec![("off (lum 0)", GroundParams { lum: 0.0, ..GroundParams::default() }), ("solid", p(Pattern::Solid, Spin::Off))];
-        for pat in [Pattern::Checker, Pattern::Diamond, Pattern::Brick, Pattern::Triangles, Pattern::Hex, Pattern::Radial] {
+        for pat in [Pattern::Checker, Pattern::Diamond, Pattern::Brick, Pattern::Triangles, Pattern::Hex, Pattern::Radial, Pattern::Quasicrystal] {
             v.push((pat.id(), p(pat, Spin::Off)));
         }
         v.push(("checker, rotating + sway", GroundParams { sway: 0.5, ..p(Pattern::Checker, Spin::Cw) }));
