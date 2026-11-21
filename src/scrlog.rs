@@ -136,6 +136,12 @@ pub fn push(entries: &mut Vec<LogEntry>, e: LogEntry) {
     });
 }
 
+/// An entry already holding exactly `settings`, if any (saves that change
+/// nothing are not logged twice).
+pub fn find_same<'a>(entries: &'a [LogEntry], settings: &[(String, String)]) -> Option<&'a LogEntry> {
+    entries.iter().find(|e| e.settings == settings)
+}
+
 /// `configuration.log`: the user's defaults and the pinned entries.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Prefs {
@@ -282,6 +288,16 @@ mod tests {
         assert!(!toggle_pin(&mut log, &mut prefs, 8));
         assert!(prefs.pinned.is_empty());
         assert!(!toggle_pin(&mut log, &mut prefs, 77), "unknown id");
+    }
+
+    #[test]
+    fn same_settings_are_found() {
+        let log = vec![entry(5, false), entry(4, true)];
+        let same = entry(9, false).settings;
+        assert_eq!(find_same(&log, &same).map(|e| e.id), Some(5));
+        let mut other = same.clone();
+        other[1].1 = "orbit".into();
+        assert!(find_same(&log, &other).is_none());
     }
 
     #[test]

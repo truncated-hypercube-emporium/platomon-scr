@@ -45,6 +45,7 @@ unsafe extern "system" {
     fn GetDlgItem(h: HWND, id: i32) -> HWND;
     fn GetDlgCtrlID(h: HWND) -> i32;
     fn EnableWindow(h: HWND, enable: i32) -> i32;
+    fn ShowWindow(h: HWND, cmd: i32) -> i32;
     fn SendMessageW(h: HWND, msg: u32, w: usize, l: isize) -> isize;
     fn CreateWindowExW(
         ex_style: u32,
@@ -311,6 +312,8 @@ const ID_PIN: i32 = 1500;
 const ID_ROW: i32 = 1600;
 const ID_DETAILS: i32 = 1700;
 const ID_LOAD: i32 = 1701;
+const ID_EMPTY: i32 = 1702;
+const ID_APPLY: i32 = 1204;
 /// Tuning dialog: row `k`'s slider, value text and reset button.
 const ID_TUNE: i32 = 2000;
 const ID_TUNE_VALUE: i32 = 2100;
@@ -333,6 +336,8 @@ const CB_ADDSTRING: u32 = 0x0143;
 const CB_GETCURSEL: u32 = 0x0147;
 const CB_SETCURSEL: u32 = 0x014E;
 const BN_CLICKED: usize = 0;
+const SW_HIDE: i32 = 0;
+const SW_SHOW: i32 = 5;
 const MB_ICONWARNING: u32 = 0x30;
 const ICC_BAR_CLASSES: u32 = 0x4;
 const ICC_TAB_CLASSES: u32 = 0x8;
@@ -411,27 +416,24 @@ fn main_tips() -> Vec<(i32, String)> {
     for (id, key) in [(ID_SHIFT, "shift"), (ID_SHIFT_MIN, "shift_min_frames"), (ID_SHIFT_MAX, "shift_max_frames"), (ID_RADIUS, "shift_radius"), (ID_RADIUS_VALUE, "shift_radius")] {
         v.push((id, help(key).into()));
     }
-    let buttons: [(i32, &str); 7] = [
+    let buttons: [(i32, &str); 8] = [
+        (ID_APPLY, "Save the settings and log them without closing the dialog."),
         (ID_DEFAULTS, "Load your saved defaults (from Set as default), or the built-in ones when none are saved. Nothing is saved until OK."),
         (ID_SET_DEFAULT, "Save the settings shown as your defaults, in configuration.log beside the settings file."),
         (ID_TUNING, "Sliders for numeric values (orbit period, floor tile size, spin speeds...) that apply every run."),
         (ID_LOAD, "Put the picked log entry's settings back into the dialog. Nothing is saved until OK."),
         (ID_DETAILS, "The picked log entry: its time, the arguments the dialog was launched with, and its settings."),
-        (IDOK, "Save the settings and add a timestamped entry to the configuration log."),
+        (IDOK, "Save the settings, log them (unless the same settings are already logged) and close."),
         (IDCANCEL, "Close without saving."),
     ];
     v.extend(buttons.iter().map(|&(id, t)| (id, t.to_string())));
-    UI.with(|u| {
-        let u = u.borrow();
-        for (k, id) in u.rows.iter().enumerate() {
-            let Some(e) = u.log.iter().find(|e| e.id == *id) else { continue };
-            v.push((ID_ROW + k as i32, format!("\"{}\", saved {}: click to show its settings and launch arguments below.", e.title, e.time)));
-            v.push((
-                ID_PIN + k as i32,
-                "+ keeps this entry: it is saved to configuration.log and never dropped from the log. \u{2212} lets it go again.".into(),
-            ));
-        }
-    });
+    for k in 0..LOG_ROWS_MAX as i32 {
+        v.push((ID_ROW + k, "A logged configuration: click to show its settings and launch arguments below.".into()));
+        v.push((
+            ID_PIN + k,
+            "+ keeps this entry: it is saved to configuration.log and never dropped from the log. \u{2212} lets it go again.".into(),
+        ));
+    }
     v
 }
 
@@ -605,11 +607,11 @@ fn group(t: &mut Template, title: &str, y: i16, items: &[(usize, &Choice)]) -> i
     y + h.max(yy - y + 4)
 }
 
-fn build_template(log: &[LogEntry]) -> Vec<u32> {
-    build_template_counted(log).0
+fn build_template() -> Vec<u32> {
+    build_template_counted().0
 }
 
-fn build_template_counted(log: &[LogEntry]) -> (Vec<u32>, usize) {
+fn build_template_counted() -> (Vec<u32>, usize) {
     let general = general_choices();
     let looks: Vec<(usize, &Choice)> = general.iter().enumerate().filter(|(_, c)| c.look).collect();
     let always: Vec<(usize, &Choice)> = general.iter().enumerate().filter(|(_, c)| !c.look).collect();
@@ -643,30 +645,28 @@ fn build_template_counted(log: &[LogEntry]) -> (Vec<u32>, usize) {
     t.item(SS_NOTIFY, (262, ry + 2, 30, 10), ID_RADIUS_VALUE as u16, STATIC, "");
     let left_bottom = gy + gh;
 
-    // right column: the configuration log
-    let rows = log.len().min(LOG_ROWS_MAX);
-    let list_h = (rows.max(1) as i16) * 12;
-    let details_y = 22 + 12 + list_h + 6;
-    let details_h = 120i16;
-    let log_h = details_y + details_h + 22 - 22;
-    t.item(BS_GROUPBOX, (LOG_X - 4, 22, LOG_W + 2, log_h), ID_STATIC, BUTTON, "Configuration log");
-    if rows == 0 {
-        t.item(0, (LOG_X + 4, 36, LOG_W - 12, 20), ID_STATIC, STATIC, "No entries yet: each OK adds one.");
-    }
-    for (k, e) in log.iter().take(rows).enumerate() {
+    // Right column: the configuration log. Every row is created (unused
+    // ones hidden) so Apply can show new entries without reopening; the
+    // details box runs down to the burn-in group's bottom edge.
+    let load_y = 34 + LOG_ROWS_MAX as i16 * 12 + 2;
+    let details_y = load_y + 17;
+    let log_bottom = left_bottom.max(details_y + 60 + 6);
+    t.item(BS_GROUPBOX, (LOG_X - 4, 22, LOG_W + 2, log_bottom - 22), ID_STATIC, BUTTON, "Configuration log");
+    t.item(0, (LOG_X + 4, 36, LOG_W - 12, 20), ID_EMPTY as u16, STATIC, "No entries yet: each OK or Apply adds one.");
+    for k in 0..LOG_ROWS_MAX {
         let y = 34 + k as i16 * 12;
-        t.item(BS_PUSHBUTTON | WS_TABSTOP, (LOG_X + 2, y, 12, 11), (ID_PIN + k as i32) as u16, BUTTON, pin_text(e.pinned));
-        t.item(BS_PUSHBUTTON | BS_FLAT | BS_LEFT | WS_TABSTOP, (LOG_X + 16, y, LOG_W - 22, 11), (ID_ROW + k as i32) as u16, BUTTON, &e.label());
+        t.item(BS_PUSHBUTTON | WS_TABSTOP, (LOG_X + 2, y, 12, 11), (ID_PIN + k as i32) as u16, BUTTON, "+");
+        t.item(BS_PUSHBUTTON | BS_FLAT | BS_LEFT | WS_TABSTOP, (LOG_X + 16, y, LOG_W - 22, 11), (ID_ROW + k as i32) as u16, BUTTON, "");
     }
+    t.item(BS_PUSHBUTTON | WS_TABSTOP, (LOG_X + 2, load_y, 80, 13), ID_LOAD as u16, BUTTON, "&Load into dialog");
     t.item(
         ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL | WS_BORDER,
-        (LOG_X + 2, details_y, LOG_W - 8, details_h - 20),
+        (LOG_X + 2, details_y, LOG_W - 8, log_bottom - 6 - details_y),
         ID_DETAILS as u16,
         EDIT,
         "Pick an entry to see its settings and launch arguments. + keeps it (saved to configuration.log).",
     );
-    t.item(BS_PUSHBUTTON | WS_TABSTOP, (LOG_X + 2, details_y + details_h - 17, 80, 13), ID_LOAD as u16, BUTTON, "&Load into dialog");
-    let right_bottom = 22 + log_h;
+    let right_bottom = log_bottom;
 
     let bottom = left_bottom.max(right_bottom) + 6;
     t.item(0, (10, bottom, DLG_W - 20, 10), ID_STATUS as u16, STATIC, "Saved to %APPDATA%\\platomon\\screensaver.ini.");
@@ -674,6 +674,7 @@ fn build_template_counted(log: &[LogEntry]) -> (Vec<u32>, usize) {
     t.item(BS_PUSHBUTTON | WS_TABSTOP, (10, by, 52, 14), ID_DEFAULTS as u16, BUTTON, "&Defaults");
     t.item(BS_PUSHBUTTON | WS_TABSTOP, (66, by, 66, 14), ID_SET_DEFAULT as u16, BUTTON, "&Set as default");
     t.item(BS_PUSHBUTTON | WS_TABSTOP, (136, by, 70, 14), ID_TUNING as u16, BUTTON, "&Tuning...");
+    t.item(BS_PUSHBUTTON | WS_TABSTOP, (DLG_W - 182, by, 55, 14), ID_APPLY as u16, BUTTON, "&Apply");
     t.item(BS_DEFPUSHBUTTON | WS_TABSTOP, (DLG_W - 122, by, 55, 14), IDOK as u16, BUTTON, "OK");
     t.item(BS_PUSHBUTTON | WS_TABSTOP, (DLG_W - 62, by, 55, 14), IDCANCEL as u16, BUTTON, "Cancel");
     // final height
@@ -878,23 +879,80 @@ unsafe fn read(h: HWND) -> Result<ScrSettings, String> {
     Ok(s)
 }
 
-/// After a successful save: log it, keeping pinned entries.
-fn log_ok(s: &ScrSettings) -> Result<(), String> {
-    let (id, time) = now_text();
-    let mut rng = fastrand::Rng::new();
-    let entry = LogEntry {
-        id,
-        title: scrlog::random_word(&mut rng).to_string(),
-        time,
-        args: launch_args(),
-        settings: pairs_of(s),
-        pinned: false,
-    };
+/// What logging a save did.
+enum Logged {
+    /// A new entry with this title.
+    Added(String),
+    /// The same settings are already logged under this title.
+    Duplicate(String),
+}
+
+/// After a successful save: log it (with the random look off, so the
+/// entry holds the look as chosen), unless the same settings are already
+/// logged; pinned entries are kept.
+fn log_save(s: &ScrSettings) -> Result<Logged, String> {
+    let settings = pairs_of(&ScrSettings { random: false, ..s.clone() });
     UI.with(|u| {
         let mut u = u.borrow_mut();
+        if let Some(e) = scrlog::find_same(&u.log, &settings) {
+            return Ok(Logged::Duplicate(e.title.clone()));
+        }
+        let (id, time) = now_text();
+        let title = scrlog::random_word(&mut fastrand::Rng::new()).to_string();
+        let entry = LogEntry { id, title: title.clone(), time, args: launch_args(), settings, pinned: false };
         scrlog::push(&mut u.log, entry);
-        write_text(&log_path(), &scrlog::render_log(&u.log))
+        write_text(&log_path(), &scrlog::render_log(&u.log)).map(|_| Logged::Added(title))
     })
+}
+
+/// Show the log's entries in the rows (newest first), hiding unused rows.
+fn refresh_log(h: HWND) {
+    let rows: Vec<(String, bool)> = UI.with(|u| {
+        let mut u = u.borrow_mut();
+        let ids: Vec<u64> = u.log.iter().take(LOG_ROWS_MAX).map(|e| e.id).collect();
+        u.rows = ids;
+        u.log.iter().take(LOG_ROWS_MAX).map(|e| (e.label(), e.pinned)).collect()
+    });
+    // SAFETY: control ids from our template.
+    unsafe {
+        for k in 0..LOG_ROWS_MAX {
+            let (row, pin) = (GetDlgItem(h, ID_ROW + k as i32), GetDlgItem(h, ID_PIN + k as i32));
+            match rows.get(k) {
+                Some((label, pinned)) => {
+                    SetDlgItemTextW(h, ID_ROW + k as i32, wide(label).as_ptr());
+                    SetDlgItemTextW(h, ID_PIN + k as i32, wide(pin_text(*pinned)).as_ptr());
+                    ShowWindow(row, SW_SHOW);
+                    ShowWindow(pin, SW_SHOW);
+                }
+                None => {
+                    ShowWindow(row, SW_HIDE);
+                    ShowWindow(pin, SW_HIDE);
+                }
+            }
+        }
+        ShowWindow(GetDlgItem(h, ID_EMPTY), if rows.is_empty() { SW_SHOW } else { SW_HIDE });
+    }
+}
+
+/// Save the dialog's settings and log them; the status line says what
+/// happened. Returns false when the settings could not be read or saved.
+unsafe fn save_and_log(h: HWND) -> bool {
+    // SAFETY: `h` is our dialog.
+    match unsafe { read(h) }.and_then(|s| save(&s).map(|_| s)) {
+        Ok(s) => {
+            match log_save(&s) {
+                Ok(Logged::Added(t)) => status(h, &format!("Saved, and logged as \"{t}\".")),
+                Ok(Logged::Duplicate(t)) => status(h, &format!("Saved; these settings are already logged as \"{t}\".")),
+                Err(e) => status(h, &format!("Saved, but the log was not: {e}")),
+            }
+            true
+        }
+        Err(e) => {
+            // SAFETY: valid strings; `h` is our dialog.
+            unsafe { MessageBoxW(h, wide(&e).as_ptr(), wide("platomon").as_ptr(), MB_ICONWARNING) };
+            false
+        }
+    }
 }
 
 fn entry_at(row: usize) -> Option<LogEntry> {
@@ -934,6 +992,7 @@ pub unsafe extern "system" fn ScreenSaverConfigureDialog(h: HWND, msg: u32, w: u
                 let r = radius_choice();
                 SendDlgItemMessageW(h, ID_RADIUS, TBM_SETRANGE, 1, (r.options.len().saturating_sub(1) as isize) << 16);
                 fill(h, &load());
+                refresh_log(h);
                 add_tips(h, &main_tips());
                 1
             }
@@ -953,17 +1012,14 @@ pub unsafe extern "system" fn ScreenSaverConfigureDialog(h: HWND, msg: u32, w: u
                 let (id, code) = ((w & 0xFFFF) as i32, (w >> 16) & 0xFFFF);
                 match id {
                     IDOK => {
-                        let result = read(h).and_then(|s| save(&s).map(|_| s));
-                        match result {
-                            Ok(s) => {
-                                if let Err(e) = log_ok(&s) {
-                                    MessageBoxW(h, wide(&format!("Settings saved, but the log was not: {e}")).as_ptr(), wide("platomon").as_ptr(), MB_ICONWARNING);
-                                }
-                                EndDialog(h, 1);
-                            }
-                            Err(e) => {
-                                MessageBoxW(h, wide(&e).as_ptr(), wide("platomon").as_ptr(), MB_ICONWARNING);
-                            }
+                        if save_and_log(h) {
+                            EndDialog(h, 1);
+                        }
+                        1
+                    }
+                    ID_APPLY => {
+                        if save_and_log(h) {
+                            refresh_log(h);
                         }
                         1
                     }
@@ -1176,9 +1232,8 @@ unsafe extern "system" fn tuning_dialog(h: HWND, msg: u32, w: usize, l: isize) -
 pub fn configure(owner: isize) -> bool {
     let prefs = load_prefs();
     let log = load_log(&prefs);
-    let rows: Vec<u64> = log.iter().take(LOG_ROWS_MAX).map(|e| e.id).collect();
-    let tpl = build_template(&log);
-    UI.with(|u| *u.borrow_mut() = Ui { log, prefs, rows, ..Ui::default() });
+    let tpl = build_template();
+    UI.with(|u| *u.borrow_mut() = Ui { log, prefs, ..Ui::default() });
     let icc = InitCommonControls { size: std::mem::size_of::<InitCommonControls>() as u32, icc: ICC_BAR_CLASSES | ICC_TAB_CLASSES };
     // SAFETY: a valid DWORD-aligned template; the procedure matches DLGPROC;
     // `icc` is a valid INITCOMMONCONTROLSEX.
@@ -1205,16 +1260,11 @@ mod tests {
 
     #[test]
     fn templates_are_well_formed() {
-        let log: Vec<LogEntry> = (0..25)
-            .map(|i| LogEntry { id: i, title: "x".into(), time: "t".into(), args: String::new(), settings: vec![], pinned: i < 3 })
-            .collect();
-        for entries in [&log[..0], &log[..4], &log[..]] {
-            let (t, n) = build_template_counted(entries);
-            let (style, items, cy) = header(&t);
-            assert!(style & DS_SETFONT != 0 && style & WS_CAPTION != 0);
-            assert_eq!(items, n);
-            assert!(cy > 200 && cy < 600, "height {cy}");
-        }
+        let (t, n) = build_template_counted();
+        let (style, items, cy) = header(&t);
+        assert!(style & DS_SETFONT != 0 && style & WS_CAPTION != 0);
+        assert_eq!(items, n);
+        assert!(cy > 200 && cy < 600, "height {cy}");
         let (t, n) = tuning_template();
         let (_, items, _) = header(&t);
         assert_eq!(items, n);

@@ -168,6 +168,9 @@ struct Cli {
     /// static, orbit (circle the centroid of the solids), focus (glide toward the busiest solid), tilt (orbit while rising 20-80° and back, holding half a period at each end) or resonance (orbit with three 20° up-and-down waves per turn).
     #[arg(long, value_name = "MODE")]
     camera: Option<CameraMode>,
+    /// Move the camera in and out so every solid stays in frame (all cameras but focus).
+    #[arg(long)]
+    auto_distance: bool,
     /// Focus camera: 0 = only turn toward the busiest solid, 1 = close-up.
     #[arg(long, value_name = "0..1")]
     focus_zoom: Option<f32>,
@@ -250,6 +253,9 @@ fn apply_cli(cfg: &mut Config, cli: &Cli) -> Result<(), String> {
     }
     if cli.color_reverse {
         cfg.color_reverse = true;
+    }
+    if cli.auto_distance {
+        cfg.auto_distance = true;
     }
     // Choosing a colour source (or reversing) without a gradient picks a default one.
     if (cli.color_by.is_some() || cli.color_reverse) && cli.color.is_none() && cfg.color.trim() == "off" {
@@ -485,6 +491,7 @@ fn camera_params(cfg: &Config) -> CameraParams {
         seed: cfg.seed,
         focus_zoom: cfg.focus_zoom,
         focus_tau: cfg.focus_tau,
+        auto_distance: cfg.auto_distance,
     }
 }
 

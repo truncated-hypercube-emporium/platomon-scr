@@ -442,7 +442,8 @@ const TAG_GAP_ROWS: f32 = 3.0;
 /// spot clear of the other solids before trying its other sides.
 const TAG_SLACK_ROWS: f32 = 6.0;
 /// A tag only moves to the solid's other side once the solid is this far
-/// (share of the width) past the picture's centre, so it doesn't flicker.
+/// (share of the width or height) past the picture's centre line, so it
+/// doesn't flicker.
 const TAG_FLIP: f32 = 0.06;
 
 /// Each solid's tag side from last frame, and the cells the tags covered
@@ -597,16 +598,18 @@ fn tag_box(rows: &[Vec<char>]) -> (usize, usize) {
     (if rows.len() == 1 { wide.max(TAG_MIN_W) } else { wide }, rows.len())
 }
 
-/// Place every solid's tag box for this frame, next to the solid: on the 45°
-/// diagonal away from the picture's centre (toward the periphery) and above
-/// it, with the text running outward so the leader line only spans the gap
-/// between box and solid. Along that diagonal (the leader line's path) the
-/// box sits as close to its solid as it can while staying clear of it (at
-/// full size, with the room its halo needs, plus a short gap for the line)
-/// and of every other solid. A box that would leave the picture or overlap
-/// another tag tries the other diagonals. `sides` keeps each tag's side
-/// from frame to frame (with hysteresis) so tags don't flip back and forth.
-/// `boxes` is each tag's (columns, rows).
+/// Place every solid's tag box for this frame, next to the solid, always
+/// pointing from the inside out: on the 45° diagonal from the solid toward
+/// the picture's corner nearest it (up and right for a solid in the upper
+/// right quarter, and so on), with the text running outward so the leader
+/// line only spans the gap between box and solid. Along that diagonal (the
+/// leader line's path) the box sits as close to its solid as it can while
+/// staying clear of it (at full size, with the room its halo needs, plus a
+/// short gap for the line), of every other solid and of the other tags,
+/// going further out when it must. `sides` keeps each tag's corner from
+/// frame to frame, changing only once the solid is clearly past the
+/// picture's centre line, so tags don't flip back and forth. `boxes` is
+/// each tag's (columns, rows).
 #[allow(clippy::too_many_arguments)]
 fn place_tags(
     sides: &mut Vec<(i8, i8)>,
@@ -621,7 +624,7 @@ fn place_tags(
 ) -> Vec<Option<TagAnchor>> {
     let n = scene.solids.len();
     sides.resize(n, (0, 0));
-    let hw = w as f32 * 0.5;
+    let (hw, hh) = (w as f32 * 0.5, h as f32 * 0.5);
     // Placed for each solid at full size (rings: a bigger solid also sits
     // higher), so a solid growing and shrinking with its load doesn't move
     // its tag; only the camera does. The radius includes the halo's room.
@@ -652,15 +655,18 @@ fn place_tags(
         let Some(((cx, cy), rr)) = circles[i] else { continue };
         let (tw, th) = boxes.get(i).copied().unwrap_or((TAG_MIN_W, 1));
         let (tw, th) = (tw.clamp(1, w.max(1)), th.clamp(1, h.max(1)));
+        // The corner nearest the solid: its quarter of the picture.
         let (mut sx, mut sy) = sides[i];
-        let outward = cx - hw;
+        let (out_x, out_y) = (cx - hw, cy - hh);
         if sx == 0 {
-            sx = if outward >= 0.0 { 1 } else { -1 };
-        } else if outward * (sx as f32) < -TAG_FLIP * w as f32 {
+            sx = if out_x >= 0.0 { 1 } else { -1 };
+        } else if out_x * (sx as f32) < -TAG_FLIP * w as f32 {
             sx = -sx; // clearly on the other half now: follow it outward
         }
         if sy == 0 {
-            sy = -1;
+            sy = if out_y >= 0.0 { 1 } else { -1 };
+        } else if out_y * (sy as f32) < -TAG_FLIP * h as f32 {
+            sy = -sy;
         }
         // The box with its inner corner `d` rows out along the diagonal:
         // (near row, attach column, row0, row1, col0, col1).
@@ -708,20 +714,21 @@ fn place_tags(
             }
             None
         };
-        // Above is preferred: a tag below its solid goes back up once there
-        // is room again.
-        let up_fits = nearest(sx, -1, true, TAG_SLACK_ROWS, &placed).is_some();
-        let ys = if sy > 0 && up_fits { [-1, 1] } else { [sy, -sy] };
-        let sides_to_try = [(sx, ys[0]), (sx, ys[1]), (-sx, ys[0]), (-sx, ys[1])];
-        // Clear of every solid and close; then clear of every solid however
-        // far; then clear of its own solid only.
-        let choice = [(true, TAG_SLACK_ROWS), (true, f32::INFINITY), (false, TAG_SLACK_ROWS)].into_iter().find_map(|(others, slack)| {
-            sides_to_try.iter().find_map(|&(hx, vy)| nearest(hx, vy, others, slack, &placed).map(|s| (s, hx, vy)))
+        // The outward diagonal first: clear of every solid and close; then
+        // however far; then clear of its own solid only. Only when that whole
+        // diagonal is blocked (the picture's edge, the legend, other tags)
+        // the other corner on the same side (up for down or down for up):
+        // a tag never points in toward the picture's centre.
+        let tries = [(true, TAG_SLACK_ROWS), (true, f32::INFINITY), (false, TAG_SLACK_ROWS), (false, f32::INFINITY)];
+        let choice = [(sx, sy), (sx, -sy)].into_iter().find_map(|(hx, vy)| {
+            tries.iter().find_map(|&(others, slack)| nearest(hx, vy, others, slack, &placed).map(|s| (s, hx, vy)))
         });
-        // Nowhere free: the preferred side, pulled onto the picture.
+        let found = choice.is_some();
+        // Nowhere free: the outward side, pulled onto the picture (dropped
+        // for this frame if that would cover the legend).
         let ((y, x, r0, r1, c0, c1), hx, vy) = choice.unwrap_or_else(|| {
             let d = rr + TAG_GAP_ROWS;
-            let vy = ys[0];
+            let vy = sy;
             let y = (cy + vy as f32 * d).round();
             let y = if vy < 0 { y.clamp(th as f32 - 1.0, h as f32 - 1.0) } else { y.clamp(0.0, (h - th) as f32) };
             let x = (cx + sx as f32 * d / aspect).round();
@@ -730,8 +737,12 @@ fn place_tags(
             let (c0, c1) = if sx > 0 { (x, x + tw as f32 - 1.0) } else { (x - tw as f32 + 1.0, x) };
             ((y, x, r0, r1, c0, c1), sx, vy)
         });
+        if !found && keep_out.is_some_and(|k| clash((r0, r1, c0, c1), &[k])) {
+            continue;
+        }
         placed.push((r0 as usize, r1 as usize, c0 as usize, c1 as usize));
-        sides[i] = (hx, vy);
+        // Remember the outward corner (a neighbouring one is only a detour).
+        sides[i] = (sx, sy);
         out[i] = Some(TagAnchor { y: y as usize, x: x as usize, rightward: hx > 0, above: vy < 0 });
     }
     out
@@ -1691,6 +1702,38 @@ mod tests {
             }
             let full = Overlays::new(&scene).compose(&view, w, h, &scene, &opt(f)).chars.to_vec();
             assert_eq!(chars, full, "halo {f}: incremental matches full");
+        }
+    }
+
+    #[test]
+    fn tags_point_toward_their_nearest_corner() {
+        let anim = AnimParams::default();
+        let (w, h) = (200, 64);
+        for (layout, yaw) in [(crate::scene::Layout::Rings, 0.0f32), (crate::scene::Layout::Sphere, 1.3)] {
+            let slots: Vec<crate::scene::SlotLayout> = (0..8)
+                .map(|i| crate::scene::SlotLayout { solid: crate::scene::sdf::SolidKind::ALL[i], ring: None })
+                .collect();
+            let cam = crate::scene::CameraParams { mode: crate::scene::camera::CameraMode::Orbit, ..Default::default() };
+            let mut scene = Scene::with_layout(&slots, &anim, &cam, layout);
+            scene.update(&[crate::metrics::Channel { available: true, level: 0.5, spin_y: 0.2, spin_x: 0.1, activity: 0.5 }; 8], &anim, yaw);
+            let mut r = Renderer::new();
+            r.render(&scene, w, h, &RenderSettings { spp: 1, ..RenderSettings::default() });
+            let view = r.view().unwrap();
+            let boxes = vec![(TAG_MIN_W, 1); 8];
+            let anchors = place_tags(&mut Vec::new(), &view, w, h, &scene, &boxes, TAG_CLEAR_PLAIN, frame_aspect(&view), None);
+            let mut checked = 0;
+            for (i, a) in anchors.iter().enumerate() {
+                let Some(a) = a else { continue };
+                let Some(((cx, cy), _)) = screen_circle(&view, scene.full_size_center(i), scene.max_radius) else { continue };
+                let (dx, dy) = (cx - w as f32 / 2.0, cy - h as f32 / 2.0);
+                if dx.abs() < 0.1 * w as f32 || dy.abs() < 0.1 * h as f32 {
+                    continue; // near a centre line: either corner is fine
+                }
+                assert_eq!(a.rightward, dx > 0.0, "{layout:?} solid {i} at ({cx:.0}, {cy:.0}): tag points left/right away from the centre");
+                assert_eq!(a.above, dy < 0.0, "{layout:?} solid {i} at ({cx:.0}, {cy:.0}): tag points up/down away from the centre");
+                checked += 1;
+            }
+            assert!(checked >= 2, "{layout:?}: {checked} solids clearly off-centre");
         }
     }
 

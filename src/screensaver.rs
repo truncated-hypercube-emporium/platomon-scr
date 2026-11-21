@@ -152,6 +152,7 @@ pub fn camera_params(cfg: &Config) -> CameraParams {
         seed: cfg.seed,
         focus_zoom: cfg.focus_zoom,
         focus_tau: cfg.focus_tau,
+        auto_distance: cfg.auto_distance,
     }
 }
 
@@ -245,6 +246,7 @@ pub fn plan(d: &Display, seed: u64, s: &ScrSettings) -> Result<Plan, String> {
         config.color_by = ColorBy::Load;
     }
     config.colors = s.colors;
+    config.auto_distance = s.auto_distance;
     for &(k, v) in &s.tuning {
         set_tunable(&mut config, k, v);
     }
@@ -408,6 +410,8 @@ pub struct ScrSettings {
     /// spectrum, the simplest solid to the bass and the most complex to the
     /// treble; off = every halo follows the overall level.
     pub halo_bands: bool,
+    /// Dynamic camera distance: move in and out to keep every solid in frame.
+    pub auto_distance: bool,
     /// Solid tags: each solid's metric floats at a fixed place on screen,
     /// with a line to the solid that stops at its halo or wireframe.
     pub tags: bool,
@@ -451,6 +455,7 @@ impl Default for ScrSettings {
             sound: true,
             halo_swing: 10,
             halo_bands: true,
+            auto_distance: false,
             tags: true,
             tag_color: crate::color::TagColor::Complement,
             tag_text: TagText::Auto,
@@ -610,6 +615,7 @@ pub fn help(key: &str) -> &'static str {
         "sound" => "A second wireframe around each solid that swells and shrinks with the sound of the default output device.",
         "halo_swing" => "How far the sound halo grows and shrinks around 1.2x the solid's size: +-10%, +-30% or +-60% of its radius.",
         "halo_bands" => "On: each solid's halo follows its own frequency band, simple solids the bass and complex ones the treble. Off: every halo follows the overall level.",
+        "auto_distance" => "The camera moves in and out so every solid stays in frame: closer when they are small or bunched up, further back as they grow or spread. Not with the focus camera.",
         "tags" => "A label with each solid's metric, joined to it by a short line.",
         "tag_color" => "Tag colour with a gradient on: complementary to the theme, a tint of the theme, or white. Always kept readable.",
         "tag_text" => "Auto: three-row block letters when the text is under 10 px tall. Line: always one line. Blocks: always block letters.",
@@ -765,6 +771,7 @@ pub fn choices() -> Vec<Choice> {
             HALO_SWING_PCT.iter().map(|p| opt(&p.to_string(), &format!("\u{b1}{p}%"))).collect(),
         ),
         always("halo_bands", "Halo bounce by frequency", on_off()),
+        always("auto_distance", "Dynamic camera distance", on_off()),
         always("tags", "Solid tags", on_off()),
         always(
             "tag_color",
@@ -824,6 +831,7 @@ impl ScrSettings {
             ("sound", on_off(self.sound)),
             ("halo_swing", self.halo_swing.to_string()),
             ("halo_bands", on_off(self.halo_bands)),
+            ("auto_distance", on_off(self.auto_distance)),
             ("tags", on_off(self.tags)),
             ("tag_color", self.tag_color.id()),
             ("tag_text", self.tag_text.id().into()),
@@ -891,6 +899,7 @@ impl ScrSettings {
                 })
                 .collect(),
             halo_bands: flag("halo_bands", d.halo_bands),
+            auto_distance: flag("auto_distance", d.auto_distance),
             tags: flag("tags", d.tags),
             tag_color: val("tag_color").and_then(|v| v.parse().ok()).unwrap_or(d.tag_color),
             tag_text: val("tag_text").and_then(|v| TagText::parse(&v)).unwrap_or(d.tag_text),
@@ -1144,6 +1153,7 @@ mod tests {
             halo_swing: 60,
             tuning: vec![("orbit_period", 45.0), ("max_spin", 2.5)],
             halo_bands: false,
+            auto_distance: true,
             tags: false,
             tag_color: crate::color::TagColor::Theme,
             tag_text: TagText::Blocks,

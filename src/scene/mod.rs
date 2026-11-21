@@ -474,6 +474,10 @@ impl Scene {
         self.update_focus(channels, dt);
         let target = self.focus.and_then(|i| self.solids.get(i)).map(|s| s.center);
         self.rig.advance(dt, target);
+        if self.rig.auto_distance() {
+            let spheres: Vec<(Vec3A, f32)> = self.solids.iter().map(|s| (s.center, s.scale)).collect();
+            self.rig.fit(&spheres, dt);
+        }
         self.camera = self.rig.camera();
         self.ground.advance(dt);
     }

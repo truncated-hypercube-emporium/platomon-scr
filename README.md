@@ -39,6 +39,7 @@ platomon [OPTIONS]
 | `--aspect-mode` | `letterbox\|crop` | `letterbox` |
 | **Camera** | | |
 | `--camera` | `static\|orbit\|focus\|tilt\|resonance` (focus: glide toward the busiest solid; tilt: orbit while rising 20–80° and back; resonance: orbit with three 20° waves per turn) | `static` |
+| `--auto-distance` | flag: dynamic camera distance, moving in and out so every solid stays in frame (all cameras but focus) | off |
 | `--focus-zoom` | `0..1`: 0 = only turn toward the busiest solid, 1 = close-up | 0.6 |
 | `--focus-tau` | glide time constant, seconds | 1.5 |
 | `--orbit-period` | seconds per revolution | 60 |
@@ -94,6 +95,15 @@ and at the same time lifts along a vertical arc over the orbit point, from 20° 
 above the look-at point (never straight down at the floor), at the overview distance throughout.
 The rise takes one orbital period, easing in and out; at each end it holds for half a period while
 the orbit carries on, then travels back. It starts on its way up at the overview's elevation.
+
+### Dynamic camera distance
+
+`--auto-distance` (*Dynamic camera distance* in the screensaver) keeps every solid in frame by
+moving the camera in and out along its line to the look-at point. Each frame it finds the closest
+distance (0.35x to 3x the camera's own) at which every solid's bounding sphere, at its current size,
+fits inside the view with 10% to spare, and backs out at once when a solid would leave the frame but
+comes back in gently (1.5 s). It works with the static, orbit, tilt and resonance cameras; the focus
+camera keeps its own close-ups.
 
 ### Resonance camera
 
@@ -418,8 +428,9 @@ administrator rights).
 **New in 1.3.2:**
 
 - **Solid tags** (on by default; *Solid tags* in the dialog): each solid's metric (`__RAM 42%__`)
-  travels with its solid, just above it on the diagonal toward the edge of the picture, clear of
-  the room its halo needs. The text runs outward and a short diagonal leader line (`/`, `\`, or `|`
+  travels with its solid on the diagonal pointing from the inside out, toward the picture's corner
+  nearest the solid, clear of the room its halo needs (a tag blocked there takes the other corner on
+  the same side, never one toward the centre). The text runs outward and a short diagonal leader line (`/`, `\`, or `|`
   when steep; never horizontal) spans only the gap from the tag's inner corner to the solid's halo,
   wireframe or surface. Tags keep their side until a solid is well past the centre, avoid each
   other and the picture's edges, and are drawn over everything, halo-only frames included.
@@ -486,9 +497,10 @@ and largest solid size, idle and fastest spin, and exposure. Moving a slider set
 every run (random look or not); *×* or *Reset all* returns it to auto (the random look's or the
 default value). Set values are saved as `tune_<name>` keys; the button shows how many are set.
 
-**Configuration log.** Each OK adds an entry to the log on the right, titled with a random English
-word and the time, holding the settings as written to the INI file and the arguments the dialog
-was launched with. Pick an entry to see them; *Load into dialog* puts its settings back in the
+**Configuration log.** Each OK or *Apply* (which saves without closing) adds an entry to the log on
+the right, titled with a random English word and the time, holding the settings and the arguments
+the dialog was launched with. Entries always hold the look with *Random look each run* off, so
+loading one brings back that look; a save whose settings are already logged adds no new entry. Pick an entry to see them; *Load into dialog* puts its settings back in the
 controls (saved only with OK). The newest 10 entries are kept; the `+` beside an entry keeps it
 (the button turns to `−`, which lets it go again) and saves it to `configuration.log` beside the
 settings file, and kept entries are never dropped. The log itself is `config-log.ini`.
@@ -588,6 +600,7 @@ halo_bands=on          ; on = each solid's halo follows its frequency band; off 
 tags=on                ; solid tags with leader lines
 tag_color=complement   ; complement | theme | white | #RRGGBB (lifted to stay readable)
 tag_text=auto          ; auto (block letters under 10 px) | line | blocks
+auto_distance=off      ; dynamic camera distance (keep every solid in frame)
 tune_orbit_period=45   ; Tuning values (only those set): tune_<name>, see Tuning above
 shift=on
 shift_min_frames=600

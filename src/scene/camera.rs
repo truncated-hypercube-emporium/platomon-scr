@@ -108,6 +108,8 @@ pub struct CameraParams {
     pub focus_zoom: f32,
     /// Focus mode: glide time constant, seconds.
     pub focus_tau: f32,
+    /// Move in and out so every solid stays in frame (all modes but focus).
+    pub auto_distance: bool,
 }
 
 impl Default for CameraParams {
@@ -122,6 +124,7 @@ impl Default for CameraParams {
             seed: None,
             focus_zoom: 0.6,
             focus_tau: 1.5,
+            auto_distance: false,
         }
     }
 }
@@ -146,6 +149,31 @@ pub const TILT_HIGH: f32 = 80.0 * PI / 180.0;
 pub const RESONANCE_SWING: f32 = 20.0 * PI / 180.0;
 pub const RESONANCE_ORDER: f32 = 3.0;
 pub const RESONANCE_BREATH: f32 = 0.08;
+
+/// Dynamic distance: the camera's distance as a multiple of its normal one.
+pub const ZOOM_MIN: f32 = 0.35;
+pub const ZOOM_MAX: f32 = 3.0;
+/// Dynamic distance: share of the half field of view a solid may reach
+/// (a little room around the edges).
+pub const FIT_MARGIN: f32 = 0.9;
+/// Dynamic distance: smoothing time constant when coming in, seconds
+/// (backing out follows the fit at once, so no solid is ever clipped; the
+/// fit itself moves smoothly with the solids and the camera).
+const ZOOM_IN_TAU: f32 = 1.5;
+
+/// Whether a sphere (`c`, `r`) lies inside `cam`'s guaranteed view (both
+/// half-angles, scaled by [`FIT_MARGIN`]).
+fn sphere_in_view(cam: &Camera, c: Vec3A, r: f32) -> bool {
+    let v = c - cam.pos;
+    let d = v.length();
+    let z = v.dot(cam.forward);
+    if d <= r || z <= 0.0 {
+        return false;
+    }
+    let spread = (r / d).clamp(0.0, 1.0).asin();
+    let (ah, av) = (0.5 * cam.hfov * FIT_MARGIN, 0.5 * cam.vfov * FIT_MARGIN);
+    v.dot(cam.right).abs().atan2(z) + spread <= ah && v.dot(cam.up).abs().atan2(z) + spread <= av
+}
 
 /// 0 → 1 easing that starts and stops at rest.
 fn ease(u: f32) -> f32 {
@@ -172,6 +200,11 @@ pub struct CameraRig {
     arc_t: f32,
     /// Tilt mode: seconds per arc (one orbital period).
     arc_secs: f32,
+    /// Dynamic distance: on, the smoothed distance factor, and whether it
+    /// has been fitted yet (the first fit snaps).
+    auto_distance: bool,
+    zoom: f32,
+    fitted: bool,
 }
 
 impl CameraRig {
@@ -200,6 +233,9 @@ impl CameraRig {
             look: Vec3A::ZERO,
             arc_t: 0.0,
             arc_secs: p.period.max(0.1),
+            auto_distance: p.auto_distance && p.mode != CameraMode::Focus,
+            zoom: 1.0,
+            fitted: false,
         };
         (rig.eye, rig.look) = rig.overview();
         // Tilt starts on its way up, at the overview's elevation (clamped to
@@ -315,7 +351,70 @@ impl CameraRig {
         }
     }
 
+    /// The current distance factor (1 = the mode's own distance).
+    pub fn zoom(&self) -> f32 {
+        self.zoom
+    }
+
+    pub fn auto_distance(&self) -> bool {
+        self.auto_distance
+    }
+
+    /// `base` moved along its line to the look-at point to `k` times its
+    /// distance.
+    fn scaled(&self, base: &Camera, k: f32) -> Camera {
+        let target = self.centroid + Vec3A::new(0.0, TARGET_Y, 0.0);
+        Camera { pos: target + (base.pos - target) * k, ..*base }
+    }
+
+    /// Dynamic distance: the smallest distance factor at which every sphere
+    /// (centre, radius) fits in view, found by bisection.
+    pub fn fit_factor(&self, spheres: &[(Vec3A, f32)]) -> f32 {
+        let base = self.base_camera();
+        let fits = |k: f32| {
+            let cam = self.scaled(&base, k);
+            spheres.iter().all(|&(c, r)| sphere_in_view(&cam, c, r))
+        };
+        if fits(ZOOM_MIN) {
+            return ZOOM_MIN;
+        }
+        if !fits(ZOOM_MAX) {
+            return ZOOM_MAX;
+        }
+        let (mut lo, mut hi) = (ZOOM_MIN, ZOOM_MAX);
+        for _ in 0..20 {
+            let m = 0.5 * (lo + hi);
+            if fits(m) { hi = m } else { lo = m }
+        }
+        hi
+    }
+
+    /// Dynamic distance: glide toward the distance that keeps every sphere
+    /// in frame (at once outward, gently inward; the first call snaps).
+    pub fn fit(&mut self, spheres: &[(Vec3A, f32)], dt: f32) {
+        if !self.auto_distance || spheres.is_empty() {
+            return;
+        }
+        let want = self.fit_factor(spheres);
+        if !self.fitted {
+            self.zoom = want;
+            self.fitted = true;
+            return;
+        }
+        if want >= self.zoom {
+            self.zoom = want;
+        } else {
+            self.zoom += (want - self.zoom) * (1.0 - (-dt.max(0.0) / ZOOM_IN_TAU).exp());
+        }
+    }
+
     pub fn camera(&self) -> Camera {
+        let base = self.base_camera();
+        if self.auto_distance { self.scaled(&base, self.zoom) } else { base }
+    }
+
+    /// The mode's camera before any dynamic distance.
+    fn base_camera(&self) -> Camera {
         if matches!(self.mode, CameraMode::Tilt | CameraMode::Resonance) {
             return self.arc_camera();
         }
@@ -467,6 +566,56 @@ mod tests {
         assert_eq!(peaks, 3, "three waves per orbit");
         assert!((r.camera().pos - start).length() < 1e-2, "closed orbit after one turn");
     }
+    #[test]
+    fn dynamic_distance_keeps_every_solid_in_view() {
+        let c = Vec3A::new(0.0, 0.0, 0.0);
+        let spheres = |spread: f32| -> Vec<(Vec3A, f32)> {
+            (0..6).map(|i| {
+                let a = i as f32 * TAU / 6.0;
+                (Vec3A::new(spread * a.cos(), 1.0, spread * a.sin()), 1.0)
+            })
+            .collect()
+        };
+        for mode in [CameraMode::Static, CameraMode::Orbit, CameraMode::Tilt, CameraMode::Resonance] {
+            let p = CameraParams { auto_distance: true, bob: 0.0, ..params(mode, OrbitDir::Ccw) };
+            let mut r = CameraRig::new(&p, c, 3.7);
+            // wide layout: backs out until everything fits
+            let wide = spheres(9.0);
+            r.fit(&wide, 0.016);
+            assert!(r.zoom() > 1.0, "{mode:?}: wide layout moves out ({})", r.zoom());
+            let cam = r.camera();
+            assert!(wide.iter().all(|&(s, rad)| sphere_in_view(&cam, s, rad)), "{mode:?}: all in view");
+            // tight layout: glides back in, gently, and still fits all the way
+            let tight = spheres(1.5);
+            let mut prev = r.zoom();
+            for _ in 0..400 {
+                r.advance(0.016, None);
+                r.fit(&tight, 0.016);
+                assert!(r.zoom() <= prev + 1e-4 || r.zoom() == r.fit_factor(&tight), "{mode:?}: moves in, or out only as far as the fit");
+                prev = r.zoom();
+                let cam = r.camera();
+                assert!(tight.iter().all(|&(s, rad)| sphere_in_view(&cam, s, rad)), "{mode:?}: in view while coming in");
+            }
+            if matches!(mode, CameraMode::Static | CameraMode::Orbit) {
+                assert!(r.zoom() < 1.0, "{mode:?}: tight layout comes in ({})", r.zoom());
+            }
+            assert!(r.zoom() >= r.fit_factor(&tight) - 1e-4, "{mode:?}: never closer than the fit");
+            if mode == CameraMode::Static {
+                assert!((r.zoom() - r.fit_factor(&tight)).abs() < 0.05, "settles on the fit");
+            }
+            // looks at the same point throughout
+            let target = c + Vec3A::new(0.0, TARGET_Y, 0.0);
+            assert!(r.camera().forward.dot((target - r.camera().pos).normalize()) > 0.9999);
+        }
+        // off, or the focus camera: distance untouched
+        for p in [CameraParams { auto_distance: false, ..params(CameraMode::Orbit, OrbitDir::Ccw) }, CameraParams { auto_distance: true, ..params(CameraMode::Focus, OrbitDir::Ccw) }] {
+            let mut r = CameraRig::new(&p, c, 3.7);
+            let before = r.camera().pos;
+            r.fit(&spheres(9.0), 0.016);
+            assert_eq!((r.zoom(), r.camera().pos), (1.0, before));
+        }
+    }
+
     #[test]
     fn parse_enums() {
         for m in CameraMode::ALL {

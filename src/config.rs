@@ -144,6 +144,9 @@ pub struct Config {
     pub focus_zoom: f32,
     /// Focus camera: glide time constant, seconds.
     pub focus_tau: f32,
+    /// Move the camera in and out so every solid stays in frame (all
+    /// cameras but focus).
+    pub auto_distance: bool,
     /// RNG seed for random choices (orbit direction); unset = random.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seed: Option<u64>,
@@ -232,6 +235,7 @@ impl Default for Config {
             layout: Layout::Rings,
             focus_zoom: 0.6,
             focus_tau: 1.5,
+            auto_distance: false,
             camera: CameraMode::Static,
             orbit_period: 60.0,
             orbit_dir: OrbitDir::Random,
