@@ -21,7 +21,7 @@
 use std::cell::RefCell;
 use std::path::PathBuf;
 
-use crate::screensaver::{self, Choice, INI_SECTION, SHIFT_FRAMES_MAX, ScrSettings, TUNABLES, help, short_label};
+use crate::screensaver::{self, Choice, INI_SECTION, Panel, SHIFT_FRAMES_MAX, ScrSettings, TUNABLES, Tunable, help, short_label};
 use crate::scrlog::{self, LogEntry, Prefs};
 
 type HWND = isize;
@@ -325,8 +325,11 @@ const ID_RANDOM: i32 = 1110;
 const ID_SHIFT: i32 = 1100;
 const ID_SHIFT_MIN: i32 = 1101;
 const ID_SHIFT_MAX: i32 = 1102;
-const ID_DEFAULTS: i32 = 1200;
 const ID_SET_DEFAULT: i32 = 1201;
+/// The small button after Randomize: roll a random look into the dialog.
+const ID_REROLL: i32 = 1207;
+const ID_LAYOUT: i32 = 1208;
+const ID_RENDERING: i32 = 1209;
 const ID_TUNING: i32 = 1202;
 const ID_STATUS: i32 = 1203;
 /// Log row `k`: its pin (`+`) button and its title button.
@@ -346,6 +349,9 @@ const ID_TUNE_VALUE: i32 = 2100;
 const ID_TUNE_RESET: i32 = 2200;
 const ID_TUNE_RESET_ALL: i32 = 2300;
 const ID_TUNE_LABEL: i32 = 2400;
+/// Secondary dialogs: choice `k`'s control and label.
+const ID_PANEL_CHOICE: i32 = 2500;
+const ID_PANEL_LABEL: i32 = 2550;
 const ID_STATIC: u16 = 0xFFFF;
 
 /// Log rows shown at most (pinned and unpinned, newest first).
@@ -435,7 +441,7 @@ unsafe fn add_tips(h: HWND, tips: &[(i32, String)]) {
 
 /// Tooltip texts for the main dialog.
 fn main_tips() -> Vec<(i32, String)> {
-    let mut v: Vec<(i32, String)> = vec![(ID_RANDOM, help("random").into())];
+    let mut v: Vec<(i32, String)> = vec![(ID_RANDOM, help("random").into()), (ID_REROLL, help("reroll").into())];
     for (i, c) in general_choices().iter().enumerate() {
         v.push((ID_COMBO + i as i32, help(c.key).into()));
         v.push((ID_LABEL + i as i32, help(c.key).into()));
@@ -444,7 +450,7 @@ fn main_tips() -> Vec<(i32, String)> {
     for (id, key) in [(ID_SHIFT, "shift"), (ID_SHIFT_MIN, "shift_min_frames"), (ID_SHIFT_MAX, "shift_max_frames"), (ID_RADIUS, "shift_radius"), (ID_RADIUS_VALUE, "shift_radius")] {
         v.push((id, help(key).into()));
     }
-    let buttons: [(i32, &str); 10] = [
+    let buttons: [(i32, &str); 11] = [
         (
             ID_PREVIEW,
             "Show these settings in a window at half the screen's size (half the render resolution); edits show live. Click inside it to close it. \
@@ -452,9 +458,10 @@ fn main_tips() -> Vec<(i32, String)> {
         ),
         (ID_FULLSCREEN, "Preview full screen at full resolution instead; the mouse is ignored, press any key to close it."),
         (ID_APPLY, "Save the settings and log them without closing the dialog."),
-        (ID_DEFAULTS, "Load your saved defaults (from Set as default), or the built-in ones when none are saved. Nothing is saved until OK."),
         (ID_SET_DEFAULT, "Save the settings shown as your defaults, in configuration.log beside the settings file."),
         (ID_TUNING, "Sliders for numeric values (orbit period, floor tile size, spin speeds...) that apply every run."),
+        (ID_LAYOUT, "Layout settings that apply every run: the order the solids take their places in (by complexity, either way, or random) and their spacing."),
+        (ID_RENDERING, "Rendering settings: samples per cell, light bounces, march steps, render distance and adaptive quality."),
         (ID_LOAD, "Put the picked log entry's settings back into the dialog. Nothing is saved until OK."),
         (ID_DETAILS, "The picked log entry: its time, the arguments the dialog was launched with, and its settings."),
         (IDOK, "Save the settings, log them (unless the same settings are already logged) and close."),
@@ -471,15 +478,19 @@ fn main_tips() -> Vec<(i32, String)> {
     v
 }
 
-fn tuning_tips() -> Vec<(i32, String)> {
+fn panel_tips(p: Panel) -> Vec<(i32, String)> {
     let mut v = Vec::new();
-    for (k, t) in TUNABLES.iter().enumerate() {
+    for (k, c) in panel_choices(p).iter().enumerate() {
+        v.push((ID_PANEL_CHOICE + k as i32, help(c.key).to_string()));
+        v.push((ID_PANEL_LABEL + k as i32, help(c.key).to_string()));
+    }
+    for (k, t) in panel_tunables(p).iter().enumerate() {
         v.push((ID_TUNE + k as i32, t.help.to_string()));
         v.push((ID_TUNE_LABEL + k as i32, t.help.to_string()));
         v.push((ID_TUNE_VALUE + k as i32, t.help.to_string()));
         v.push((ID_TUNE_RESET + k as i32, "Back to auto: the random look's or the default value.".to_string()));
     }
-    v.push((ID_TUNE_RESET_ALL, "Set every slider back to auto.".to_string()));
+    v.push((ID_TUNE_RESET_ALL, "Set everything in this dialog back to auto or its default.".to_string()));
     v.push((IDOK, "Keep these values (saved with OK in the main dialog).".to_string()));
     v.push((IDCANCEL, "Discard changes to these values.".to_string()));
     v
@@ -588,9 +599,44 @@ fn kind(c: &Choice) -> Kind {
     }
 }
 
-/// Settings shown in the two main groups (the burn-in range has its own).
+/// Settings shown in the two main groups (the burn-in range has its own;
+/// a secondary dialog's settings are in that dialog).
 fn general_choices() -> Vec<Choice> {
-    screensaver::choices().into_iter().filter(|c| c.key != "shift_radius").collect()
+    screensaver::choices().into_iter().filter(|c| c.key != "shift_radius" && c.panel.is_none()).collect()
+}
+
+/// The drop-downs and check boxes of secondary dialog `p`.
+fn panel_choices(p: Panel) -> Vec<Choice> {
+    screensaver::choices().into_iter().filter(|c| c.panel == Some(p)).collect()
+}
+
+/// The sliders of secondary dialog `p`.
+fn panel_tunables(p: Panel) -> Vec<&'static Tunable> {
+    TUNABLES.iter().filter(|t| t.panel == p).collect()
+}
+
+fn panel_title(p: Panel) -> &'static str {
+    match p {
+        Panel::Tuning => "Tuning",
+        Panel::Layout => "Layout",
+        Panel::Rendering => "Rendering",
+    }
+}
+
+/// The main dialog's button for `p`, and its text with nothing set.
+fn panel_button(p: Panel) -> (i32, &'static str) {
+    match p {
+        Panel::Tuning => (ID_TUNING, "&Tuning..."),
+        Panel::Layout => (ID_LAYOUT, "&Layout..."),
+        Panel::Rendering => (ID_RENDERING, "&Rendering..."),
+    }
+}
+
+const PANELS: [Panel; 3] = [Panel::Tuning, Panel::Layout, Panel::Rendering];
+
+/// Every secondary dialog's choice keys (kept in [`Ui::panel_values`]).
+fn panel_keys() -> Vec<&'static str> {
+    screensaver::choices().into_iter().filter(|c| c.panel.is_some()).map(|c| c.key).collect()
 }
 
 fn radius_choice() -> Choice {
@@ -609,22 +655,57 @@ const LOG_X: i16 = 314;
 const LOG_W: i16 = 176;
 const DLG_W: i16 = LOG_X + LOG_W + 8;
 
-/// Lay out one group of settings from `y`; returns the y below it.
-fn group(t: &mut Template, title: &str, y: i16, items: &[(usize, &Choice)]) -> i16 {
-    let toggles: Vec<&(usize, &Choice)> = items.iter().filter(|(_, c)| kind(c) == Kind::Toggle).collect();
+/// Check boxes drawn at the end of another setting's row instead of in the
+/// group's check-box grid: (row's setting, check box's setting).
+const INLINE_TOGGLES: [(&str, &str); 1] = [("budget", "overdrive")];
+
+/// Buttons drawn between a drop-down's label and the drop-down: (row's
+/// setting, button id, text).
+const INLINE_BUTTONS: [(&str, i32, &str); 1] = [("fps_cap", ID_RENDERING, "&Rendering...")];
+
+/// Top of the right column (the configuration log), dialog units.
+const LOG_TOP: i16 = 6;
+
+/// The control id of general setting `key`.
+fn choice_id(key: &str) -> Option<i32> {
+    general_choices().iter().position(|c| c.key == key).map(|i| ID_COMBO + i as i32)
+}
+
+/// Lay out one group of settings from `y`, leaving `head` dialog units at
+/// its top for the caller's own row; returns the y below it.
+fn group(t: &mut Template, title: &str, y: i16, head: i16, items: &[(usize, &Choice)]) -> i16 {
+    let inline = |c: &Choice| INLINE_TOGGLES.iter().any(|&(_, k)| k == c.key);
+    let toggles: Vec<&(usize, &Choice)> = items.iter().filter(|(_, c)| kind(c) == Kind::Toggle && !inline(c)).collect();
     let rest: Vec<&(usize, &Choice)> = items.iter().filter(|(_, c)| kind(c) != Kind::Toggle).collect();
-    let h = 14 + rest.len() as i16 * ROW + toggles.len().div_ceil(2) as i16 * 12 + 4;
+    let h = 14 + head + rest.len() as i16 * ROW + toggles.len().div_ceil(2) as i16 * 12 + 4;
     t.item(BS_GROUPBOX, (6, y, LEFT_W - 6, h), ID_STATIC, BUTTON, title);
-    let mut yy = y + 12;
+    let mut yy = y + 12 + head;
     for &&(i, c) in &rest {
         let id = ID_COMBO + i as i32;
         t.item(SS_NOTIFY, (14, yy + 2, 104, 10), (ID_LABEL + i as i32) as u16, STATIC, &format!("{}:", c.label));
+        // a check box of this group that sits at the end of this row
+        let beside = INLINE_TOGGLES
+            .iter()
+            .filter(|&&(row, _)| row == c.key)
+            .find_map(|&(_, k)| items.iter().find(|(_, tc)| tc.key == k));
         match kind(c) {
+            Kind::Slider if beside.is_some() => {
+                let &(j, tc) = beside.expect("checked");
+                t.slider(TBS_AUTOTICKS, (120, yy - 1, 84, 14), id);
+                t.item(SS_NOTIFY, (206, yy + 2, 30, 10), (ID_VALUE + i as i32) as u16, STATIC, "");
+                t.item(BS_AUTOCHECKBOX | WS_TABSTOP, (238, yy + 1, 56, 10), (ID_COMBO + j as i32) as u16, BUTTON, tc.label);
+            }
             Kind::Slider => {
                 t.slider(TBS_AUTOTICKS, (120, yy - 1, 132, 14), id);
                 t.item(SS_NOTIFY, (254, yy + 2, 40, 10), (ID_VALUE + i as i32) as u16, STATIC, "");
             }
-            _ => t.item(CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, (120, yy, 170, 160), id as u16, COMBOBOX, ""),
+            _ => match INLINE_BUTTONS.iter().find(|(row, _, _)| *row == c.key) {
+                Some(&(_, bid, text)) => {
+                    t.item(BS_PUSHBUTTON | WS_TABSTOP, (120, yy, 56, 13), bid as u16, BUTTON, text);
+                    t.item(CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, (180, yy, 110, 160), id as u16, COMBOBOX, "");
+                }
+                None => t.item(CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, (120, yy, 170, 160), id as u16, COMBOBOX, ""),
+            },
         }
         yy += ROW;
     }
@@ -651,15 +732,12 @@ fn build_template_counted() -> (Vec<u32>, usize) {
     let always: Vec<(usize, &Choice)> = general.iter().enumerate().filter(|(_, c)| !c.look).collect();
     // left column, measured first on a scratch template
     let mut t = Template::new("platomon screensaver settings", DLG_W, 100);
-    t.item(
-        BS_AUTOCHECKBOX | WS_TABSTOP | WS_GROUP,
-        (10, 7, LEFT_W - 12, 12),
-        ID_RANDOM as u16,
-        BUTTON,
-        "&Random look each run (otherwise use the look below)",
-    );
-    let y = group(&mut t, "Look", 22, &looks);
-    let y = group(&mut t, "Every run", y + 4, &always);
+    // The Look group's first row: Randomize, and a button that rolls a look now.
+    let look_y = LOG_TOP;
+    t.item(BS_AUTOCHECKBOX | WS_TABSTOP | WS_GROUP, (14, look_y + 12, 50, 10), ID_RANDOM as u16, BUTTON, "&Randomize");
+    t.item(BS_PUSHBUTTON | WS_TABSTOP, (64, look_y + 11, 14, 12), ID_REROLL as u16, BUTTON, REROLL_TEXT);
+    let y = group(&mut t, "Look", look_y, ROW, &looks);
+    let y = group(&mut t, "Performance && features", y + 4, 0, &always);
     let (gy, gh) = (y + 4, 46i16);
     t.item(BS_GROUPBOX, (6, gy, LEFT_W - 6, gh), ID_STATIC, BUTTON, "OLED burn-in protection");
     t.item(
@@ -682,12 +760,12 @@ fn build_template_counted() -> (Vec<u32>, usize) {
     // Right column: the configuration log. Every row is created (unused
     // ones hidden) so Apply can show new entries without reopening; the
     // details box runs down to the burn-in group's bottom edge.
-    let details_y = 34 + LOG_ROWS_MAX as i16 * 12 + 2;
+    let details_y = details_top(LOG_ROWS_MAX);
     let log_bottom = left_bottom.max(details_y + 60 + 6);
-    t.item(BS_GROUPBOX, (LOG_X - 4, 22, LOG_W + 2, log_bottom - 22), ID_STATIC, BUTTON, "Configuration log");
-    t.item(0, (LOG_X + 4, 36, LOG_W - 12, 20), ID_EMPTY as u16, STATIC, "No entries yet: each OK or Apply adds one.");
+    t.item(BS_GROUPBOX, (LOG_X - 4, LOG_TOP, LOG_W + 2, log_bottom - LOG_TOP), ID_STATIC, BUTTON, "Configuration log");
+    t.item(0, (LOG_X + 4, LOG_TOP + 14, LOG_W - 12, 20), ID_EMPTY as u16, STATIC, "No entries yet: each OK or Apply adds one.");
     for k in 0..LOG_ROWS_MAX {
-        let y = 34 + k as i16 * 12;
+        let y = LOG_TOP + 12 + k as i16 * 12;
         t.item(BS_PUSHBUTTON | WS_TABSTOP, (LOG_X + 2, y, 12, 11), (ID_PIN + k as i32) as u16, BUTTON, "+");
         t.item(BS_PUSHBUTTON | BS_FLAT | BS_LEFT | WS_TABSTOP, (LOG_X + 16, y, LOG_W - 22, 11), (ID_ROW + k as i32) as u16, BUTTON, "");
     }
@@ -705,9 +783,9 @@ fn build_template_counted() -> (Vec<u32>, usize) {
     t.item(BS_PUSHBUTTON | WS_TABSTOP, (DLG_W - 182, bottom - 2, 115, 13), ID_LOAD as u16, BUTTON, "&Load into dialog");
     t.item(0, (10, bottom, DLG_W - 200, 10), ID_STATUS as u16, STATIC, "Saved to %APPDATA%\\platomon\\screensaver.ini.");
     let by = bottom + 15;
-    t.item(BS_PUSHBUTTON | WS_TABSTOP, (10, by, 52, 14), ID_DEFAULTS as u16, BUTTON, "&Defaults");
-    t.item(BS_PUSHBUTTON | WS_TABSTOP, (66, by, 66, 14), ID_SET_DEFAULT as u16, BUTTON, "&Set as default");
-    t.item(BS_PUSHBUTTON | WS_TABSTOP, (136, by, 70, 14), ID_TUNING as u16, BUTTON, "&Tuning...");
+    t.item(BS_PUSHBUTTON | WS_TABSTOP, (10, by, 60, 14), ID_SET_DEFAULT as u16, BUTTON, "&Set as default");
+    t.item(BS_PUSHBUTTON | WS_TABSTOP, (74, by, 66, 14), ID_TUNING as u16, BUTTON, "&Tuning...");
+    t.item(BS_PUSHBUTTON | WS_TABSTOP, (144, by, 62, 14), ID_LAYOUT as u16, BUTTON, "&Layout...");
     t.item(BS_PUSHBUTTON | WS_TABSTOP, (210, by, 44, 14), ID_PREVIEW as u16, BUTTON, "&Preview");
     t.item(BS_AUTOCHECKBOX | WS_TABSTOP, (258, by + 2, 54, 10), ID_FULLSCREEN as u16, BUTTON, "&Fullscreen");
     t.item(BS_PUSHBUTTON | WS_TABSTOP, (DLG_W - 182, by, 55, 14), ID_APPLY as u16, BUTTON, "&Apply");
@@ -724,19 +802,33 @@ fn pin_text(pinned: bool) -> &'static str {
     if pinned { "\u{2212}" } else { "+" }
 }
 
-fn tuning_template() -> (Vec<u32>, usize) {
-    let rows = TUNABLES.len() as i16;
+/// The small button after Randomize (a die).
+const REROLL_TEXT: &str = "\u{2684}";
+
+/// Secondary dialog `p`: its drop-downs and check boxes, then its sliders.
+fn panel_template(p: Panel) -> (Vec<u32>, usize) {
+    let (choices, tunables) = (panel_choices(p), panel_tunables(p));
+    let rows = (choices.len() + tunables.len()) as i16;
     let cy = 30 + rows * 15 + 26;
-    let mut t = Template::new("Tuning", 300, cy);
-    t.item(
-        0,
-        (10, 6, 280, 20),
-        ID_STATIC,
-        STATIC,
-        "Move a slider to set that value for every run; auto keeps the random look's or the default value.",
-    );
-    for (k, tu) in TUNABLES.iter().enumerate() {
+    let mut t = Template::new(panel_title(p), 300, cy);
+    let intro = match p {
+        Panel::Tuning => "Move a slider to set that value for every run; auto keeps the random look's or the default value.",
+        Panel::Layout => "How the solids are placed, every run (the layout itself is in the Look group); auto keeps the default spacing.",
+        Panel::Rendering => "How the picture is traced, every run; auto keeps the screensaver's own cheap settings (1 sample, 1 bounce).",
+    };
+    t.item(0, (10, 6, 280, 20), ID_STATIC, STATIC, intro);
+    for (k, c) in choices.iter().enumerate() {
         let y = 30 + k as i16 * 15;
+        let id = (ID_PANEL_CHOICE + k as i32) as u16;
+        if kind(c) == Kind::Toggle {
+            t.item(BS_AUTOCHECKBOX | WS_TABSTOP, (10, y + 1, 220, 10), id, BUTTON, c.label);
+        } else {
+            t.item(SS_NOTIFY, (10, y + 2, 92, 10), (ID_PANEL_LABEL + k as i32) as u16, STATIC, &format!("{}:", c.label));
+            t.item(CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, (102, y, 188, 120), id, COMBOBOX, "");
+        }
+    }
+    for (k, tu) in tunables.iter().enumerate() {
+        let y = 30 + (choices.len() + k) as i16 * 15;
         t.item(SS_NOTIFY, (10, y + 2, 92, 10), (ID_TUNE_LABEL + k as i32) as u16, STATIC, tu.label);
         t.slider(TBS_NOTICKS, (102, y, 128, 13), ID_TUNE + k as i32);
         t.item(SS_RIGHT | SS_NOTIFY, (232, y + 2, 38, 10), (ID_TUNE_VALUE + k as i32) as u16, STATIC, "");
@@ -755,10 +847,17 @@ fn tuning_template() -> (Vec<u32>, usize) {
 /// What the dialogs hold that is not in a control.
 #[derive(Default)]
 struct Ui {
-    /// Tuning values of the settings being edited.
+    /// Tuning values of the settings being edited (every secondary
+    /// dialog's sliders).
     tuning: Vec<(&'static str, f32)>,
-    /// The Tuning dialog's working copy.
+    /// A secondary dialog's working copy.
     tuning_edit: Vec<(&'static str, f32)>,
+    /// The secondary dialogs' drop-down and check-box settings, and the
+    /// open one's working copy.
+    panel_values: Vec<(&'static str, String)>,
+    panel_edit: Vec<(&'static str, String)>,
+    /// The secondary dialog open now.
+    panel: Option<Panel>,
     log: Vec<LogEntry>,
     prefs: Prefs,
     /// Entry id per log row.
@@ -949,21 +1048,85 @@ unsafe fn fill(h: HWND, s: &ScrSettings) {
         let r = radius_choice();
         set_choice(h, ID_RADIUS, ID_RADIUS_VALUE, &r, &value_of(&pairs, r.key));
         CheckDlgButton(h, ID_RANDOM, s.random as u32);
+        let keys = panel_keys();
+        UI.with(|u| {
+            u.borrow_mut().panel_values =
+                pairs.iter().filter(|(k, _)| keys.contains(k)).map(|(k, v)| (*k, v.clone())).collect()
+        });
         CheckDlgButton(h, ID_SHIFT, s.shift as u32);
         SetDlgItemInt(h, ID_SHIFT_MIN, s.shift_min_frames, 0);
         SetDlgItemInt(h, ID_SHIFT_MAX, s.shift_max_frames, 0);
         enable_look(h);
         enable_shift(h);
+        enable_inline(h);
     }
     UI.with(|u| u.borrow_mut().tuning = s.tuning.clone());
     tuning_label(h);
 }
 
+/// The Tuning, Layout and Rendering buttons: how many of each dialog's
+/// settings are set (sliders off auto, choices off their default).
 fn tuning_label(h: HWND) {
-    let n = UI.with(|u| u.borrow().tuning.len());
-    let text = if n == 0 { "&Tuning...".to_string() } else { format!("&Tuning... ({n} set)") };
-    // SAFETY: control id from our template.
-    unsafe { SetDlgItemTextW(h, ID_TUNING, wide(&text).as_ptr()) };
+    let defaults = ScrSettings::default().to_pairs();
+    for p in PANELS {
+        let n = UI.with(|u| {
+            let u = u.borrow();
+            let sliders = u.tuning.iter().filter(|(k, _)| panel_tunables(p).iter().any(|t| t.key == *k)).count();
+            let choices = panel_choices(p)
+                .iter()
+                .filter(|c| u.panel_values.iter().find(|(k, _)| *k == c.key).map(|(_, v)| v) != defaults.iter().find(|(k, _)| *k == c.key).map(|(_, v)| v))
+                .count();
+            sliders + choices
+        });
+        let (id, base) = panel_button(p);
+        let text = match (n, p) {
+            (0, _) => base.to_string(),
+            (_, Panel::Rendering) => format!("&Rendering ({n})"),
+            _ => format!("{base} ({n} set)"),
+        };
+        // SAFETY: control id from our template.
+        unsafe { SetDlgItemTextW(h, id, wide(&text).as_ptr()) };
+    }
+}
+
+/// Roll a random look into the Look group (and turn Randomize off so the
+/// rolled look is what runs).
+unsafe fn reroll(h: HWND) {
+    let mut rng = fastrand::Rng::new();
+    // SAFETY: control ids from our template.
+    unsafe {
+        for (i, c) in general_choices().iter().enumerate() {
+            if c.look && !c.options.is_empty() {
+                let (v, _) = &c.options[rng.usize(0..c.options.len())];
+                set_choice(h, ID_COMBO + i as i32, ID_VALUE + i as i32, c, v);
+            }
+        }
+        CheckDlgButton(h, ID_RANDOM, 0);
+        enable_look(h);
+    }
+    status(h, "Rolled a random look (not saved until OK or Apply).");
+}
+
+/// Open secondary dialog `p` over the main dialog `h`; OK keeps its edits.
+unsafe fn open_panel(h: HWND, p: Panel) {
+    UI.with(|u| {
+        let mut u = u.borrow_mut();
+        u.tuning_edit = u.tuning.clone();
+        u.panel_edit = u.panel_values.clone();
+        u.panel = Some(p);
+    });
+    let (tpl, _) = panel_template(p);
+    // SAFETY: a valid DWORD-aligned template; the procedure matches DLGPROC.
+    let ok = unsafe { DialogBoxIndirectParamW(GetModuleHandleW(std::ptr::null()), tpl.as_ptr() as *const u16, h, Some(tuning_dialog), 0) } == 1;
+    if ok {
+        UI.with(|u| {
+            let mut u = u.borrow_mut();
+            u.tuning = std::mem::take(&mut u.tuning_edit);
+            u.panel_values = std::mem::take(&mut u.panel_edit);
+        });
+        tuning_label(h);
+        status(h, &format!("{} changed (saved with OK).", panel_title(p)));
+    }
 }
 
 /// Grey out the look settings while the look is random.
@@ -979,6 +1142,20 @@ unsafe fn enable_look(h: HWND) {
                     EnableWindow(v, chosen);
                 }
             }
+        }
+    }
+}
+
+/// Grey out each row whose inline check box takes over its setting (the
+/// CPU budget while overdrive is on).
+unsafe fn enable_inline(h: HWND) {
+    for (row, k) in INLINE_TOGGLES {
+        let (Some(row_id), Some(box_id)) = (choice_id(row), choice_id(k)) else { continue };
+        // SAFETY: control ids from our template.
+        unsafe {
+            let on = (IsDlgButtonChecked(h, box_id) != 1) as i32;
+            EnableWindow(GetDlgItem(h, row_id), on);
+            EnableWindow(GetDlgItem(h, row_id - ID_COMBO + ID_VALUE), on);
         }
     }
 }
@@ -1026,6 +1203,7 @@ unsafe fn read(h: HWND) -> Result<ScrSettings, String> {
     map.push(("shift".into(), if shift { "on" } else { "off" }.into()));
     map.push(("shift_min_frames".into(), min.to_string()));
     map.push(("shift_max_frames".into(), max.to_string()));
+    map.extend(UI.with(|u| u.borrow().panel_values.iter().map(|(k, v)| (k.to_string(), v.clone())).collect::<Vec<_>>()));
     let mut s = settings_from(&map);
     s.tuning = UI.with(|u| u.borrow().tuning.clone());
     Ok(s)
@@ -1091,7 +1269,7 @@ fn refresh_log(h: HWND) {
 /// under the last row (or under the "no entries" note), so the box takes
 /// all the room the unused rows would.
 fn details_top(rows: usize) -> i16 {
-    34 + rows.clamp(2, LOG_ROWS_MAX) as i16 * 12 + 2
+    LOG_TOP + 12 + rows.clamp(2, LOG_ROWS_MAX) as i16 * 12 + 2
 }
 
 /// Stretch the details box up to [`details_top`]; its bottom stays put.
@@ -1227,13 +1405,16 @@ pub unsafe extern "system" fn ScreenSaverConfigureDialog(h: HWND, msg: u32, w: u
                         EndDialog(h, 0);
                         1
                     }
-                    ID_DEFAULTS => {
-                        let (d, own) = UI.with(|u| {
-                            let u = u.borrow();
-                            (defaults(&u.prefs), u.prefs.default.is_some())
-                        });
-                        fill(h, &d);
-                        status(h, if own { "Your defaults loaded (not saved until OK)." } else { "Built-in defaults loaded (not saved until OK)." });
+                    ID_REROLL if code == BN_CLICKED => {
+                        reroll(h);
+                        1
+                    }
+                    ID_LAYOUT if code == BN_CLICKED => {
+                        open_panel(h, Panel::Layout);
+                        1
+                    }
+                    ID_RENDERING if code == BN_CLICKED => {
+                        open_panel(h, Panel::Rendering);
                         1
                     }
                     ID_SET_DEFAULT => {
@@ -1255,27 +1436,8 @@ pub unsafe extern "system" fn ScreenSaverConfigureDialog(h: HWND, msg: u32, w: u
                         }
                         1
                     }
-                    ID_TUNING => {
-                        UI.with(|u| {
-                            let mut u = u.borrow_mut();
-                            u.tuning_edit = u.tuning.clone();
-                        });
-                        let (tpl, _) = tuning_template();
-                        let ok = DialogBoxIndirectParamW(
-                            GetModuleHandleW(std::ptr::null()),
-                            tpl.as_ptr() as *const u16,
-                            h,
-                            Some(tuning_dialog),
-                            0,
-                        ) == 1;
-                        if ok {
-                            UI.with(|u| {
-                                let mut u = u.borrow_mut();
-                                u.tuning = std::mem::take(&mut u.tuning_edit);
-                            });
-                            tuning_label(h);
-                            status(h, "Tuning changed (saved with OK).");
-                        }
+                    ID_TUNING if code == BN_CLICKED => {
+                        open_panel(h, Panel::Tuning);
                         1
                     }
                     ID_LOAD => {
@@ -1337,6 +1499,9 @@ pub unsafe extern "system" fn ScreenSaverConfigureDialog(h: HWND, msg: u32, w: u
                     _ => 0,
                 };
                 if !matches!(id, IDOK | IDCANCEL) {
+                    if code == BN_CLICKED && INLINE_TOGGLES.iter().any(|(_, k)| choice_id(k) == Some(id)) {
+                        enable_inline(h);
+                    }
                     sync_preview(h);
                 }
                 r
@@ -1348,27 +1513,50 @@ pub unsafe extern "system" fn ScreenSaverConfigureDialog(h: HWND, msg: u32, w: u
 
 // ------------------------------------------------------------------ tuning dialog
 
-/// The value shown for tunable `k`: set, or `auto (default)`.
-fn tune_text(k: usize, set: Option<f32>) -> String {
-    let t = &TUNABLES[k];
+/// The value shown for tunable `t`: set, or `auto (default)`.
+fn tune_text(t: &Tunable, set: Option<f32>) -> String {
     match set {
         Some(v) => t.show(v),
-        None => format!("auto {}", t.show(t.snap(screensaver::get_tunable(&crate::config::Config::default(), t.key)))),
+        None => format!("auto {}", t.show(t.snap(screensaver::tunable_auto(t.key)))),
     }
 }
 
-unsafe fn tune_row(h: HWND, k: usize) {
-    let t = &TUNABLES[k];
+/// Slider row `k` of the open dialog, showing tunable `t`.
+unsafe fn tune_row(h: HWND, k: usize, t: &Tunable) {
     let set = UI.with(|u| u.borrow().tuning_edit.iter().find(|(key, _)| *key == t.key).map(|&(_, v)| v));
-    let shown_v = set.unwrap_or_else(|| screensaver::get_tunable(&crate::config::Config::default(), t.key));
-    // SAFETY: control ids from the tuning template.
+    let shown_v = set.unwrap_or_else(|| screensaver::tunable_auto(t.key));
+    // SAFETY: control ids from the panel template.
     unsafe {
         SendDlgItemMessageW(h, ID_TUNE + k as i32, TBM_SETPOS, 1, t.pos_of(shown_v) as isize);
-        SetDlgItemTextW(h, ID_TUNE_VALUE + k as i32, wide(&tune_text(k, set)).as_ptr());
+        SetDlgItemTextW(h, ID_TUNE_VALUE + k as i32, wide(&tune_text(t, set)).as_ptr());
     }
 }
 
-/// The Tuning dialog procedure: sliders over [`TUNABLES`].
+/// Show the open dialog's choices from its working copy.
+unsafe fn panel_fill(h: HWND, p: Panel) {
+    let values = UI.with(|u| u.borrow().panel_edit.clone());
+    for (k, c) in panel_choices(p).iter().enumerate() {
+        let v = values.iter().find(|(key, _)| *key == c.key).map(|(_, v)| v.clone()).unwrap_or_default();
+        // SAFETY: control ids from the panel template.
+        unsafe { set_choice(h, ID_PANEL_CHOICE + k as i32, 0, c, &v) };
+    }
+}
+
+/// The open dialog's choices into its working copy.
+unsafe fn panel_take(h: HWND, p: Panel) {
+    for (k, c) in panel_choices(p).iter().enumerate() {
+        // SAFETY: control ids from the panel template.
+        let v = unsafe { get_choice(h, ID_PANEL_CHOICE + k as i32, c) };
+        UI.with(|u| {
+            let mut u = u.borrow_mut();
+            u.panel_edit.retain(|(key, _)| *key != c.key);
+            u.panel_edit.push((c.key, v));
+        });
+    }
+}
+
+/// The secondary dialogs' procedure (Tuning, Layout, Rendering): drop-downs
+/// and check boxes, then sliders over the dialog's [`TUNABLES`].
 ///
 /// # Safety
 /// Called by the dialog manager with a valid dialog window handle.
@@ -1377,17 +1565,29 @@ unsafe extern "system" fn tuning_dialog(h: HWND, msg: u32, w: usize, l: isize) -
     unsafe {
         match msg {
             WM_INITDIALOG => {
-                for (k, t) in TUNABLES.iter().enumerate() {
-                    SendDlgItemMessageW(h, ID_TUNE + k as i32, TBM_SETRANGE, 1, (t.steps() as isize) << 16);
-                    tune_row(h, k);
+                let p = UI.with(|u| u.borrow().panel).unwrap_or(Panel::Tuning);
+                for (k, c) in panel_choices(p).iter().enumerate() {
+                    if kind(c) != Kind::Toggle {
+                        for (_, label) in &c.options {
+                            // the full option names: this dialog has the room
+                            SendDlgItemMessageW(h, ID_PANEL_CHOICE + k as i32, CB_ADDSTRING, 0, wide(label).as_ptr() as isize);
+                        }
+                    }
                 }
-                add_tips(h, &tuning_tips());
+                panel_fill(h, p);
+                for (k, t) in panel_tunables(p).iter().enumerate() {
+                    SendDlgItemMessageW(h, ID_TUNE + k as i32, TBM_SETRANGE, 1, (t.steps() as isize) << 16);
+                    tune_row(h, k, t);
+                }
+                add_tips(h, &panel_tips(p));
                 1
             }
             WM_HSCROLL => {
+                let p = UI.with(|u| u.borrow().panel).unwrap_or(Panel::Tuning);
                 let id = GetDlgCtrlID(l as HWND);
                 let k = (id - ID_TUNE) as usize;
-                if let Some(t) = TUNABLES.get(k).filter(|_| id >= ID_TUNE) {
+                let list = panel_tunables(p);
+                if let Some(t) = list.get(k).filter(|_| id >= ID_TUNE) {
                     let pos = SendDlgItemMessageW(h, id, TBM_GETPOS, 0, 0).max(0) as u32;
                     let v = t.value_at(pos);
                     UI.with(|u| {
@@ -1395,14 +1595,17 @@ unsafe extern "system" fn tuning_dialog(h: HWND, msg: u32, w: usize, l: isize) -
                         u.tuning_edit.retain(|(key, _)| *key != t.key);
                         u.tuning_edit.push((t.key, v));
                     });
-                    SetDlgItemTextW(h, ID_TUNE_VALUE + k as i32, wide(&tune_text(k, Some(v))).as_ptr());
+                    SetDlgItemTextW(h, ID_TUNE_VALUE + k as i32, wide(&tune_text(t, Some(v))).as_ptr());
                 }
                 0
             }
             WM_COMMAND => {
                 let id = (w & 0xFFFF) as i32;
+                let p = UI.with(|u| u.borrow().panel).unwrap_or(Panel::Tuning);
+                let list = panel_tunables(p);
                 match id {
                     IDOK => {
+                        panel_take(h, p);
                         EndDialog(h, 1);
                         1
                     }
@@ -1411,16 +1614,27 @@ unsafe extern "system" fn tuning_dialog(h: HWND, msg: u32, w: usize, l: isize) -
                         1
                     }
                     ID_TUNE_RESET_ALL => {
-                        UI.with(|u| u.borrow_mut().tuning_edit.clear());
-                        for k in 0..TUNABLES.len() {
-                            tune_row(h, k);
+                        let defaults = ScrSettings::default().to_pairs();
+                        UI.with(|u| {
+                            let mut u = u.borrow_mut();
+                            u.tuning_edit.retain(|(key, _)| !list.iter().any(|t| t.key == *key));
+                            for c in panel_choices(p) {
+                                u.panel_edit.retain(|(key, _)| *key != c.key);
+                                if let Some((_, v)) = defaults.iter().find(|(k, _)| *k == c.key) {
+                                    u.panel_edit.push((c.key, v.clone()));
+                                }
+                            }
+                        });
+                        panel_fill(h, p);
+                        for (k, t) in list.iter().enumerate() {
+                            tune_row(h, k, t);
                         }
                         1
                     }
-                    _ if (ID_TUNE_RESET..ID_TUNE_RESET + TUNABLES.len() as i32).contains(&id) => {
+                    _ if (ID_TUNE_RESET..ID_TUNE_RESET + list.len() as i32).contains(&id) => {
                         let k = (id - ID_TUNE_RESET) as usize;
-                        UI.with(|u| u.borrow_mut().tuning_edit.retain(|(key, _)| *key != TUNABLES[k].key));
-                        tune_row(h, k);
+                        UI.with(|u| u.borrow_mut().tuning_edit.retain(|(key, _)| *key != list[k].key));
+                        tune_row(h, k, list[k]);
                         1
                     }
                     _ => 0,
@@ -1469,16 +1683,24 @@ mod tests {
         assert!(style & DS_SETFONT != 0 && style & WS_CAPTION != 0);
         assert_eq!(items, n);
         assert!(cy > 200 && cy < 600, "height {cy}");
-        let (t, n) = tuning_template();
-        let (_, items, _) = header(&t);
-        assert_eq!(items, n);
-        assert_eq!(n, 1 + TUNABLES.len() * 4 + 3);
+        for p in PANELS {
+            let (t, n) = panel_template(p);
+            let (_, items, _) = header(&t);
+            assert_eq!(items, n);
+            let choices: usize = panel_choices(p).iter().map(|c| if kind(c) == Kind::Toggle { 1 } else { 2 }).sum();
+            assert_eq!(n, 1 + choices + panel_tunables(p).len() * 4 + 3, "{p:?}");
+        }
+        // every slider is in exactly one dialog, every dialog has something
+        assert_eq!(PANELS.iter().map(|&p| panel_tunables(p).len()).sum::<usize>(), TUNABLES.len());
+        assert!(PANELS.iter().all(|&p| !panel_tunables(p).is_empty()));
+        assert!(panel_choices(Panel::Layout).iter().any(|c| c.key == "ordering"));
+        assert!(general_choices().iter().all(|c| c.panel.is_none()), "secondary settings stay out of the main dialog");
     }
 
     #[test]
     fn controls_suit_their_settings_and_labels_are_short_and_distinct() {
         let by_key = |k: &str| general_choices().into_iter().find(|c| c.key == k).unwrap();
-        for k in ["wireframe", "stats", "fps_invert", "sound", "halo_bands", "tags"] {
+        for k in ["wireframe", "stats", "fps_invert", "sound", "halo_bands", "tags", "overdrive"] {
             assert_eq!(kind(&by_key(k)), Kind::Toggle, "{k}");
         }
         for k in ["bg_lum", "bg_waves", "bg_wave_speed", "budget", "levels", "colors", "halo_swing"] {
@@ -1508,8 +1730,11 @@ mod tests {
             assert!(!help(k).is_empty(), "{k}");
         }
         assert!(TUNABLES.iter().all(|t| t.help.len() > 20));
-        let tips = tuning_tips();
-        assert_eq!(tips.len(), TUNABLES.len() * 4 + 3);
+        for p in PANELS {
+            let tips = panel_tips(p);
+            assert_eq!(tips.len(), panel_choices(p).len() * 2 + panel_tunables(p).len() * 4 + 3);
+            assert!(tips.iter().all(|(_, t)| !t.is_empty()), "{p:?}");
+        }
         assert!(main_tips().iter().all(|(_, t)| !t.is_empty()));
         assert_eq!(TIP_DELAY_MS, 2000);
     }

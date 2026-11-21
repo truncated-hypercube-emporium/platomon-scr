@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use crate::aspect::AspectMode;
 use crate::clock::FpsCurve;
 use crate::color::{self, ColorBy, ColorMap, Gradient, HaloColor};
-use crate::scene::Layout;
+use crate::scene::{Arrangement, Layout, Ordering, SPACING_RANGE};
 use crate::metrics::{MetricKind, MetricSpec};
 use crate::overlay::{LEGEND_SIZE_MAX, LEGEND_SIZE_MIN, LegendParams, LegendPos};
 use crate::scene::camera::{CameraMode, OrbitDir};
@@ -125,8 +125,14 @@ pub struct Config {
     pub color_reverse: bool,
 
     // --- layout ---
-    /// `rings` (on the ground) or `sphere` (concentric spherical shells).
+    /// `rings` (on the ground), `sphere` (concentric spherical shells),
+    /// `line` (one evenly spaced row) or `stack` (one above another).
     pub layout: Layout,
+    /// Which solid goes where: `listed` (metric order), `simple` (simplest
+    /// first), `complex` (most complex first) or `random`.
+    pub ordering: Ordering,
+    /// Neighbour spacing as a multiple of the standard, 0.8..=2.5.
+    pub spacing: f32,
 
     // --- camera ---
     pub camera: CameraMode,
@@ -243,6 +249,8 @@ impl Default for Config {
             color_depth: None,
             color_reverse: false,
             layout: Layout::Rings,
+            ordering: Ordering::Listed,
+            spacing: 1.0,
             focus_zoom: 0.6,
             focus_tau: 1.5,
             auto_distance: false,
@@ -349,6 +357,7 @@ impl Config {
         self.bounces = self.bounces.min(8);
         self.max_steps = self.max_steps.clamp(8, 1024);
         self.max_dist = finite_or(self.max_dist, d.max_dist).clamp(5.0, 1000.0);
+        self.spacing = finite_or(self.spacing, d.spacing).clamp(SPACING_RANGE.0, SPACING_RANGE.1);
 
         if self.ramp.chars().count() < 2 {
             self.ramp = d.ramp.clone();
@@ -402,6 +411,11 @@ impl Config {
         for v in [&mut w.cpu, &mut w.ram, &mut w.disk, &mut w.net, &mut w.gpu, &mut w.nic, &mut w.disk_dev] {
             *v = finite_or(*v, 1.0).max(0.0);
         }
+    }
+
+    /// How the solids are placed (the random ordering follows the seed).
+    pub fn arrangement(&self) -> Arrangement {
+        Arrangement { layout: self.layout, ordering: self.ordering, spacing: self.spacing, seed: self.seed.unwrap_or(0) }
     }
 
     pub fn ground_params(&self) -> GroundParams {

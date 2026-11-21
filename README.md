@@ -26,7 +26,9 @@ platomon [OPTIONS]
 | `--show` | `METRIC[,METRIC…]`, max 16 | `cpu,ram,disk,net,gpu` |
 | `--solid` | `METRIC=SOLID`, repeatable | built-in mapping |
 | `--ring` | `METRIC=N`, repeatable (0 = innermost ring or shell) | automatic |
-| `--layout` | `rings` (on the ground) or `sphere` (concentric spherical shells) | `rings` |
+| `--layout` | `rings` (on the ground), `sphere` (concentric spherical shells), `line` (one evenly spaced row) or `stack` (one above another in the centre) | `rings` |
+| `--ordering` | which solid takes which place: `listed` (metric order), `simple` (simplest first), `complex` (most complex first) or `random` | `listed` |
+| `--spacing` | neighbour spacing as a multiple of the standard, 0.8–2.5 | `1` |
 | **Rendering** | | |
 | `--spp` | `N` (1–64) | 2 |
 | `--bounces` | `N` (0–8) | 2 |
@@ -123,6 +125,17 @@ camera keeps its own close-ups.
 elevation rises and falls sinusoidally three times over a 20° range centred on the overview's
 elevation, and its distance breathes ±8% in step, so the closed path is a three-lobed rosette that
 repeats every orbit.
+
+### Line and stack layouts, ordering and spacing
+
+`--layout line` puts the solids in one evenly spaced row along the ground, floating at the same
+height as the rings; `--layout stack` sets them one above another in the centre, the lowest lifted
+so its largest halo clears the floor, with the camera backed off to frame the column. `--ordering`
+decides which solid takes which place: `listed` keeps the metric order, `simple` puts the simplest
+solid (fewest edges, faces breaking ties) first and the most complex last, `complex` the reverse,
+and `random` shuffles them (the same for a given seed). The first place is the inner ring's front,
+the inner shell, the line's left end or the stack's bottom. `--spacing` scales the distance between
+neighbours (and between rings and shells).
 
 ### Sphere layout
 
@@ -422,7 +435,7 @@ administrator rights).
 - **Palettes instead of 24-bit colour**: 16 (default), 32, 64 or 128 colours per gradient (*Palette size*, `--colors`).
 - **New colour sources**: each solid by its **spin** (speed and direction seen from the camera) or by the **sound** of its own frequency band, low frequencies on the simplest solids and high on the most complex.
 - **Background colour on its own**: auto, off, the solids' gradient, or a gradient of its own (*Background colour*, `--bg-color`).
-- **Settings dialog**: check boxes and sliders, one-word option names, a *Tuning* dialog of numeric sliders, a live **Preview** (windowed, or *Fullscreen*), a **configuration log** of the last 10 OKs (each titled with a random word; `+` keeps one for good in `configuration.log`), and *Set as default*.
+- **Settings dialog**: check boxes and sliders, one-word option names, *Tuning*, *Layout* (ordering, spacing) and *Rendering* dialogs, a live **Preview** (windowed, or *Fullscreen*), a **configuration log** of the last 10 OKs (each titled with a random word; `+` keeps one for good in `configuration.log`), and *Set as default*.
 - **Halo size swing** is ±10% (was ±5%), ±30% or the new ±60%.
 - **Faster colour**: a palette-sized tile cache, a single glyph-and-colour pass and a tone-curve table make the colour pipeline 35–45% faster.
 - **Quasicrystal background** (`quasicrystal` pattern, with wave count and flow speed settings), and tags no longer cover the legend.
@@ -494,16 +507,26 @@ as the shift opens on the other side.
 
 **Settings.** Screen Saver Settings › Settings… (`platomon.scr /c`) and `platomon-config.exe` open
 the same dialog, run by a dialog procedure named `ScreenSaverConfigureDialog` as in the Win32
-screensaver interface. A master **Random look each run** switch (on by default) picks the look anew
-every time; turn it off to use the look chosen below it instead: layout, camera, colour gradient and
-source, background colour, background pattern and luminosity, wireframe, stats bar, inverted frame rate and extra
-metrics (greyed out while the switch is on). The frame-rate cap (the display's refresh rate by
-default), the CPU budget used to size the text, the text density, the number of luminosity levels,
-the palette size, the sound halo and tags, and the burn-in shift (on/off, frame interval, range)
-always apply. On/off settings are check boxes, settings with three or more numeric steps are
-sliders showing their value, and drop-downs show each option by its leading word.
+screensaver interface. **Randomize** at the top of the *Look* group (on by default) picks the look
+anew every run; turn it off to use the look chosen below it instead: layout, camera, colour gradient
+and source, background colour, background pattern and luminosity, wireframe, stats bar, inverted
+frame rate and extra metrics (greyed out while Randomize is on). The small die button beside it
+rolls a random look into those settings now and turns Randomize off so it is kept (saved with OK or
+*Apply*). The *Performance & features* group always applies: the frame-rate cap (the display's
+refresh rate by default), the CPU budget used to size the text, the text density, the number of
+luminosity levels, the palette size, the sound halo and tags; so does the burn-in shift (on/off,
+frame interval, range). On/off settings are check boxes, settings with three or more numeric steps
+are sliders showing their value, and drop-downs show each option by its leading word, capitalised
+(the settings file keeps the lowercase names).
 
-**Tuning.** *Tuning…* opens a second dialog of sliders for numeric values: orbit period and bob,
+**Layout and Rendering.** *Layout…* (beside *Tuning…*) opens the layout settings that apply every
+run: *Ordering* (as listed, simple to complex, complex to simple, or random; see *Line and stack
+layouts* above) and *Spacing*. *Rendering…* (in the frame-rate cap's row) opens the rendering
+settings: samples per cell, light bounces, march steps and render distance (auto: the screensaver's
+own 1 sample and 1 bounce) and adaptive quality. Their sliders work like *Tuning*'s and are saved the
+same way (`tune_spacing`, `tune_spp`, ...); `ordering` and `adaptive` are plain keys.
+
+**Tuning.** *Tuning…* opens a dialog of sliders for numeric values: orbit period and bob,
 focus zoom and glide, floor contrast, tile size, sway and its period, floor turn period, smallest
 and largest solid size, idle and fastest spin, and exposure. Moving a slider sets that value for
 every run (random look or not); *×* or *Reset all* returns it to auto (the random look's or the
@@ -514,26 +537,30 @@ half the screen's size, rendered at half resolution with the full-screen run's t
 inside the window closes it. With *Fullscreen* ticked it covers the whole screen at full
 resolution instead; it ignores the mouse and closes on any key. While it runs, edits show live (the
 dialog writes them to `preview.ini` beside the settings file, and the preview reads that a few times
-a second, keeping its random look). Edits to the CPU budget, text density and frame-rate cap set the
+a second, keeping its random look). Edits to the CPU budget, overdrive, text density and frame-rate cap set the
 text size, which is fixed once the preview's window exists; after one of those, or after ticking or
 unticking *Fullscreen*, the button reads *Restart* and starts a new preview. Closing the dialog
 closes the preview. Run it directly with `platomon.scr /w` or `/w full`.
 
 **Configuration log.** Each OK or *Apply* (which saves without closing) adds an entry to the log on
 the right, titled with a random English word and the time, holding the settings and the arguments
-the dialog was launched with. Entries always hold the look with *Random look each run* off, so
+the dialog was launched with. Entries always hold the look with *Randomize* off, so
 loading one brings back that look; a save whose settings are already logged adds no new entry. Pick an entry to see them; *Load into dialog* puts its settings back in the
 controls (saved only with OK). The newest 10 entries are kept; the `+` beside an entry keeps it
 (the button turns to `−`, which lets it go again) and saves it to `configuration.log` beside the
 settings file, and kept entries are never dropped. The log itself is `config-log.ini`.
 
 **Defaults.** *Set as default* saves the dialog's current settings as your defaults (in
-`configuration.log`); *Defaults* then loads them (or the built-in defaults when none are saved), and a
-first run with no settings file starts from them.
+`configuration.log`); a first run with no settings file starts from them.
 
 **Text density.** The text is first sized so rendering fits the CPU budget, then (with the default
 double density) set at half that height, never below 4 px: twice the characters per axis, about 4x
 the rendering cost of the budget. Choose Standard to keep the budget-sized text.
+
+**Overdrive.** The check box beside the CPU budget slider ignores the budget: the text is sized for
+the whole CPU at the full frame rate, and full frames render back to back with no pause between
+them (up to the frame-rate cap). The slider is greyed out while it is on. Expect full CPU load, heat
+and fan noise.
 
 **Sound halo** (on by default). A second wireframe of every solid, 1.2x its size, follows the
 sound level of the default output device (the one selected in Windows sound settings, read through
@@ -607,7 +634,9 @@ INI file through `WritePrivateProfileString`: `%APPDATA%\platomon\screensaver.in
 ```ini
 [platomon]
 random=on              ; on = random look each run; off = use the look below
-layout=rings           ; rings | sphere
+layout=rings           ; rings | sphere | line | stack
+ordering=listed        ; listed | simple | complex | random
+adaptive=on            ; adaptive quality
 camera=orbit           ; static | orbit | focus | tilt | resonance
 color=inferno          ; off | inferno | viridis | ... (see --list gradients)
 color_by=lum           ; lum | load | spin | sound
@@ -621,6 +650,7 @@ fps_invert=off         ; on | off
 extras=none            ; none | nic | disk | both
 fps_cap=display        ; or 30..240
 budget=15              ; percent
+overdrive=off          ; on = ignore the budget and use all the CPU time rendering wants
 density=2              ; 1 = standard | 2 = double
 levels=16              ; 8 | 16 | 32 (older auto -> 16, 10 -> 8)
 sound=on               ; sound halo from the default output device

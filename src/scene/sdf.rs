@@ -95,6 +95,13 @@ impl SolidKind {
     }
 
     /// Expected (faces, vertices).
+    /// How complex the solid is: its edge count (faces + vertices − 2), the
+    /// face count breaking ties. Orders solids simple to complex.
+    pub fn complexity(self) -> f32 {
+        let (f, v) = self.counts();
+        (f + v - 2) as f32 * (1.0 + f as f32 / 1000.0)
+    }
+
     pub fn counts(self) -> (usize, usize) {
         match self {
             SolidKind::Tetrahedron => (4, 4),

@@ -17,7 +17,7 @@ use platomon::render::{QualityGovernor, RenderSettings, Renderer, TraceSettings}
 use platomon::scene::camera::{CameraMode, CameraParams, OrbitDir};
 use platomon::scene::ground::{Pattern, Spin, parse_vec2};
 use platomon::scene::sdf::{Polyhedron, SolidKind};
-use platomon::scene::{AnimParams, Layout, Scene, SlotLayout};
+use platomon::scene::{AnimParams, Layout, Ordering, Scene, SlotLayout};
 use platomon::ui::{self, Action};
 
 /// Longest sleep between input polls while waiting for a frame deadline.
@@ -158,9 +158,17 @@ struct Cli {
     color_reverse: bool,
 
     // ---- layout
-    /// rings (on the ground) or sphere (concentric spherical shells; --ring picks the shell).
-    #[arg(long, value_name = "rings|sphere")]
+    /// rings (on the ground), sphere (concentric spherical shells; --ring picks the shell),
+    /// line (one evenly spaced row) or stack (one above another in the centre).
+    #[arg(long, value_name = "rings|sphere|line|stack")]
     layout: Option<Layout>,
+    /// Which solid takes which place: listed (metric order), simple (simplest first),
+    /// complex (most complex first) or random.
+    #[arg(long, value_name = "listed|simple|complex|random")]
+    ordering: Option<Ordering>,
+    /// Neighbour spacing as a multiple of the standard, 0.8..2.5 (default 1).
+    #[arg(long, value_name = "FLOAT")]
+    spacing: Option<f32>,
 
     // ---- display ratio
     /// Picture ratio: fill, a preset (vga, wxga, fhd, uwqhd, ... see --list aspects) or W:H.
@@ -250,7 +258,7 @@ fn apply_cli(cfg: &mut Config, cli: &Cli) -> Result<(), String> {
     set!(spp, bounces, fps_min, fps_max, ramp, char_aspect, aspect, aspect_mode, camera, orbit_period, orbit_dir, orbit_bob);
     set!(bg_lum, bg_pattern, bg_contrast, bg_scale, bg_sway, bg_sway_period, bg_rotate, bg_rotate_period, bg_waves, bg_wave_speed);
     set!(legend_size, legend_opacity, legend_pos);
-    set!(color, color_by, bg_color, layout, focus_zoom, focus_tau);
+    set!(color, color_by, bg_color, layout, ordering, spacing, focus_zoom, focus_tau);
     if let Some(n) = &cli.colors {
         cfg.colors = n.parse().unwrap_or(color::DEFAULT_COLORS);
     }
@@ -508,7 +516,7 @@ fn camera_params(cfg: &Config) -> CameraParams {
 }
 
 fn build_scene(cfg: &Config, slots: &[SlotSpec]) -> Scene {
-    Scene::with_layout(&layouts(slots), &anim_params(cfg), &camera_params(cfg), cfg.layout)
+    Scene::arranged(&layouts(slots), &anim_params(cfg), &camera_params(cfg), &cfg.arrangement())
         .with_ground(&cfg.ground_params())
 }
 

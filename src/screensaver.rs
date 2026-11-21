@@ -11,7 +11,7 @@ use crate::render::{RenderSettings, Renderer, TraceSettings};
 use crate::scene::camera::{CameraMode, CameraParams, OrbitDir};
 use crate::scene::ground::{Pattern, Spin};
 use crate::scene::sdf::SolidKind;
-use crate::scene::{AnimParams, Layout, Scene, SlotLayout};
+use crate::scene::{AnimParams, Layout, Ordering, Scene, SlotLayout};
 use crate::color::{self, ColorBy};
 
 /// The primary display as Windows reports it.
@@ -54,8 +54,8 @@ pub fn fps_for(d: &Display) -> f32 {
 /// per pixel, 1 bounce, adaptive quality on.
 pub fn randomize(rng: &mut fastrand::Rng, d: &Display) -> Config {
     let mut c = Config {
-        spp: 1,
-        bounces: 1,
+        spp: SCR_SPP,
+        bounces: SCR_BOUNCES,
         adaptive_quality: true,
         fps_max: fps_for(d),
         seed: Some(rng.u64(..)),
@@ -75,7 +75,12 @@ pub fn randomize(rng: &mut fastrand::Rng, d: &Display) -> Config {
         c.solids.insert(m.clone(), k.id().to_string());
     }
     c.show = show;
-    c.layout = if rng.bool() { Layout::Rings } else { Layout::Sphere };
+    c.layout = match rng.u8(0..20) {
+        0..=6 => Layout::Rings,
+        7..=13 => Layout::Sphere,
+        14..=16 => Layout::Line,
+        _ => Layout::Stack,
+    };
 
     // camera
     c.camera = match rng.u8(0..20) {
@@ -159,7 +164,7 @@ pub fn camera_params(cfg: &Config) -> CameraParams {
 /// The scene for `cfg`'s resolved slots, with its layout and background.
 pub fn build_scene(cfg: &Config, slots: &[SlotSpec]) -> Scene {
     let layouts: Vec<SlotLayout> = slots.iter().map(|s| SlotLayout { solid: s.solid, ring: s.ring }).collect();
-    Scene::with_layout(&layouts, &anim_params(cfg), &camera_params(cfg), cfg.layout).with_ground(&cfg.ground_params())
+    Scene::arranged(&layouts, &anim_params(cfg), &camera_params(cfg), &cfg.arrangement()).with_ground(&cfg.ground_params())
 }
 
 /// Render settings for `cfg` (no picture-ratio framing: the screen is filled).
@@ -240,7 +245,7 @@ pub struct Plan {
 pub fn plan(d: &Display, seed: u64, s: &ScrSettings) -> Result<Plan, String> {
     let config = plan_config(d, seed, s);
     let spc = seconds_per_cell(&config)?;
-    let budget = s.budget_pct as f32 / 100.0;
+    let budget = s.budget();
     let (px, ..) = font_height(d, config.fps_max, spc, budget);
     let (font_px, cols, rows) = apply_density(d, px, s.density);
     Ok(Plan { config, font_px, est_grid: (cols, rows), sec_per_cell: spc, budget, settings: s.clone() })
@@ -249,18 +254,25 @@ pub fn plan(d: &Display, seed: u64, s: &ScrSettings) -> Result<Plan, String> {
 /// The settings a running preview cannot pick up: they set the text size
 /// (CPU budget, density, and the frame-rate cap the budget is spread
 /// over), which is fixed once its window is made.
-pub const PREVIEW_RESTART_KEYS: [&str; 3] = ["budget", "density", "fps_cap"];
+pub const PREVIEW_RESTART_KEYS: [&str; 4] = ["budget", "overdrive", "density", "fps_cap"];
 
 /// Whether `edited` changes a setting the preview started with `running`
 /// cannot apply live (see [`PREVIEW_RESTART_KEYS`]).
 pub fn preview_needs_restart(running: &ScrSettings, edited: &ScrSettings) -> bool {
-    (running.budget_pct, running.density, running.fps_cap) != (edited.budget_pct, edited.density, edited.fps_cap)
+    (running.budget_pct, running.overdrive, running.density, running.fps_cap)
+        != (edited.budget_pct, edited.overdrive, edited.density, edited.fps_cap)
 }
 
 /// `edited` as a running preview applies it: everything but the
 /// [`PREVIEW_RESTART_KEYS`], which stay as `running` had them.
 pub fn preview_live(running: &ScrSettings, edited: &ScrSettings) -> ScrSettings {
-    ScrSettings { budget_pct: running.budget_pct, density: running.density, fps_cap: running.fps_cap, ..edited.clone() }
+    ScrSettings {
+        budget_pct: running.budget_pct,
+        overdrive: running.overdrive,
+        density: running.density,
+        fps_cap: running.fps_cap,
+        ..edited.clone()
+    }
 }
 
 /// Settings as the preview file holds them: one `key=value` per line.
@@ -291,6 +303,8 @@ pub fn plan_config(d: &Display, seed: u64, s: &ScrSettings) -> Config {
     config.far_ground = s.far_ground;
     config.tag_fixed_len = s.tag_fixed;
     config.halo_color = s.halo_color;
+    config.ordering = s.ordering;
+    config.adaptive_quality = s.adaptive;
     for &(k, v) in &s.tuning {
         set_tunable(&mut config, k, v);
     }
@@ -434,6 +448,9 @@ pub struct ScrSettings {
     /// Rendering CPU budget, percent of wall time at full frame rate, for the
     /// font size before the density factor.
     pub budget_pct: u8,
+    /// Overdrive: ignore `budget_pct` and let rendering take all the CPU
+    /// time it wants (text sized for the whole CPU, frames back to back).
+    pub overdrive: bool,
     /// Glyphs per axis relative to the budget-sized font (1 or 2); 2 costs
     /// about 4x the budget.
     pub density: u8,
@@ -452,6 +469,10 @@ pub struct ScrSettings {
     pub halo_bands: bool,
     /// What the halo's colour comes from (with a colour gradient on).
     pub halo_color: color::HaloColor,
+    /// Which solid takes which place in the layout.
+    pub ordering: Ordering,
+    /// Adaptive quality: drop samples, then bounces, when frames run late.
+    pub adaptive: bool,
     /// Dynamic camera distance: move in and out to keep every solid in frame.
     pub auto_distance: bool,
     /// Extended floor: the ground plane drawn 8x further out.
@@ -495,6 +516,7 @@ impl Default for ScrSettings {
             extras: Extras::None,
             fps_cap: None,
             budget_pct: (RENDER_BUDGET * 100.0).round() as u8,
+            overdrive: false,
             density: 2,
             levels: Levels::L16,
             colors: color::DEFAULT_COLORS,
@@ -502,6 +524,8 @@ impl Default for ScrSettings {
             halo_swing: 10,
             halo_bands: true,
             halo_color: color::HaloColor::Under,
+            ordering: Ordering::Listed,
+            adaptive: true,
             auto_distance: false,
             far_ground: false,
             tag_fixed: false,
@@ -523,9 +547,19 @@ pub const SHIFT_FRAMES_MAX: u32 = 1_000_000;
 /// Halo size swings offered, percent of the radius either way.
 pub const HALO_SWING_PCT: [u8; 3] = [10, 30, 60];
 
-/// A numeric setting the Tuning dialog edits with a slider.
+/// The secondary dialogs of the settings dialog: which one shows a setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Panel {
+    Tuning,
+    Layout,
+    Rendering,
+}
+
+/// A numeric setting a secondary dialog edits with a slider.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Tunable {
+    /// The dialog it is in.
+    pub panel: Panel,
     /// Config field.
     pub key: &'static str,
     /// INI key (`tune_<field>`).
@@ -572,28 +606,43 @@ impl Tunable {
 }
 
 macro_rules! tunable {
-    ($key:literal, $label:literal, $min:expr, $max:expr, $step:expr, $help:literal) => {
-        Tunable { key: $key, ini: concat!("tune_", $key), label: $label, min: $min, max: $max, step: $step, help: $help }
+    ($panel:ident, $key:literal, $label:literal, $min:expr, $max:expr, $step:expr, $help:literal) => {
+        Tunable {
+            panel: Panel::$panel,
+            key: $key,
+            ini: concat!("tune_", $key),
+            label: $label,
+            min: $min,
+            max: $max,
+            step: $step,
+            help: $help,
+        }
     };
 }
 
-/// Every numeric setting in the Tuning dialog. A set value applies every
-/// run (random look or not); unset ones keep the random or default value.
-pub const TUNABLES: [Tunable; 14] = [
-    tunable!("orbit_period", "Orbit period (s)", 15.0, 180.0, 5.0, "Seconds per camera orbit (orbit, tilt and resonance cameras). Tilt also takes one period per rise or fall."),
-    tunable!("orbit_bob", "Orbit bob", 0.0, 1.0, 0.05, "How far the orbiting camera rises and falls twice per turn, in world units."),
-    tunable!("focus_zoom", "Focus zoom", 0.0, 1.0, 0.05, "Focus camera: 0 only turns toward the busiest solid, 1 comes in to a close-up."),
-    tunable!("focus_tau", "Focus glide (s)", 0.25, 5.0, 0.25, "Focus camera: how long its glides take (smoothing time constant)."),
-    tunable!("bg_contrast", "Floor contrast", 0.0, 1.0, 0.05, "How far the floor pattern's tones spread around its brightness."),
-    tunable!("bg_scale", "Floor tile size", 0.3, 4.0, 0.1, "Size of the floor pattern's tiles (the quasicrystal's wavelength), in world units."),
-    tunable!("bg_sway", "Floor sway", 0.0, 2.0, 0.05, "How far the floor pattern sways in a slow circle; 0 holds it still."),
-    tunable!("bg_sway_period", "Sway period (s)", 3.0, 30.0, 1.0, "Seconds per floor sway cycle."),
-    tunable!("bg_rotate_period", "Floor turn period (s)", 10.0, 180.0, 5.0, "Seconds per turn when the floor pattern rotates."),
-    tunable!("min_scale", "Smallest solid size", 0.2, 1.0, 0.05, "Size of a solid whose metric is idle, as a share of full size."),
-    tunable!("max_scale", "Largest solid size", 0.5, 1.5, 0.05, "Size of a solid whose metric is at full load."),
-    tunable!("idle_spin", "Idle spin (rad/s)", 0.0, 1.0, 0.05, "How fast a solid spins when its metric is idle."),
-    tunable!("max_spin", "Fastest spin (rad/s)", 0.5, 8.0, 0.25, "How fast a solid spins at full load."),
-    tunable!("exposure", "Exposure", 0.3, 3.0, 0.1, "Overall picture brightness before it is turned into glyphs."),
+/// Every numeric setting set with a slider, in the Tuning, Layout and
+/// Rendering dialogs ([`Tunable::panel`]). A set value applies every run
+/// (random look or not); unset ones keep the random or default value.
+pub const TUNABLES: [Tunable; 19] = [
+    tunable!(Tuning, "orbit_period", "Orbit period (s)", 15.0, 180.0, 5.0, "Seconds per camera orbit (orbit, tilt and resonance cameras). Tilt also takes one period per rise or fall."),
+    tunable!(Tuning, "orbit_bob", "Orbit bob", 0.0, 1.0, 0.05, "How far the orbiting camera rises and falls twice per turn, in world units."),
+    tunable!(Tuning, "focus_zoom", "Focus zoom", 0.0, 1.0, 0.05, "Focus camera: 0 only turns toward the busiest solid, 1 comes in to a close-up."),
+    tunable!(Tuning, "focus_tau", "Focus glide (s)", 0.25, 5.0, 0.25, "Focus camera: how long its glides take (smoothing time constant)."),
+    tunable!(Tuning, "bg_contrast", "Floor contrast", 0.0, 1.0, 0.05, "How far the floor pattern's tones spread around its brightness."),
+    tunable!(Tuning, "bg_scale", "Floor tile size", 0.3, 4.0, 0.1, "Size of the floor pattern's tiles (the quasicrystal's wavelength), in world units."),
+    tunable!(Tuning, "bg_sway", "Floor sway", 0.0, 2.0, 0.05, "How far the floor pattern sways in a slow circle; 0 holds it still."),
+    tunable!(Tuning, "bg_sway_period", "Sway period (s)", 3.0, 30.0, 1.0, "Seconds per floor sway cycle."),
+    tunable!(Tuning, "bg_rotate_period", "Floor turn period (s)", 10.0, 180.0, 5.0, "Seconds per turn when the floor pattern rotates."),
+    tunable!(Tuning, "min_scale", "Smallest solid size", 0.2, 1.0, 0.05, "Size of a solid whose metric is idle, as a share of full size."),
+    tunable!(Tuning, "max_scale", "Largest solid size", 0.5, 1.5, 0.05, "Size of a solid whose metric is at full load."),
+    tunable!(Tuning, "idle_spin", "Idle spin (rad/s)", 0.0, 1.0, 0.05, "How fast a solid spins when its metric is idle."),
+    tunable!(Tuning, "max_spin", "Fastest spin (rad/s)", 0.5, 8.0, 0.25, "How fast a solid spins at full load."),
+    tunable!(Tuning, "exposure", "Exposure", 0.3, 3.0, 0.1, "Overall picture brightness before it is turned into glyphs."),
+    tunable!(Layout, "spacing", "Spacing", 0.8, 2.5, 0.05, "Distance between neighbouring solids (and between rings or shells), as a multiple of the standard spacing."),
+    tunable!(Rendering, "spp", "Samples per cell", 1.0, 4.0, 1.0, "Light paths traced per character cell: more is smoother and less noisy, and costs that many times the work."),
+    tunable!(Rendering, "bounces", "Light bounces", 0.0, 4.0, 1.0, "Indirect bounces after the first hit: 0 gives hard direct light only, more fills shadows with reflected light at more cost."),
+    tunable!(Rendering, "max_steps", "March steps", 16.0, 256.0, 8.0, "Most sphere-tracing steps per ray: fewer is faster but can miss thin edges and grazing surfaces."),
+    tunable!(Rendering, "max_dist", "Render distance", 20.0, 200.0, 10.0, "How far rays travel before they count as sky, in world units; the extended floor multiplies it."),
 ];
 
 /// Set config field `key` (a [`TUNABLES`] key) to `v`.
@@ -613,8 +662,24 @@ pub fn set_tunable(c: &mut Config, key: &str, v: f32) {
         "idle_spin" => c.idle_spin = v,
         "max_spin" => c.max_spin = v,
         "exposure" => c.exposure = v,
+        "spacing" => c.spacing = v,
+        "spp" => c.spp = v.round().max(1.0) as u32,
+        "bounces" => c.bounces = v.round().max(0.0) as u32,
+        "max_steps" => c.max_steps = v.round().max(1.0) as u32,
+        "max_dist" => c.max_dist = v,
         _ => {}
     }
+}
+
+/// The screensaver's own cheap rendering (every run, unless the Rendering
+/// dialog sets otherwise): samples per cell and bounces.
+pub const SCR_SPP: u32 = 1;
+pub const SCR_BOUNCES: u32 = 1;
+
+/// Tunable `key`'s value while it is on auto: the default, with the
+/// screensaver's own rendering settings.
+pub fn tunable_auto(key: &str) -> f32 {
+    get_tunable(&Config { spp: SCR_SPP, bounces: SCR_BOUNCES, ..Config::default() }, key)
 }
 
 /// Config field `key`'s value (a [`TUNABLES`] key).
@@ -634,6 +699,11 @@ pub fn get_tunable(c: &Config, key: &str) -> f32 {
         "idle_spin" => c.idle_spin,
         "max_spin" => c.max_spin,
         "exposure" => c.exposure,
+        "spacing" => c.spacing,
+        "spp" => c.spp as f32,
+        "bounces" => c.bounces as f32,
+        "max_steps" => c.max_steps as f32,
+        "max_dist" => c.max_dist,
         _ => f32::NAN,
     }
 }
@@ -642,8 +712,11 @@ pub fn get_tunable(c: &Config, key: &str) -> f32 {
 /// dialog's own controls); empty when there is none.
 pub fn help(key: &str) -> &'static str {
     match key {
-        "random" => "On: every run picks a new random look (layout, camera, colours, background...). Off: the look chosen in the Look group is used every time.",
-        "layout" => "Rings: the solids stand in rings on the floor. Sphere: they float on concentric spherical shells.",
+        "random" => "On: every run picks a new random look (layout, camera, colours, background...). Off: the look chosen in this group is used every time.",
+        "reroll" => "Roll a random look into the settings of this group now (and turn Randomize off so it is kept). Nothing is saved until OK or Apply.",
+        "layout" => "Rings: the solids stand in rings on the floor. Sphere: they float on concentric spherical shells. Line: one evenly spaced row. Stack: one above another in the centre. Ordering and spacing are in the Layout dialog.",
+        "ordering" => "Which solid takes which place: in metric order, from the simplest solid (fewest edges) to the most complex, the reverse, or shuffled. The first place is the inner ring's front, the inner shell, the line's left end or the stack's bottom.",
+        "adaptive" => "When frames run late, render with fewer samples, then fewer bounces, and step back up when there is time again.",
         "camera" => "Static: a fixed overview. Orbit: circles the solids. Focus: glides toward the busiest solid. Tilt: orbits while rising from 20 to 80 degrees and back, pausing half an orbit at each end. Resonance: orbits with three 20-degree rises and falls per turn.",
         "color" => "The colour gradient, or Off for plain monochrome text.",
         "color_by" => "What picks each solid's colour. Brightness: how lit the cell is. Load: the solid's metric. Spin: its spin speed and direction seen from the camera. Sound: the loudness of its own frequency band (bass on simple solids, treble on complex ones).",
@@ -658,6 +731,7 @@ pub fn help(key: &str) -> &'static str {
         "extras" => "Extra solids for a network adapter and/or a disk device, beside CPU, RAM, disk, network and GPU.",
         "fps_cap" => "Highest frame rate: the display's refresh rate, or a lower fixed cap.",
         "budget" => "Share of CPU time the rendering may use; the text size is chosen so it fits.",
+        "overdrive" => "Ignore the CPU budget: rendering takes all the CPU time it wants (the text is sized for the whole CPU at the full frame rate, and frames render back to back). Expect full CPU load, heat and fan noise.",
         "density" => "Double halves the text height (twice the characters per axis) at about 4x the rendering cost.",
         "levels" => "How many glyphs from dark to bright: 8, 16 or 32.",
         "colors" => "Colours per gradient: 16, 32, 64 or 128. More gives smoother colour; brightness colouring then redraws more cells each frame.",
@@ -711,10 +785,14 @@ fn parse_on_off(s: &str) -> Option<bool> {
 }
 
 fn layout_id(l: Layout) -> &'static str {
-    match l {
-        Layout::Rings => "rings",
-        Layout::Sphere => "sphere",
-    }
+    l.id()
+}
+
+/// `s` with its first letter in capitals (shown option names; the INI
+/// values stay lowercase).
+fn capitalized(s: &str) -> String {
+    let mut c = s.chars();
+    c.next().map_or_else(String::new, |f| f.to_uppercase().chain(c).collect())
 }
 
 fn extras_id(e: Extras) -> &'static str {
@@ -743,6 +821,8 @@ pub struct Choice {
     pub label: &'static str,
     pub options: Vec<(String, String)>,
     pub look: bool,
+    /// Shown in this secondary dialog instead of the main one.
+    pub panel: Option<Panel>,
 }
 
 /// Every drop-down in the configuration dialog, in display order.
@@ -750,24 +830,37 @@ pub fn choices() -> Vec<Choice> {
     let opt = |v: &str, t: &str| (v.to_string(), t.to_string());
     let on_off = || vec![opt("on", "On"), opt("off", "Off")];
     let mut colors = vec![opt("off", "Off (monochrome)")];
-    colors.extend(color::PRESETS.iter().map(|(id, _, _)| opt(id, id)));
+    colors.extend(color::PRESETS.iter().map(|(id, _, _)| opt(id, &capitalized(id))));
     let mut bg_colors = vec![
         opt("auto", "Auto (by brightness when the solids are)"),
         opt("off", "Off (uncoloured)"),
         opt("match", "Match (the solids' gradient, by brightness)"),
     ];
-    bg_colors.extend(color::PRESETS.iter().map(|(id, _, _)| opt(id, id)));
-    let patterns = Pattern::ALL.iter().map(|p| opt(p.id(), p.id())).collect();
+    bg_colors.extend(color::PRESETS.iter().map(|(id, _, _)| opt(id, &capitalized(id))));
+    let patterns = Pattern::ALL.iter().map(|p| opt(p.id(), &capitalized(p.id()))).collect();
     let lums = (0..=10).map(|l| opt(&l.to_string(), &if l == 0 { "0 (no floor)".into() } else { l.to_string() })).collect();
     let waves = (WAVES_CHOICE_MIN..=WAVES_CHOICE_MAX).map(|n| opt(&n.to_string(), &format!("{n}-fold"))).collect();
     let speeds = WAVE_SPEEDS.iter().map(|&(v, t)| opt(v, t)).collect();
     let mut caps = vec![opt("display", "Display refresh rate")];
     caps.extend([30, 60, 75, 90, 120, 144, 165, 240].map(|f| opt(&f.to_string(), &format!("{f} fps"))));
     let budgets = [5, 10, 15, 20, 25, 30, 40, 50].map(|b| opt(&b.to_string(), &format!("{b}%"))).to_vec();
-    let look = |key, label, options| Choice { key, label, options, look: true };
-    let always = |key, label, options| Choice { key, label, options, look: false };
+    let look = |key, label, options| Choice { key, label, options, look: true, panel: None };
+    let always = |key, label, options| Choice { key, label, options, look: false, panel: None };
+    let in_panel = |panel, key, label, options| Choice { key, label, options, look: false, panel: Some(panel) };
     vec![
-        look("layout", "Layout", vec![opt("rings", "Rings"), opt("sphere", "Sphere")]),
+        look("layout", "Layout", Layout::ALL.iter().map(|l| opt(l.id(), &capitalized(l.id()))).collect()),
+        in_panel(
+            Panel::Layout,
+            "ordering",
+            "Ordering",
+            vec![
+                opt("listed", "As listed (metric order)"),
+                opt("simple", "Simple to complex"),
+                opt("complex", "Complex to simple"),
+                opt("random", "Random"),
+            ],
+        ),
+        in_panel(Panel::Rendering, "adaptive", "Adaptive quality", on_off()),
         look(
             "camera",
             "Camera",
@@ -805,6 +898,7 @@ pub fn choices() -> Vec<Choice> {
         ),
         always("fps_cap", "Frame-rate cap", caps),
         always("budget", "CPU budget", budgets),
+        always("overdrive", "Overdrive", on_off()),
         always("density", "Text density", vec![opt("1", "Standard"), opt("2", "Double (about 4x CPU)")]),
         always(
             "levels",
@@ -860,6 +954,12 @@ pub fn choices() -> Vec<Choice> {
 }
 
 impl ScrSettings {
+    /// The rendering CPU budget, share of wall time: the slider's, or all
+    /// of it with overdrive on.
+    pub fn budget(&self) -> f32 {
+        if self.overdrive { 1.0 } else { self.budget_pct as f32 / 100.0 }
+    }
+
     /// `(key, value)` pairs as written to the INI file.
     pub fn to_pairs(&self) -> Vec<(&'static str, String)> {
         let mut v = self.look_pairs();
@@ -889,6 +989,7 @@ impl ScrSettings {
             ("extras", extras_id(self.extras).into()),
             ("fps_cap", self.fps_cap.map_or_else(|| "display".to_string(), |f| f.to_string())),
             ("budget", self.budget_pct.to_string()),
+            ("overdrive", on_off(self.overdrive)),
             ("density", self.density.to_string()),
             ("levels", levels_id(self.levels).into()),
             ("colors", self.colors.to_string()),
@@ -896,6 +997,8 @@ impl ScrSettings {
             ("halo_swing", self.halo_swing.to_string()),
             ("halo_bands", on_off(self.halo_bands)),
             ("halo_color", self.halo_color.id().into()),
+            ("ordering", self.ordering.id().into()),
+            ("adaptive", on_off(self.adaptive)),
             ("auto_distance", on_off(self.auto_distance)),
             ("far_ground", on_off(self.far_ground)),
             ("tag_fixed", on_off(self.tag_fixed)),
@@ -950,6 +1053,7 @@ impl ScrSettings {
                 Some(v) => v.parse::<u32>().ok().filter(|f| (30..=240).contains(f)).or(d.fps_cap),
             },
             budget_pct: num("budget").filter(|b| (1..=100).contains(b)).map_or(d.budget_pct, |b| b as u8),
+            overdrive: flag("overdrive", d.overdrive),
             density: num("density").filter(|v| (1..=2).contains(v)).map_or(d.density, |v| v as u8),
             levels: val("levels").and_then(|v| parse_levels(&v)).unwrap_or(d.levels),
             colors: num("colors").map(|n| n as usize).filter(|n| color::PALETTE_SIZES.contains(n)).unwrap_or(d.colors),
@@ -967,6 +1071,8 @@ impl ScrSettings {
                 .collect(),
             halo_bands: flag("halo_bands", d.halo_bands),
             halo_color: val("halo_color").and_then(|v| color::HaloColor::parse(&v)).unwrap_or(d.halo_color),
+            ordering: val("ordering").and_then(|v| v.parse().ok()).unwrap_or(d.ordering),
+            adaptive: flag("adaptive", d.adaptive),
             auto_distance: flag("auto_distance", d.auto_distance),
             far_ground: flag("far_ground", d.far_ground),
             tag_fixed: flag("tag_fixed", d.tag_fixed),
@@ -1068,6 +1174,22 @@ impl PixelShift {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overdrive_takes_the_whole_cpu() {
+        let d = Display { width: 2560, height: 1440, refresh: 60 };
+        let s = ScrSettings { random: false, budget_pct: 10, ..ScrSettings::default() };
+        let od = ScrSettings { overdrive: true, ..s.clone() };
+        assert_eq!((s.budget(), od.budget()), (0.10, 1.0));
+        let (p, q) = (plan(&d, 4, &s).unwrap(), plan(&d, 4, &od).unwrap());
+        assert_eq!(q.budget, 1.0);
+        // the same speed test sizes the text for all of the CPU: smaller text, more cells
+        let (px_full, ..) = font_height(&d, q.config.fps_max, p.sec_per_cell, 1.0);
+        let (px_ten, ..) = font_height(&d, p.config.fps_max, p.sec_per_cell, 0.10);
+        assert!(px_full <= px_ten);
+        assert!(preview_needs_restart(&s, &od), "overdrive sets the text size");
+        assert!(preview_settings(&preview_text(&od)).overdrive);
+    }
 
     #[test]
     fn preview_file_round_trips_and_only_text_size_needs_a_restart() {
@@ -1250,6 +1372,7 @@ mod tests {
             extras: Extras::Both,
             fps_cap: Some(60),
             budget_pct: 25,
+            overdrive: true,
             density: 1,
             levels: Levels::L32,
             colors: 64,
@@ -1258,6 +1381,8 @@ mod tests {
             tuning: vec![("orbit_period", 45.0), ("max_spin", 2.5)],
             halo_bands: false,
             halo_color: crate::color::HaloColor::Size,
+            ordering: Ordering::Complex,
+            adaptive: false,
             auto_distance: true,
             far_ground: true,
             tag_fixed: true,
@@ -1299,7 +1424,8 @@ mod tests {
         );
         for c in choices() {
             assert!(keys.contains(&c.key), "{} is a settings key", c.key);
-            assert!(c.options.iter().all(|(v, _)| v != "random"), "{}: no per-setting random", c.key);
+            // (old INI files used "random" per setting; the ordering's random is its own, newer choice)
+            assert!(c.key == "ordering" || c.options.iter().all(|(v, _)| v != "random"), "{}: no per-setting random", c.key);
             for (v, _) in &c.options {
                 let s = ScrSettings::from_lookup(lookup(&[(c.key, v)]));
                 let written = s.to_pairs().into_iter().find(|(k, _)| *k == c.key).unwrap().1;

@@ -123,17 +123,23 @@ pub struct SlotLayout {
 /// order the rings. Within a ring, slots keep their `show` order, starting at
 /// the front (+z); odd rings are rotated half a step so solids interleave.
 pub fn ring_layout(rings: &[Option<u32>]) -> (Vec<Vec3A>, Vec<usize>) {
+    ring_layout_spaced(rings, 1.0)
+}
+
+/// [`ring_layout`] with neighbour spacing and ring radii scaled by `spacing`.
+pub fn ring_layout_spaced(rings: &[Option<u32>], spacing: f32) -> (Vec<Vec3A>, Vec<usize>) {
+    let (gap, min_r) = (SPACING * spacing, MIN_RING_RADIUS * spacing);
     let (compact, nrings) = assign_rings(rings);
 
     let mut radius_prev: Option<f32> = None;
     let mut radii = Vec::with_capacity(nrings);
     for k in 0..nrings {
         let n = compact.iter().filter(|&&c| c == k).count();
-        let chord = if n > 1 { SPACING / (2.0 * (PI / n as f32).sin()) } else { 0.0 };
+        let chord = if n > 1 { gap / (2.0 * (PI / n as f32).sin()) } else { 0.0 };
         let r = match radius_prev {
             None if n == 1 => 0.0,
-            None => chord.max(MIN_RING_RADIUS),
-            Some(prev) => chord.max(prev + SPACING),
+            None => chord.max(min_r),
+            Some(prev) => chord.max(prev + gap),
         };
         radii.push(r);
         radius_prev = Some(r);
@@ -180,6 +186,12 @@ fn min_gap(pos: &[Vec3A]) -> f32 {
 /// assignment rules as [`ring_layout`]), around a centre raised so the lowest
 /// full-size solid clears the ground. Returns (centres, shell index, centre).
 pub fn shell_layout(rings: &[Option<u32>]) -> (Vec<Vec3A>, Vec<usize>, Vec3A) {
+    shell_layout_spaced(rings, 1.0)
+}
+
+/// [`shell_layout`] with neighbour spacing and shell radii scaled by `spacing`.
+pub fn shell_layout_spaced(rings: &[Option<u32>], spacing: f32) -> (Vec<Vec3A>, Vec<usize>, Vec3A) {
+    let (gap, min_r) = (SPACING * spacing, MIN_RING_RADIUS * spacing);
     let (compact, nshells) = assign_rings(rings);
     let mut dirs: Vec<Vec<Vec3A>> = Vec::with_capacity(nshells);
     let mut radii: Vec<f32> = Vec::with_capacity(nshells);
@@ -188,11 +200,11 @@ pub fn shell_layout(rings: &[Option<u32>]) -> (Vec<Vec3A>, Vec<usize>, Vec3A) {
         let n = compact.iter().filter(|&&c| c == k).count();
         // Alternate shells are turned so solids don't line up radially.
         let d = fibonacci_sphere(n, k as f32 * 0.9);
-        let fit = if n > 1 { SPACING / min_gap(&d) } else { 0.0 };
+        let fit = if n > 1 { gap / min_gap(&d) } else { 0.0 };
         let r = match prev {
             None if n == 1 => 0.0,
-            None => fit.max(MIN_RING_RADIUS),
-            Some(p) => fit.max(p + SPACING),
+            None => fit.max(min_r),
+            Some(p) => fit.max(p + gap),
         };
         dirs.push(d);
         radii.push(r);
@@ -207,6 +219,35 @@ pub fn shell_layout(rings: &[Option<u32>]) -> (Vec<Vec3A>, Vec<usize>, Vec3A) {
         next[k] += 1;
     }
     (pos, compact, centre)
+}
+
+/// `n` ground positions evenly spaced `SPACING × spacing` apart along x,
+/// centred on the origin.
+pub fn line_layout(n: usize, spacing: f32) -> Vec<Vec3A> {
+    let gap = SPACING * spacing;
+    (0..n).map(|i| Vec3A::new((i as f32 - (n as f32 - 1.0) * 0.5) * gap, 0.0, 0.0)).collect()
+}
+
+/// `n` centres one above another on the vertical axis, `SPACING × spacing`
+/// apart, the lowest at y = 0 (the scene lifts the stack clear of the floor).
+pub fn stack_layout(n: usize, spacing: f32) -> Vec<Vec3A> {
+    let gap = SPACING * spacing;
+    (0..n).map(|i| Vec3A::new(0.0, i as f32 * gap, 0.0)).collect()
+}
+
+/// The order slots take the layout's places in (first place first: the
+/// inner ring's front, the inner shell, the line's left end, the stack's
+/// bottom).
+pub fn placement_order(kinds: &[SolidKind], ordering: Ordering, seed: u64) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..kinds.len()).collect();
+    match ordering {
+        Ordering::Listed => {}
+        // stable: equal solids keep their listed order
+        Ordering::Simple => order.sort_by(|&a, &b| kinds[a].complexity().total_cmp(&kinds[b].complexity())),
+        Ordering::Complex => order.sort_by(|&a, &b| kinds[b].complexity().total_cmp(&kinds[a].complexity())),
+        Ordering::Random => fastrand::Rng::with_seed(seed).shuffle(&mut order),
+    }
+    order
 }
 
 /// Compacted ring index per slot (explicit rings honoured, automatic slots
@@ -244,6 +285,23 @@ pub enum Layout {
     Rings,
     /// Concentric spherical shells floating above the ground.
     Sphere,
+    /// One row, evenly spaced, floating above the ground.
+    Line,
+    /// One above another in the centre, the lowest clear of the ground.
+    Stack,
+}
+
+impl Layout {
+    pub const ALL: [Layout; 4] = [Layout::Rings, Layout::Sphere, Layout::Line, Layout::Stack];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Layout::Rings => "rings",
+            Layout::Sphere => "sphere",
+            Layout::Line => "line",
+            Layout::Stack => "stack",
+        }
+    }
 }
 
 impl std::str::FromStr for Layout {
@@ -252,13 +310,75 @@ impl std::str::FromStr for Layout {
         match s.trim().to_ascii_lowercase().as_str() {
             "rings" | "ring" => Ok(Self::Rings),
             "sphere" | "shells" => Ok(Self::Sphere),
-            _ => Err(format!("unknown layout '{s}' (rings|sphere)")),
+            "line" | "row" => Ok(Self::Line),
+            "stack" | "column" | "tower" => Ok(Self::Stack),
+            _ => Err(format!("unknown layout '{s}' (rings|sphere|line|stack)")),
         }
     }
 }
 
+/// Which solid takes which place in the layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Ordering {
+    /// In the order the metrics are listed.
+    #[default]
+    Listed,
+    /// Simplest solid first (fewest edges), most complex last.
+    Simple,
+    /// Most complex first.
+    Complex,
+    /// Shuffled (the same for a given seed).
+    Random,
+}
+
+impl Ordering {
+    pub const ALL: [Ordering; 4] = [Ordering::Listed, Ordering::Simple, Ordering::Complex, Ordering::Random];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Ordering::Listed => "listed",
+            Ordering::Simple => "simple",
+            Ordering::Complex => "complex",
+            Ordering::Random => "random",
+        }
+    }
+}
+
+impl std::str::FromStr for Ordering {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        let s = s.trim().to_ascii_lowercase();
+        Self::ALL.into_iter().find(|o| o.id() == s).ok_or_else(|| format!("unknown ordering '{s}' (listed|simple|complex|random)"))
+    }
+}
+
+/// How the solids are placed: the layout, which solid goes where, and how
+/// far apart.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Arrangement {
+    pub layout: Layout,
+    pub ordering: Ordering,
+    /// Neighbour spacing as a multiple of the standard (1 = as tuned).
+    pub spacing: f32,
+    /// Seed for [`Ordering::Random`].
+    pub seed: u64,
+}
+
+impl Default for Arrangement {
+    fn default() -> Self {
+        Self { layout: Layout::Rings, ordering: Ordering::Listed, spacing: 1.0, seed: 0 }
+    }
+}
+
+/// Spacing range for [`Arrangement::spacing`].
+pub const SPACING_RANGE: (f32, f32) = (0.8, 2.5);
+
 /// Camera distance multiplier for the sphere layout.
 const SPHERE_FRAMING: f32 = 1.45;
+/// Camera distance multiplier for the stack: the camera frames layouts by
+/// their width, and a stack is all height.
+const STACK_FRAMING: f32 = 1.6;
 
 /// Focus mode: a solid must lead the current focus by this much activity...
 const FOCUS_MARGIN: f32 = 0.05;
@@ -306,27 +426,50 @@ impl Scene {
     }
 
     pub fn with_layout(slots: &[SlotLayout], anim: &AnimParams, cam: &CameraParams, layout: Layout) -> Self {
-        let rings: Vec<Option<u32>> = slots.iter().map(|s| s.ring).collect();
+        Self::arranged(slots, anim, cam, &Arrangement { layout, ..Arrangement::default() })
+    }
+
+    /// The scene with its solids placed by `arr`.
+    pub fn arranged(slots: &[SlotLayout], anim: &AnimParams, cam: &CameraParams, arr: &Arrangement) -> Self {
+        let layout = arr.layout;
+        let spacing = if arr.spacing.is_finite() { arr.spacing.clamp(SPACING_RANGE.0, SPACING_RANGE.1) } else { 1.0 };
         let n = slots.len().max(1) as f32;
-        let (ring_pos, ring_index, centroid) = match layout {
+        let mean = |p: &[Vec3A]| p.iter().copied().fold(Vec3A::ZERO, |a, b| a + b) / n;
+        // Lay out the slots in placement order, then hand each its place.
+        let kinds: Vec<SolidKind> = slots.iter().map(|s| s.solid).collect();
+        let order = placement_order(&kinds, arr.ordering, arr.seed);
+        let rings: Vec<Option<u32>> = order.iter().map(|&i| slots[i].ring).collect();
+        let (placed, placed_index, centroid) = match layout {
             Layout::Rings => {
-                let (p, idx) = ring_layout(&rings);
-                let c = p.iter().copied().fold(Vec3A::ZERO, |a, b| a + b) / n;
+                let (p, idx) = ring_layout_spaced(&rings, spacing);
+                let c = mean(&p);
                 (p, idx, c)
             }
-            Layout::Sphere => shell_layout(&rings),
+            Layout::Sphere => shell_layout_spaced(&rings, spacing),
+            Layout::Line | Layout::Stack => {
+                let p = if layout == Layout::Line { line_layout(slots.len(), spacing) } else { stack_layout(slots.len(), spacing) };
+                let c = mean(&p);
+                (p, vec![0; slots.len()], c)
+            }
         };
+        let (mut ring_pos, mut ring_index) = (vec![Vec3A::ZERO; slots.len()], vec![0; slots.len()]);
+        for (k, &i) in order.iter().enumerate() {
+            ring_pos[i] = placed[k];
+            ring_index[i] = placed_index[k];
+        }
         let extent = ring_pos.iter().map(|p| (*p - centroid).length()).fold(0.0, f32::max)
             + BASE_RADIUS * anim.max_scale;
         // Float the solids so their largest halo clears the ground: rings
-        // hover at a fixed height (the camera's aim rises with them); a
-        // sphere of shells is lifted if its lowest halo would dip below.
+        // and lines hover at a fixed height (the camera's aim rises with
+        // them); a sphere of shells or a stack is lifted if its lowest halo
+        // would dip below.
         let max_r = BASE_RADIUS * anim.max_scale.max(anim.min_scale);
         let float_y = max_r * HALO_REACH_MAX + FLOAT_GAP;
+        let grounded = matches!(layout, Layout::Rings | Layout::Line);
         let (mut ring_pos, mut centroid) = (ring_pos, centroid);
         match layout {
-            Layout::Rings => centroid.y += float_y - (max_r + HOVER),
-            Layout::Sphere => {
+            Layout::Rings | Layout::Line => centroid.y += float_y - (max_r + HOVER),
+            Layout::Sphere | Layout::Stack => {
                 let low = ring_pos.iter().map(|p| p.y).fold(f32::INFINITY, f32::min) - max_r * HALO_REACH_MAX;
                 let lift = (FLOAT_GAP - low).max(0.0);
                 for p in &mut ring_pos {
@@ -353,7 +496,11 @@ impl Scene {
         let angles = (0..slots.len()).map(|i| (0.4 + 0.3 * i as f32, 0.7 * i as f32)).collect();
         // A sphere is as tall as it is wide; flat rings appear foreshortened,
         // so the camera framing tuned for rings needs to back off for shells.
-        let frame_extent = if layout == Layout::Sphere { extent * SPHERE_FRAMING } else { extent };
+        let frame_extent = match layout {
+            Layout::Sphere => extent * SPHERE_FRAMING,
+            Layout::Stack => extent * STACK_FRAMING,
+            Layout::Rings | Layout::Line => extent,
+        };
         let rig = CameraRig::new(cam, centroid, frame_extent);
         let light = light_beyond(centroid, k, &rig);
         let span = (anim.max_spin - anim.idle_spin).max(0.0);
@@ -376,7 +523,7 @@ impl Scene {
             ground: Ground::new(&GroundParams::default(), Vec2::new(centroid.x, centroid.z)),
             slab_top: 2.0 * BASE_RADIUS + HOVER,
             max_radius: BASE_RADIUS * anim.max_scale.max(anim.min_scale),
-            grounded: layout == Layout::Rings,
+            grounded,
             focus: None,
             challenger: None,
         };
@@ -697,6 +844,68 @@ mod tests {
     }
 
     #[test]
+    fn line_and_stack_layouts_with_ordering_and_spacing() {
+        let anim = AnimParams::default();
+        let kinds = [SolidKind::Dodecahedron, SolidKind::Tetrahedron, SolidKind::Cube, SolidKind::Icosahedron, SolidKind::Octahedron];
+        let slots: Vec<SlotLayout> = kinds.iter().map(|&solid| SlotLayout { solid, ring: None }).collect();
+        let build = |layout, ordering, spacing| {
+            let arr = Arrangement { layout, ordering, spacing, seed: 7 };
+            let mut s = Scene::arranged(&slots, &anim, &CameraParams::default(), &arr);
+            s.update(&[Channel { available: true, level: 1.0, spin_y: 0.0, spin_x: 0.0, activity: 1.0 }; 5], &anim, 0.1);
+            s
+        };
+        let cx = |s: &Scene| -> Vec<f32> { s.solids.iter().map(|i| i.center.x).collect() };
+        // line: one row along x, evenly spaced, centred, all at one height
+        let line = build(Layout::Line, Ordering::Listed, 1.0);
+        let mut xs = cx(&line);
+        xs.sort_by(f32::total_cmp);
+        for w in xs.windows(2) {
+            assert!((w[1] - w[0] - SPACING).abs() < 1e-4, "even gaps: {xs:?}");
+        }
+        assert!(xs.iter().sum::<f32>().abs() < 1e-3, "centred");
+        assert!(line.solids.iter().all(|i| (i.center.y - line.solids[0].center.y).abs() < 1e-5 && i.center.z.abs() < 1e-5));
+        assert!(line.solids.iter().all(|i| i.center.y - i.scale * HALO_REACH_MAX >= FLOAT_GAP - 1e-3), "halos clear the floor");
+        // listed order runs left to right; simple-first puts the tetrahedron left, the most complex right
+        let x = cx(&line);
+        assert!(x.windows(2).all(|w| w[0] < w[1]), "listed order: {x:?}");
+        let simple = build(Layout::Line, Ordering::Simple, 1.0);
+        let mut by_x: Vec<(f32, SolidKind)> = simple.solids.iter().map(|i| (i.center.x, i.poly.kind())).collect();
+        by_x.sort_by(|a, b| a.0.total_cmp(&b.0));
+        assert!(by_x.windows(2).all(|w| w[0].1.complexity() <= w[1].1.complexity()), "{by_x:?}");
+        assert_eq!(by_x[0].1, SolidKind::Tetrahedron);
+        // spacing doubles the gaps
+        let wide = build(Layout::Line, Ordering::Listed, 2.0);
+        let gap = |s: &Scene| (s.solids[1].center.x - s.solids[0].center.x).abs();
+        assert!((gap(&wide) - 2.0 * gap(&line)).abs() < 1e-4);
+        // stack: one column, evenly spaced, the lowest halo clear of the floor
+        let stack = build(Layout::Stack, Ordering::Complex, 1.0);
+        let mut by_y: Vec<(f32, SolidKind)> = stack.solids.iter().map(|i| (i.center.y, i.poly.kind())).collect();
+        by_y.sort_by(|a, b| a.0.total_cmp(&b.0));
+        assert!(stack.solids.iter().all(|i| i.center.x.abs() < 1e-4 && i.center.z.abs() < 1e-4), "a column");
+        for w in by_y.windows(2) {
+            assert!((w[1].0 - w[0].0 - SPACING).abs() < 1e-4, "even steps");
+            assert!(w[0].1.complexity() >= w[1].1.complexity(), "complex at the bottom: {by_y:?}");
+        }
+        let lowest = stack.solids.iter().map(|i| i.center.y - stack.max_radius * HALO_REACH_MAX).fold(f32::MAX, f32::min);
+        assert!(lowest >= FLOAT_GAP - 1e-3, "lowest halo clear: {lowest}");
+        // random: a permutation, the same for the same seed
+        let k = [SolidKind::Cube; 6];
+        let a = placement_order(&k, Ordering::Random, 3);
+        assert_eq!(a, placement_order(&k, Ordering::Random, 3));
+        let mut sorted = a.clone();
+        sorted.sort();
+        assert_eq!(sorted, (0..6).collect::<Vec<_>>());
+        assert!((0..20).any(|s| placement_order(&k, Ordering::Random, s) != a), "seeds differ");
+        // rings and spheres take ordering too: simple-first puts the simplest solid in slot order's first place
+        let rings = build(Layout::Rings, Ordering::Simple, 1.0);
+        let front = rings.solids.iter().max_by(|a, b| a.center.z.total_cmp(&b.center.z)).unwrap();
+        assert_eq!(front.poly.kind(), SolidKind::Tetrahedron, "first place (the front) holds the simplest");
+        assert!("Line".parse::<Layout>().unwrap() == Layout::Line && "stack".parse::<Layout>().unwrap() == Layout::Stack);
+        assert_eq!("complex".parse::<Ordering>().unwrap(), Ordering::Complex);
+        assert!("sideways".parse::<Ordering>().is_err());
+    }
+
+    #[test]
     fn camera_and_light_scale_with_layout() {
         let anim = AnimParams::default();
         let small = Scene::demo(&anim);
@@ -715,7 +924,9 @@ mod tests {
         use crate::scene::camera::CameraMode;
         let anim = AnimParams::default();
         let tuned = (LIGHT_RADIUS / LIGHT_OFFSET.length()).asin();
-        for (n, layout) in [(5usize, Layout::Rings), (16, Layout::Rings), (16, Layout::Sphere)] {
+        for (n, layout) in
+            [(5usize, Layout::Rings), (16, Layout::Rings), (16, Layout::Sphere), (5, Layout::Line), (16, Layout::Line), (8, Layout::Stack)]
+        {
             let slots: Vec<SlotLayout> =
                 (0..n).map(|i| SlotLayout { solid: SolidKind::ALL[i % SolidKind::ALL.len()], ring: None }).collect();
             for mode in CameraMode::ALL {
