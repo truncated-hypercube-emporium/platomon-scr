@@ -1,4 +1,4 @@
-# platomon 1.3.2
+# platomon 1.3.21
 
 A terminal system monitor: one path-traced polyhedron per metric, rendered in monochrome ASCII on
 concentric rings. Each solid's scale and spin follow its metric; the frame rate (5–150 fps) follows
@@ -340,7 +340,7 @@ At that resolution expect the adaptive quality to drop to `q-1`/`q-2` and tens o
 ## Windows screensaver
 
 **Download:** `platomon.scr` and `platomon-config.exe` are attached to the
-[v1.3.2 release](https://github.com/truncated-hypercube-emporium/platomon-scr/releases/tag/v1.3.2)
+[v1.3.21 release](https://github.com/truncated-hypercube-emporium/platomon-scr/releases/tag/v1.3.21)
 (64-bit Windows 10/11, no installer, no dependencies). To build them yourself,
 `scripts\build-scr.ps1` writes both to `dist\`.
 
@@ -350,13 +350,18 @@ Screen saver. `platomon-config.exe` opens the same settings dialog as the Settin
 The `install` folder has both files and `install-platomon-scr.bat`, which moves them there (asking for
 administrator rights).
 
+**New in 1.3.21:**
+
+- **Tags follow their solids**: instead of fixed places on a ring, each tag travels with its solid, placed for the solid at full size so it doesn't move as the solid grows and shrinks with its load (only the camera moves it), three rows past the halo's room. Leader lines are short diagonals that never cross any tag's text.
+
 **New in 1.3.2:**
 
 - **Solid tags** (on by default; *Solid tags* in the dialog): each solid's metric (`__RAM 42%__`)
-  floats at a fixed place around the upper edge of the picture, on a ring 75% of the way from the
-  centre to the edges, above its solid and in the solids' left-to-right order. A leader line (`/`,
-  `\`, `|` or `_`) follows the solid as it moves and stops at its halo, wireframe or surface. Tags
-  are drawn over everything and redrawn on halo-only frames too.
+  travels with its solid, just above it on the diagonal toward the edge of the picture, clear of
+  the room its halo needs. The text runs outward and a short diagonal leader line (`/`, `\`, or `|`
+  when steep; never horizontal) spans only the gap from the tag's inner corner to the solid's halo,
+  wireframe or surface. Tags keep their side until a solid is well past the centre, avoid each
+  other and the picture's edges, and are drawn over everything, halo-only frames included.
 - **Tag colour** (*Tag colour*): the complementary hue of the colour theme (default), a tint of the
   theme itself, or white; every choice is lifted to at least 11:1 contrast against the black
   background. Monochrome tags use the normal text colour.
