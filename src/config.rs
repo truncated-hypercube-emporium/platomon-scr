@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use crate::aspect::AspectMode;
 use crate::clock::FpsCurve;
-use crate::color::{self, ColorBy, ColorMap, Gradient};
+use crate::color::{self, ColorBy, ColorMap, Gradient, HaloColor};
 use crate::scene::Layout;
 use crate::metrics::{MetricKind, MetricSpec};
 use crate::overlay::{LEGEND_SIZE_MAX, LEGEND_SIZE_MIN, LegendParams, LegendPos};
@@ -153,6 +153,10 @@ pub struct Config {
     /// Fixed tag length: tags placed for each solid's current size so the
     /// leader keeps one length, growing only to keep tags off other solids.
     pub tag_fixed_len: bool,
+    /// Sound halo colour (with a gradient on): `under` (what it passes
+    /// over), `solid` (its own solid's colour), `size` (quiet → loud along
+    /// the gradient) or `bass`. The halo itself is the screensaver's.
+    pub halo_color: HaloColor,
     /// RNG seed for random choices (orbit direction); unset = random.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seed: Option<u64>,
@@ -244,6 +248,7 @@ impl Default for Config {
             auto_distance: false,
             far_ground: false,
             tag_fixed_len: false,
+            halo_color: HaloColor::Under,
             camera: CameraMode::Static,
             orbit_period: 60.0,
             orbit_dir: OrbitDir::Random,

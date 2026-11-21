@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
 use crate::ascii::{self, Ramp};
-use crate::color::{self, ColorMap};
+use crate::color::{self, ColorMap, HaloColor};
 use crate::render::FrameView;
 use crate::scene::Scene;
 use crate::scene::sdf::SolidKind;
@@ -370,6 +370,9 @@ pub struct Overlays {
     /// Cells the halo currently covers, as a mask and as a list.
     halo_mask: Vec<bool>,
     halo_cells: Vec<usize>,
+    /// Per cell, the solid whose halo was drawn there (valid where
+    /// `halo_mask` is set).
+    halo_owner: Vec<u8>,
     scratch: Vec<usize>,
     dirty: Vec<usize>,
     tags: TagState,
@@ -398,6 +401,8 @@ pub struct OverlayOptions<'a> {
     /// Per-slot halo sizes overriding `halo.factor` (empty = all solids use
     /// `halo.factor`).
     pub halo_factors: &'a [f32],
+    /// What the halo's colour comes from (with colour on).
+    pub halo_color: HaloColor,
     /// Solid tags: each solid's label floats at a fixed place on screen with
     /// a leader line to the solid ([`TagState`]), on top of everything.
     pub tags: bool,
@@ -938,6 +943,15 @@ fn draw_tags(
 }
 
 impl OverlayOptions<'_> {
+    /// Solid `i`'s halo size as a level 0..=1 (smallest to largest of its
+    /// swing).
+    fn halo_level(&self, i: usize) -> f32 {
+        let Some(hl) = self.halo else { return 0.0 };
+        let f = self.halo_factors.get(i).copied().unwrap_or(hl.factor);
+        let swing = hl.reach - HALO_BASE;
+        if swing > 1e-4 { (0.5 + 0.5 * (f - HALO_BASE) / swing).clamp(0.0, 1.0) } else { 0.5 }
+    }
+
     /// Halo size per solid, or `None` without a halo.
     fn halo_sizes(&self) -> Option<Vec<f32>> {
         self.halo.map(|hl| {
@@ -1005,10 +1019,26 @@ fn cell_color(cm: &ColorMap, frame: &FrameView<'_>, ramp: &Ramp, levels: &[f32],
     }
 }
 
+/// Colour of halo cell `c` (brightness `l`) drawn for solid `owner`, by
+/// `opt.halo_color`.
+fn halo_cell_color(cm: &ColorMap, opt: &OverlayOptions<'_>, frame: &FrameView<'_>, n_solids: usize, owner: usize, c: usize, l: f32) -> u32 {
+    let (lvl, nr) = (opt.ramp.level(l), opt.ramp.len());
+    match opt.halo_color {
+        HaloColor::Under => cell_color(cm, frame, opt.ramp, opt.levels, n_solids, c, l),
+        HaloColor::Solid if cm.solid.is_some() => cm.solid_color(opt.levels.get(owner).copied(), l, lvl, nr),
+        HaloColor::Solid => cm.bg_color(l),
+        HaloColor::Size => cm.value_color(opt.halo_level(owner), lvl, nr),
+        HaloColor::Bass => {
+            let bass = opt.halo.map_or(0.0, |hl| (hl.lum - HALO_LUM_MIN) / (1.0 - HALO_LUM_MIN));
+            cm.value_color(bass.clamp(0.0, 1.0), lvl, nr)
+        }
+    }
+}
+
 /// Mark every visible edge cell of every solid's wire model scaled by
 /// `factors[i]` for solid `i` (1 = the solid itself; past the end of
 /// `factors`, its last value) in `mask`; newly marked cells are also pushed
-/// to `list`.
+/// to `list`, and their solid's index written to `owner`.
 #[allow(clippy::too_many_arguments)]
 fn mark_edges(
     wires: &[Wire],
@@ -1019,6 +1049,7 @@ fn mark_edges(
     factors: &[f32],
     mask: &mut [bool],
     mut list: Option<&mut Vec<usize>>,
+    mut owner: Option<&mut [u8]>,
 ) {
     if frame.depth.len() < w * h || frame.ids.len() < w * h || mask.len() < w * h {
         return;
@@ -1062,6 +1093,9 @@ fn mark_edges(
                     if let Some(l) = list.as_deref_mut() {
                         l.push(c);
                     }
+                    if let Some(slot) = owner.as_deref_mut().and_then(|o| o.get_mut(c)) {
+                        *slot = i as u8;
+                    }
                 }
             }
         }
@@ -1086,6 +1120,7 @@ impl Overlays {
             base: Vec::new(),
             halo_mask: Vec::new(),
             halo_cells: Vec::new(),
+            halo_owner: Vec::new(),
             scratch: Vec::new(),
             dirty: Vec::new(),
             tags: TagState::default(),
@@ -1127,16 +1162,25 @@ impl Overlays {
             }
             let mut fresh = std::mem::take(&mut self.scratch);
             fresh.clear();
+            self.halo_owner.resize(w * h, 0);
             if let Some(sizes) = opt.halo_sizes() {
-                mark_edges(&self.wires, frame, w, h, scene, &sizes, &mut self.halo_mask, Some(&mut fresh));
+                mark_edges(&self.wires, frame, w, h, scene, &sizes, &mut self.halo_mask, Some(&mut fresh), Some(&mut self.halo_owner));
             }
             let lum_on = opt.halo.map_or(0.0, |hl| hl.lum);
+            let n = scene.solids.len();
             for &c in self.halo_cells.iter().chain(&fresh) {
-                let l = if self.halo_mask[c] { lum_on } else { self.base[c] };
+                let on = self.halo_mask[c];
+                let l = if on { lum_on } else { self.base[c] };
                 self.journal.touch(c, &self.cells, colors);
                 self.cells[c] = opt.ramp.glyph(l);
                 if let Some(slot) = colors.get_mut(c) {
-                    *slot = opt.color.map_or(color::NONE, |cm| cell_color(cm, frame, opt.ramp, opt.levels, scene.solids.len(), c, l));
+                    *slot = opt.color.map_or(color::NONE, |cm| {
+                        if on {
+                            halo_cell_color(cm, opt, frame, n, self.halo_owner[c] as usize, c, l)
+                        } else {
+                            cell_color(cm, frame, opt.ramp, opt.levels, n, c, l)
+                        }
+                    });
                 }
             }
             self.scratch = std::mem::replace(&mut self.halo_cells, fresh);
@@ -1238,7 +1282,7 @@ impl Overlays {
         if opt.wireframe {
             self.mask.clear();
             self.mask.resize(w * h, false);
-            mark_edges(&self.wires, frame, w, h, scene, &[1.0], &mut self.mask, None);
+            mark_edges(&self.wires, frame, w, h, scene, &[1.0], &mut self.mask, None, None);
             for (l, &m) in self.lum.iter_mut().zip(&self.mask) {
                 if m {
                     *l = invert(*l);
@@ -1259,9 +1303,11 @@ impl Overlays {
         self.halo_mask.clear();
         self.halo_mask.resize(w * h, false);
         self.halo_cells.clear();
+        self.halo_owner.clear();
+        self.halo_owner.resize(w * h, 0);
         if let (Some(hl), Some(sizes)) = (opt.halo, opt.halo_sizes()) {
             self.base.clone_from(&self.lum);
-            mark_edges(&self.wires, frame, w, h, scene, &sizes, &mut self.halo_mask, Some(&mut self.halo_cells));
+            mark_edges(&self.wires, frame, w, h, scene, &sizes, &mut self.halo_mask, Some(&mut self.halo_cells), Some(&mut self.halo_owner));
             for &c in &self.halo_cells {
                 self.lum[c] = hl.lum;
             }
@@ -1270,6 +1316,12 @@ impl Overlays {
         }
         if let Some(cm) = opt.color {
             self.shade_colorize(cm, frame, ramp, opt.levels, scene.solids.len());
+            if opt.halo_color != HaloColor::Under {
+                let n = scene.solids.len();
+                for &c in &self.halo_cells {
+                    self.colors[c] = halo_cell_color(cm, opt, frame, n, self.halo_owner[c] as usize, c, self.lum[c]);
+                }
+            }
             if let Some((_, panel)) = &panel {
                 // Panel background stays uncoloured so labels read clearly.
                 for y in panel.y..panel.y + panel.h {
@@ -1464,6 +1516,7 @@ mod tests {
             levels: &levels,
             halo,
             halo_factors: &[],
+            halo_color: Default::default(),
             tags: false,
             tag_labels: &[],
             tag_ink: color::NONE,
@@ -1569,6 +1622,7 @@ mod tests {
             levels: &[],
             halo,
             halo_factors: &[],
+            halo_color: Default::default(),
             tags: true,
             tag_labels: labels,
             tag_ink: color::NONE,
@@ -2041,6 +2095,7 @@ mod tests {
                 levels: &levels,
                 halo,
                 halo_factors: &[],
+                halo_color: Default::default(),
                 tags: false,
                 tag_labels: &[],
                 tag_ink: color::NONE,
@@ -2080,6 +2135,82 @@ mod tests {
     }
 
     #[test]
+    fn halo_colour_sources() {
+        use crate::color::Gradient;
+        let scene = Scene::demo(&AnimParams::default());
+        let mut r = Renderer::new();
+        r.render(&scene, W, H, &RenderSettings { spp: 1, ..RenderSettings::default() });
+        let view = r.view().unwrap();
+        let ramp = Ramp::default();
+        let levels = [0.1f32, 0.3, 0.5, 0.7, 0.9];
+        let g = Gradient::parse("rainbow").unwrap();
+        for by in [ColorBy::Load, ColorBy::Lum] {
+            let cm = ColorMap::new(Some(g.clone()), by, 32, Some(g.clone())).unwrap();
+            let opt = |src: HaloColor, halo: Halo, factors: &'static [f32]| OverlayOptions {
+                wireframe: false,
+                legend: None,
+                labels: &[],
+                char_aspect: 0.5,
+                ramp: &ramp,
+                exposure: 1.0,
+                color: Some(&cm),
+                levels: &levels,
+                halo: Some(halo),
+                halo_factors: factors,
+                halo_color: src,
+                tags: false,
+                tag_labels: &[],
+                tag_ink: color::NONE,
+                tag_blocks: false,
+                tag_fixed: false,
+            };
+            let loud = Halo { factor: 1.2, lum: 1.0, reach: 1.5 };
+            let quiet = Halo { lum: HALO_LUM_MIN, ..loud };
+            let draw = |o: &OverlayOptions<'_>| {
+                let mut ov = Overlays::new(&scene);
+                let colors = ov.compose(&view, W, H, &scene, o).colors.unwrap().to_vec();
+                (ov.halo_cells.clone(), ov.halo_owner.clone(), colors)
+            };
+            // under: the colour of what lies beneath, as before
+            let (cells, _, under) = draw(&opt(HaloColor::Under, loud, &[]));
+            assert!(cells.len() > 50, "{by:?}: a halo is drawn");
+            for &c in &cells {
+                assert_eq!(under[c], cell_color(&cm, &view, &ramp, &levels, 5, c, 1.0));
+            }
+            // solid: each cell its own solid's colour, also over the background
+            let (cells, owner, solid) = draw(&opt(HaloColor::Solid, loud, &[]));
+            let over_bg = cells.iter().filter(|&&c| view.ids[c] as usize >= 5).count();
+            assert!(over_bg > 10, "{by:?}: some halo lies over the background");
+            for &c in &cells {
+                let o = owner[c] as usize;
+                assert_eq!(solid[c], cm.solid_color(Some(levels[o]), 1.0, ramp.level(1.0), ramp.len()), "{by:?} cell {c}");
+            }
+            if by == ColorBy::Load {
+                assert!(cells.iter().any(|&c| solid[c] != under[c]), "solid differs from under somewhere");
+            }
+            // size: a large halo and a small one sit at opposite ends of the gradient
+            let (cells, owner, big) = draw(&opt(HaloColor::Size, loud, &[1.5, 0.9, 1.2, 1.2, 1.2]));
+            let of = |k: usize| cells.iter().find(|&&c| owner[c] as usize == k).map(|&c| big[c]).unwrap();
+            assert_ne!(of(0), of(1), "{by:?}: size colours differ");
+            assert_eq!(of(0), cm.value_color(1.0, ramp.level(1.0), ramp.len()));
+            assert_eq!(of(1), cm.value_color(0.0, ramp.level(1.0), ramp.len()));
+            // bass: one colour for all, following the bass level
+            let (cells, _, b_loud) = draw(&opt(HaloColor::Bass, loud, &[]));
+            let (cells_q, _, b_quiet) = draw(&opt(HaloColor::Bass, quiet, &[]));
+            assert!(cells.iter().all(|&c| b_loud[c] == b_loud[cells[0]]), "{by:?}: one bass colour");
+            assert_ne!(b_loud[cells[0]], b_quiet[cells_q[0]], "{by:?}: bass colour follows the level");
+            // halo-only updates agree with a full compose in every mode
+            for src in HaloColor::ALL {
+                let mut inc = Overlays::new(&scene);
+                inc.compose(&view, W, H, &scene, &opt(src, quiet, &[]));
+                let u = inc.update_halo(&view, W, H, &scene, &opt(src, loud, &[1.4, 1.0, 1.2, 1.3, 1.1])).colors.unwrap().to_vec();
+                let full = Overlays::new(&scene).compose(&view, W, H, &scene, &opt(src, loud, &[1.4, 1.0, 1.2, 1.3, 1.1])).colors.unwrap().to_vec();
+                assert_eq!(u, full, "{by:?} {src:?}: incremental matches full");
+            }
+        }
+    }
+
+    #[test]
     fn per_solid_halo_sizes_move_only_their_solid() {
         let scene = Scene::demo(&AnimParams::default());
         let mut r = Renderer::new();
@@ -2098,6 +2229,7 @@ mod tests {
             levels: &[],
             halo: Some(Halo { factor: 1.2, lum: 1.0, reach: TAG_CLEAR_HALO }),
             halo_factors: f,
+            halo_color: Default::default(),
             tags: false,
             tag_labels: &[],
             tag_ink: color::NONE,

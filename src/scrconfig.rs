@@ -62,6 +62,12 @@ unsafe extern "system" {
         param: *const std::ffi::c_void,
     ) -> HWND;
     fn MessageBoxW(h: HWND, text: *const u16, caption: *const u16, flags: u32) -> i32;
+    fn MoveWindow(h: HWND, x: i32, y: i32, w: i32, h_: i32, repaint: i32) -> i32;
+    fn GetWindowRect(h: HWND, r: *mut Rect) -> i32;
+    fn MapWindowPoints(from: HWND, to: HWND, pts: *mut Rect, n: u32) -> i32;
+    fn MapDialogRect(h: HWND, r: *mut Rect) -> i32;
+    fn SetTimer(h: HWND, id: usize, ms: u32, f: isize) -> usize;
+    fn KillTimer(h: HWND, id: usize) -> i32;
 }
 
 #[link(name = "kernel32")]
@@ -91,6 +97,15 @@ struct ToolInfo {
     instance: isize,
     text: *mut u16,
     lparam: isize,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct Rect {
+    l: i32,
+    t: i32,
+    r: i32,
+    b: i32,
 }
 
 #[repr(C)]
@@ -137,6 +152,13 @@ pub fn log_path() -> PathBuf {
 /// `configuration.log` beside the settings file.
 pub fn prefs_path() -> PathBuf {
     ini_path().with_file_name("configuration.log")
+}
+
+/// `preview.ini` beside the settings file: the dialog's current settings
+/// while a preview runs ([`screensaver::preview_text`]); the preview reads
+/// it a few times a second.
+pub fn preview_path() -> PathBuf {
+    ini_path().with_file_name("preview.ini")
 }
 
 fn read_text(p: &std::path::Path) -> String {
@@ -314,6 +336,10 @@ const ID_DETAILS: i32 = 1700;
 const ID_LOAD: i32 = 1701;
 const ID_EMPTY: i32 = 1702;
 const ID_APPLY: i32 = 1204;
+const ID_PREVIEW: i32 = 1205;
+const ID_FULLSCREEN: i32 = 1206;
+/// Timer that notices a preview closing.
+const PREVIEW_TIMER: usize = 1;
 /// Tuning dialog: row `k`'s slider, value text and reset button.
 const ID_TUNE: i32 = 2000;
 const ID_TUNE_VALUE: i32 = 2100;
@@ -325,6 +351,8 @@ const ID_STATIC: u16 = 0xFFFF;
 /// Log rows shown at most (pinned and unpinned, newest first).
 const LOG_ROWS_MAX: usize = 20;
 
+const WM_DESTROY: u32 = 0x0002;
+const WM_TIMER: u32 = 0x0113;
 const WM_INITDIALOG: u32 = 0x0110;
 const WM_COMMAND: u32 = 0x0111;
 const WM_HSCROLL: u32 = 0x0114;
@@ -416,7 +444,13 @@ fn main_tips() -> Vec<(i32, String)> {
     for (id, key) in [(ID_SHIFT, "shift"), (ID_SHIFT_MIN, "shift_min_frames"), (ID_SHIFT_MAX, "shift_max_frames"), (ID_RADIUS, "shift_radius"), (ID_RADIUS_VALUE, "shift_radius")] {
         v.push((id, help(key).into()));
     }
-    let buttons: [(i32, &str); 8] = [
+    let buttons: [(i32, &str); 10] = [
+        (
+            ID_PREVIEW,
+            "Show these settings in a window at half the screen's size (half the render resolution); edits show live. Click inside it to close it. \
+             Reads Restart when an edit (CPU budget, text density, frame-rate cap) needs a new preview.",
+        ),
+        (ID_FULLSCREEN, "Preview full screen at full resolution instead; the mouse is ignored, press any key to close it."),
         (ID_APPLY, "Save the settings and log them without closing the dialog."),
         (ID_DEFAULTS, "Load your saved defaults (from Set as default), or the built-in ones when none are saved. Nothing is saved until OK."),
         (ID_SET_DEFAULT, "Save the settings shown as your defaults, in configuration.log beside the settings file."),
@@ -674,6 +708,8 @@ fn build_template_counted() -> (Vec<u32>, usize) {
     t.item(BS_PUSHBUTTON | WS_TABSTOP, (10, by, 52, 14), ID_DEFAULTS as u16, BUTTON, "&Defaults");
     t.item(BS_PUSHBUTTON | WS_TABSTOP, (66, by, 66, 14), ID_SET_DEFAULT as u16, BUTTON, "&Set as default");
     t.item(BS_PUSHBUTTON | WS_TABSTOP, (136, by, 70, 14), ID_TUNING as u16, BUTTON, "&Tuning...");
+    t.item(BS_PUSHBUTTON | WS_TABSTOP, (210, by, 44, 14), ID_PREVIEW as u16, BUTTON, "&Preview");
+    t.item(BS_AUTOCHECKBOX | WS_TABSTOP, (258, by + 2, 54, 10), ID_FULLSCREEN as u16, BUTTON, "&Fullscreen");
     t.item(BS_PUSHBUTTON | WS_TABSTOP, (DLG_W - 182, by, 55, 14), ID_APPLY as u16, BUTTON, "&Apply");
     t.item(BS_DEFPUSHBUTTON | WS_TABSTOP, (DLG_W - 122, by, 55, 14), IDOK as u16, BUTTON, "OK");
     t.item(BS_PUSHBUTTON | WS_TABSTOP, (DLG_W - 62, by, 55, 14), IDCANCEL as u16, BUTTON, "Cancel");
@@ -728,6 +764,122 @@ struct Ui {
     /// Entry id per log row.
     rows: Vec<u64>,
     selected: Option<u64>,
+    preview: Option<Preview>,
+}
+
+/// A running preview.
+struct Preview {
+    child: std::process::Child,
+    /// The settings and full-screen choice it started with.
+    started: ScrSettings,
+    fullscreen: bool,
+    /// What the preview file holds now.
+    sent: String,
+}
+
+/// What the Preview button should read for the dialog's `edited`
+/// settings: `Restart` once a running preview cannot show them (or the
+/// full-screen choice changed).
+fn preview_button_text(p: Option<(&ScrSettings, bool)>, edited: Option<&ScrSettings>, fullscreen: bool) -> &'static str {
+    match (p, edited) {
+        (Some((started, full)), Some(e)) if full != fullscreen || screensaver::preview_needs_restart(started, e) => "&Restart",
+        (Some((_, full)), None) if full != fullscreen => "&Restart",
+        _ => "&Preview",
+    }
+}
+
+/// The program that shows previews: this one when it is the screensaver,
+/// else `platomon.scr` beside it.
+fn preview_program() -> Result<PathBuf, String> {
+    let me = std::env::current_exe().map_err(|e| format!("cannot find this program: {e}"))?;
+    if me.extension().is_some_and(|x| x.eq_ignore_ascii_case("scr")) {
+        return Ok(me);
+    }
+    let scr = me.with_file_name("platomon.scr");
+    if scr.exists() { Ok(scr) } else { Err(format!("The preview needs platomon.scr beside this program ({}).", scr.display())) }
+}
+
+/// End the preview, if one runs.
+fn stop_preview() {
+    if let Some(mut p) = UI.with(|u| u.borrow_mut().preview.take()) {
+        let _ = p.child.kill();
+        let _ = p.child.wait();
+    }
+}
+
+/// Forget a preview that has closed by itself.
+fn reap_preview() {
+    UI.with(|u| {
+        let mut u = u.borrow_mut();
+        if u.preview.as_mut().is_some_and(|p| !matches!(p.child.try_wait(), Ok(None))) {
+            u.preview = None;
+        }
+    });
+}
+
+/// (Re)start the preview with the dialog's settings.
+unsafe fn start_preview(h: HWND) {
+    // SAFETY: `h` is our dialog.
+    let s = match unsafe { read(h) } {
+        Ok(s) => s,
+        Err(e) => {
+            // SAFETY: valid strings; `h` is our dialog.
+            unsafe { MessageBoxW(h, wide(&e).as_ptr(), wide("platomon").as_ptr(), MB_ICONWARNING) };
+            return;
+        }
+    };
+    // SAFETY: control id from our template.
+    let fullscreen = unsafe { IsDlgButtonChecked(h, ID_FULLSCREEN) } == 1;
+    stop_preview();
+    let text = screensaver::preview_text(&s);
+    let started = write_text(&preview_path(), &text).and_then(|_| preview_program()).and_then(|exe| {
+        let mut cmd = std::process::Command::new(exe);
+        cmd.arg("/w");
+        if fullscreen {
+            cmd.arg("full");
+        }
+        cmd.spawn().map_err(|e| format!("cannot start the preview: {e}"))
+    });
+    match started {
+        Ok(child) => {
+            UI.with(|u| u.borrow_mut().preview = Some(Preview { child, started: s, fullscreen, sent: text }));
+            status(
+                h,
+                if fullscreen {
+                    "Previewing full screen: edits show live; press any key to close it."
+                } else {
+                    "Previewing: edits show live; click inside the preview to close it."
+                },
+            );
+        }
+        Err(e) => {
+            // SAFETY: valid strings; `h` is our dialog.
+            unsafe { MessageBoxW(h, wide(&e).as_ptr(), wide("platomon").as_ptr(), MB_ICONWARNING) };
+        }
+    }
+    // SAFETY: `h` is our dialog.
+    unsafe { sync_preview(h) };
+}
+
+/// Send the dialog's settings to a running preview (when they changed) and
+/// set the Preview button's text.
+unsafe fn sync_preview(h: HWND) {
+    reap_preview();
+    // SAFETY: `h` is our dialog; control ids from our template.
+    let (edited, fullscreen) = unsafe { (read(h).ok(), IsDlgButtonChecked(h, ID_FULLSCREEN) == 1) };
+    let label = UI.with(|u| {
+        let mut u = u.borrow_mut();
+        let Some(p) = u.preview.as_mut() else { return preview_button_text(None, None, fullscreen) };
+        if let Some(e) = &edited {
+            let text = screensaver::preview_text(e);
+            if text != p.sent && write_text(&preview_path(), &text).is_ok() {
+                p.sent = text;
+            }
+        }
+        preview_button_text(Some((&p.started, p.fullscreen)), edited.as_ref(), fullscreen)
+    });
+    // SAFETY: control id from our template.
+    unsafe { SetDlgItemTextW(h, ID_PREVIEW, wide(label).as_ptr()) };
 }
 
 thread_local! {
@@ -931,6 +1083,34 @@ fn refresh_log(h: HWND) {
             }
         }
         ShowWindow(GetDlgItem(h, ID_EMPTY), if rows.is_empty() { SW_SHOW } else { SW_HIDE });
+        fit_details(h, rows.len());
+    }
+}
+
+/// Top of the details box, dialog units, with `rows` log rows shown: just
+/// under the last row (or under the "no entries" note), so the box takes
+/// all the room the unused rows would.
+fn details_top(rows: usize) -> i16 {
+    34 + rows.clamp(2, LOG_ROWS_MAX) as i16 * 12 + 2
+}
+
+/// Stretch the details box up to [`details_top`]; its bottom stays put.
+unsafe fn fit_details(h: HWND, rows: usize) {
+    // SAFETY: `h` is our dialog and the details box one of its controls;
+    // the rects are valid out pointers.
+    unsafe {
+        let d = GetDlgItem(h, ID_DETAILS);
+        if d == 0 {
+            return;
+        }
+        let mut r = Rect::default();
+        GetWindowRect(d, &mut r);
+        MapWindowPoints(0, h, &mut r, 2);
+        let mut top = Rect { t: details_top(rows) as i32, ..Rect::default() };
+        MapDialogRect(h, &mut top);
+        if top.t < r.b - 20 {
+            MoveWindow(d, r.l, top.t, r.r - r.l, r.b - top.t, 1);
+        }
     }
 }
 
@@ -994,7 +1174,21 @@ pub unsafe extern "system" fn ScreenSaverConfigureDialog(h: HWND, msg: u32, w: u
                 fill(h, &load());
                 refresh_log(h);
                 add_tips(h, &main_tips());
+                SetTimer(h, PREVIEW_TIMER, 500, 0);
                 1
+            }
+            WM_TIMER => {
+                // notice a preview that was closed
+                if UI.with(|u| u.borrow().preview.is_some()) {
+                    sync_preview(h);
+                }
+                0
+            }
+            WM_DESTROY => {
+                KillTimer(h, PREVIEW_TIMER);
+                stop_preview();
+                let _ = std::fs::remove_file(preview_path());
+                0
             }
             WM_HSCROLL => {
                 let id = GetDlgCtrlID(l as HWND);
@@ -1006,11 +1200,17 @@ pub unsafe extern "system" fn ScreenSaverConfigureDialog(h: HWND, msg: u32, w: u
                     let pos = SendDlgItemMessageW(h, id, TBM_GETPOS, 0, 0).max(0) as usize;
                     show_slider(h, ID_VALUE + (id - ID_COMBO), c, pos);
                 }
+                sync_preview(h);
                 0
             }
             WM_COMMAND => {
                 let (id, code) = ((w & 0xFFFF) as i32, (w >> 16) & 0xFFFF);
-                match id {
+                // every edit goes to a running preview
+                let r = match id {
+                    ID_PREVIEW if code == BN_CLICKED => {
+                        start_preview(h);
+                        1
+                    }
                     IDOK => {
                         if save_and_log(h) {
                             EndDialog(h, 1);
@@ -1135,7 +1335,11 @@ pub unsafe extern "system" fn ScreenSaverConfigureDialog(h: HWND, msg: u32, w: u
                         1
                     }
                     _ => 0,
+                };
+                if !matches!(id, IDOK | IDCANCEL) {
+                    sync_preview(h);
                 }
+                r
             }
             _ => 0,
         }
@@ -1308,6 +1512,20 @@ mod tests {
         assert_eq!(tips.len(), TUNABLES.len() * 4 + 3);
         assert!(main_tips().iter().all(|(_, t)| !t.is_empty()));
         assert_eq!(TIP_DELAY_MS, 2000);
+    }
+
+    #[test]
+    fn preview_button_reads_restart_only_when_an_edit_needs_it() {
+        let s = ScrSettings::default();
+        assert_eq!(preview_button_text(None, Some(&s), false), "&Preview", "nothing running");
+        assert_eq!(preview_button_text(None, Some(&s), true), "&Preview");
+        let live = ScrSettings { sound: false, camera: crate::scene::camera::CameraMode::Tilt, ..s.clone() };
+        assert_eq!(preview_button_text(Some((&s, false)), Some(&live), false), "&Preview", "shown live");
+        let text_size = ScrSettings { density: 1, ..s.clone() };
+        assert_eq!(preview_button_text(Some((&s, false)), Some(&text_size), false), "&Restart");
+        assert_eq!(preview_button_text(Some((&s, false)), Some(&s), true), "&Restart", "full-screen choice changed");
+        assert_eq!(preview_button_text(Some((&s, true)), None, true), "&Preview", "unreadable edits keep the label");
+        assert!(preview_path().ends_with(r"platomon\preview.ini"));
     }
 
     #[test]

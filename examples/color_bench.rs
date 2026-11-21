@@ -170,6 +170,7 @@ fn main() {
                     levels,
                     halo: None,
                     halo_factors: &[],
+                    halo_color: Default::default(),
                     tags: false,
                     tag_labels: &[],
                     tag_ink: platomon::color::NONE,

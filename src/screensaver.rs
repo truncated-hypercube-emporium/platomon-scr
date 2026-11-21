@@ -238,6 +238,46 @@ pub struct Plan {
 /// Random look, then the user's fixed choices from `s` on top; frame-rate
 /// cap and CPU budget from `s`; text size from a speed test.
 pub fn plan(d: &Display, seed: u64, s: &ScrSettings) -> Result<Plan, String> {
+    let config = plan_config(d, seed, s);
+    let spc = seconds_per_cell(&config)?;
+    let budget = s.budget_pct as f32 / 100.0;
+    let (px, ..) = font_height(d, config.fps_max, spc, budget);
+    let (font_px, cols, rows) = apply_density(d, px, s.density);
+    Ok(Plan { config, font_px, est_grid: (cols, rows), sec_per_cell: spc, budget, settings: s.clone() })
+}
+
+/// The settings a running preview cannot pick up: they set the text size
+/// (CPU budget, density, and the frame-rate cap the budget is spread
+/// over), which is fixed once its window is made.
+pub const PREVIEW_RESTART_KEYS: [&str; 3] = ["budget", "density", "fps_cap"];
+
+/// Whether `edited` changes a setting the preview started with `running`
+/// cannot apply live (see [`PREVIEW_RESTART_KEYS`]).
+pub fn preview_needs_restart(running: &ScrSettings, edited: &ScrSettings) -> bool {
+    (running.budget_pct, running.density, running.fps_cap) != (edited.budget_pct, edited.density, edited.fps_cap)
+}
+
+/// `edited` as a running preview applies it: everything but the
+/// [`PREVIEW_RESTART_KEYS`], which stay as `running` had them.
+pub fn preview_live(running: &ScrSettings, edited: &ScrSettings) -> ScrSettings {
+    ScrSettings { budget_pct: running.budget_pct, density: running.density, fps_cap: running.fps_cap, ..edited.clone() }
+}
+
+/// Settings as the preview file holds them: one `key=value` per line.
+pub fn preview_text(s: &ScrSettings) -> String {
+    s.to_pairs().into_iter().filter(|(_, v)| !v.is_empty()).map(|(k, v)| format!("{k}={v}\n")).collect()
+}
+
+/// Settings from [`preview_text`] (defaults for anything missing).
+pub fn preview_settings(text: &str) -> ScrSettings {
+    let pairs: Vec<(&str, &str)> = text.lines().filter_map(|l| l.split_once('=')).map(|(k, v)| (k.trim(), v.trim())).collect();
+    ScrSettings::from_lookup(|k| pairs.iter().find(|(pk, _)| *pk == k).map(|(_, v)| v.to_string()))
+}
+
+/// The run's config for `s`: [`plan`] without the speed test and text size
+/// (a running preview re-plans with this when the settings change; the
+/// same seed keeps the same random look).
+pub fn plan_config(d: &Display, seed: u64, s: &ScrSettings) -> Config {
     let mut rng = fastrand::Rng::with_seed(seed);
     let mut config = randomize(&mut rng, d);
     s.apply(&mut config);
@@ -250,6 +290,7 @@ pub fn plan(d: &Display, seed: u64, s: &ScrSettings) -> Result<Plan, String> {
     config.auto_distance = s.auto_distance;
     config.far_ground = s.far_ground;
     config.tag_fixed_len = s.tag_fixed;
+    config.halo_color = s.halo_color;
     for &(k, v) in &s.tuning {
         set_tunable(&mut config, k, v);
     }
@@ -258,16 +299,12 @@ pub fn plan(d: &Display, seed: u64, s: &ScrSettings) -> Result<Plan, String> {
         None => fps_for(d),
     };
     config.sanitize();
-    let spc = seconds_per_cell(&config)?;
     match s.levels {
         Levels::L8 => config.ramp = crate::ascii::RAMP_8.to_string(),
         Levels::L16 => config.ramp = crate::ascii::DEFAULT_RAMP.to_string(),
         Levels::L32 => config.ramp = crate::ascii::RAMP_32.to_string(),
     }
-    let budget = s.budget_pct as f32 / 100.0;
-    let (px, ..) = font_height(d, config.fps_max, spc, budget);
-    let (font_px, cols, rows) = apply_density(d, px, s.density);
-    Ok(Plan { config, font_px, est_grid: (cols, rows), sec_per_cell: spc, budget, settings: s.clone() })
+    config
 }
 
 impl Plan {
@@ -413,6 +450,8 @@ pub struct ScrSettings {
     /// spectrum, the simplest solid to the bass and the most complex to the
     /// treble; off = every halo follows the overall level.
     pub halo_bands: bool,
+    /// What the halo's colour comes from (with a colour gradient on).
+    pub halo_color: color::HaloColor,
     /// Dynamic camera distance: move in and out to keep every solid in frame.
     pub auto_distance: bool,
     /// Extended floor: the ground plane drawn 8x further out.
@@ -462,6 +501,7 @@ impl Default for ScrSettings {
             sound: true,
             halo_swing: 10,
             halo_bands: true,
+            halo_color: color::HaloColor::Under,
             auto_distance: false,
             far_ground: false,
             tag_fixed: false,
@@ -623,6 +663,7 @@ pub fn help(key: &str) -> &'static str {
         "colors" => "Colours per gradient: 16, 32, 64 or 128. More gives smoother colour; brightness colouring then redraws more cells each frame.",
         "sound" => "A second wireframe around each solid that swells and shrinks with the sound of the default output device.",
         "halo_swing" => "How far the sound halo grows and shrinks around 1.2x the solid's size: +-10%, +-30% or +-60% of its radius.",
+        "halo_color" => "Colour of the sound halo (with a colour gradient on). Under: whatever it passes over. Solid: its own solid's colour. Size: quiet halos at the gradient's start, loud ones at its end. Bass: the bass level, which also sets its brightness.",
         "halo_bands" => "On: each solid's halo follows its own frequency band, simple solids the bass and complex ones the treble. Off: every halo follows the overall level.",
         "far_ground" => "Draw the floor 8 times further out, toward the horizon. Past the normal distance it is shaded cheaply (averaged pattern, exact lighting, no sampling), so it costs little.",
         "tag_fixed" => "Leader lines keep one fixed length, following each solid as it grows and shrinks; a line only gets longer when its tag would otherwise cover another solid.",
@@ -782,6 +823,16 @@ pub fn choices() -> Vec<Choice> {
             HALO_SWING_PCT.iter().map(|p| opt(&p.to_string(), &format!("\u{b1}{p}%"))).collect(),
         ),
         always("halo_bands", "Halo bounce by frequency", on_off()),
+        always(
+            "halo_color",
+            "Halo colour",
+            vec![
+                opt("under", "Under (what it passes over)"),
+                opt("solid", "Solid (its own solid's colour)"),
+                opt("size", "Size (quiet to loud along the gradient)"),
+                opt("bass", "Bass (the bass level)"),
+            ],
+        ),
         always("auto_distance", "Dynamic camera distance", on_off()),
         always("far_ground", "Extended floor distance", on_off()),
         always("tag_fixed", "Fixed tag length", on_off()),
@@ -844,6 +895,7 @@ impl ScrSettings {
             ("sound", on_off(self.sound)),
             ("halo_swing", self.halo_swing.to_string()),
             ("halo_bands", on_off(self.halo_bands)),
+            ("halo_color", self.halo_color.id().into()),
             ("auto_distance", on_off(self.auto_distance)),
             ("far_ground", on_off(self.far_ground)),
             ("tag_fixed", on_off(self.tag_fixed)),
@@ -914,6 +966,7 @@ impl ScrSettings {
                 })
                 .collect(),
             halo_bands: flag("halo_bands", d.halo_bands),
+            halo_color: val("halo_color").and_then(|v| color::HaloColor::parse(&v)).unwrap_or(d.halo_color),
             auto_distance: flag("auto_distance", d.auto_distance),
             far_ground: flag("far_ground", d.far_ground),
             tag_fixed: flag("tag_fixed", d.tag_fixed),
@@ -1015,6 +1068,40 @@ impl PixelShift {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preview_file_round_trips_and_only_text_size_needs_a_restart() {
+        let s = ScrSettings {
+            random: false,
+            camera: CameraMode::Tilt,
+            tuning: vec![("orbit_period", 40.0)],
+            fps_cap: Some(30),
+            ..ScrSettings::default()
+        };
+        assert_eq!(preview_settings(&preview_text(&s)), s);
+        assert_eq!(preview_settings(""), ScrSettings::default());
+        // look and every-run changes apply live
+        let live = ScrSettings { camera: CameraMode::Orbit, sound: false, colors: 64, random: true, ..s.clone() };
+        assert!(!preview_needs_restart(&s, &live));
+        assert_eq!(preview_live(&s, &live), live);
+        // the text size settings need a restart, and stay as they were until then
+        for edited in [
+            ScrSettings { budget_pct: 40, ..s.clone() },
+            ScrSettings { density: 1, ..s.clone() },
+            ScrSettings { fps_cap: None, ..s.clone() },
+        ] {
+            assert!(preview_needs_restart(&s, &edited));
+            let applied = preview_live(&s, &edited);
+            assert_eq!((applied.budget_pct, applied.density, applied.fps_cap), (s.budget_pct, s.density, s.fps_cap));
+        }
+        for k in PREVIEW_RESTART_KEYS {
+            assert!(choices().iter().any(|c| c.key == k), "{k} is a dialog setting");
+        }
+        // the cheap re-plan is the plan's own config
+        let d = Display { width: 1920, height: 1080, refresh: 60 };
+        let p = plan(&d, 9, &s).unwrap();
+        assert_eq!(plan_config(&d, 9, &s).to_toml(), p.config.to_toml());
+    }
 
     const WQHD: Display = Display { width: 2560, height: 1440, refresh: 144 };
 
@@ -1170,6 +1257,7 @@ mod tests {
             halo_swing: 60,
             tuning: vec![("orbit_period", 45.0), ("max_spin", 2.5)],
             halo_bands: false,
+            halo_color: crate::color::HaloColor::Size,
             auto_distance: true,
             far_ground: true,
             tag_fixed: true,

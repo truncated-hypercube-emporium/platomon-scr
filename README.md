@@ -422,7 +422,7 @@ administrator rights).
 - **Palettes instead of 24-bit colour**: 16 (default), 32, 64 or 128 colours per gradient (*Palette size*, `--colors`).
 - **New colour sources**: each solid by its **spin** (speed and direction seen from the camera) or by the **sound** of its own frequency band, low frequencies on the simplest solids and high on the most complex.
 - **Background colour on its own**: auto, off, the solids' gradient, or a gradient of its own (*Background colour*, `--bg-color`).
-- **Settings dialog**: check boxes and sliders, one-word option names, a *Tuning* dialog of numeric sliders, a **configuration log** of the last 10 OKs (each titled with a random word; `+` keeps one for good in `configuration.log`), and *Set as default*.
+- **Settings dialog**: check boxes and sliders, one-word option names, a *Tuning* dialog of numeric sliders, a live **Preview** (windowed, or *Fullscreen*), a **configuration log** of the last 10 OKs (each titled with a random word; `+` keeps one for good in `configuration.log`), and *Set as default*.
 - **Halo size swing** is ±10% (was ±5%), ±30% or the new ±60%.
 - **Faster colour**: a palette-sized tile cache, a single glyph-and-colour pass and a tone-curve table make the colour pipeline 35–45% faster.
 - **Quasicrystal background** (`quasicrystal` pattern, with wave count and flow speed settings), and tags no longer cover the legend.
@@ -509,6 +509,16 @@ and largest solid size, idle and fastest spin, and exposure. Moving a slider set
 every run (random look or not); *×* or *Reset all* returns it to auto (the random look's or the
 default value). Set values are saved as `tune_<name>` keys; the button shows how many are set.
 
+**Preview.** *Preview* (beside *Tuning…*) shows the dialog's settings, saved or not, in a window
+half the screen's size, rendered at half resolution with the full-screen run's text size. A click
+inside the window closes it. With *Fullscreen* ticked it covers the whole screen at full
+resolution instead; it ignores the mouse and closes on any key. While it runs, edits show live (the
+dialog writes them to `preview.ini` beside the settings file, and the preview reads that a few times
+a second, keeping its random look). Edits to the CPU budget, text density and frame-rate cap set the
+text size, which is fixed once the preview's window exists; after one of those, or after ticking or
+unticking *Fullscreen*, the button reads *Restart* and starts a new preview. Closing the dialog
+closes the preview. Run it directly with `platomon.scr /w` or `/w full`.
+
 **Configuration log.** Each OK or *Apply* (which saves without closing) adds an entry to the log on
 the right, titled with a random English word and the time, holding the settings and the arguments
 the dialog was launched with. Entries always hold the look with *Random look each run* off, so
@@ -536,6 +546,13 @@ so low frequencies count most (half weight at 150 Hz, falling further above), so
 halo bright and treble-only or silent passages leave it dim. Both size and brightness are smoothed
 (fast rise, slower fall) and auto-gained over the last few seconds, so quiet material moves them
 as well. The halo is hidden behind nearer solids.
+
+**Halo colour** (with a colour gradient on). *Under* (the default) colours each halo cell like
+whatever it passes over, a solid or the background. *Solid* gives each halo its own solid's colour
+wherever it is drawn, over the background too. *Size* places it on the gradient by its size: quiet
+(small) halos take the start of the gradient and loud (large) ones its end. With *Halo bounce by
+frequency* each solid's halo has its own colour. *Bass* colours every halo by the bass level, which
+also sets their brightness. Each colour is shaded by the halo's brightness like any other cell.
 
 **Halo bounce by frequency** (on by default). Each solid's halo
 size follows its own slice of the spectrum instead of the overall level. Solids are ranked by
@@ -609,6 +626,7 @@ levels=16              ; 8 | 16 | 32 (older auto -> 16, 10 -> 8)
 sound=on               ; sound halo from the default output device
 halo_swing=10          ; halo size swing, percent of the radius: 10 | 30 | 60 (older halo_wide on -> 30)
 halo_bands=on          ; on = each solid's halo follows its frequency band; off = overall level
+halo_color=under       ; halo colour: under | solid | size | bass
 tags=on                ; solid tags with leader lines
 tag_color=complement   ; complement | theme | white | #RRGGBB (lifted to stay readable)
 tag_text=auto          ; auto (block letters under 10 px) | line | blocks

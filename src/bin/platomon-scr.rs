@@ -1,7 +1,11 @@
 //! Windows screensaver (`platomon.scr`).
 //!
 //! Windows runs a screensaver as `NAME.scr /s` (show), `/p HWND` (preview in
-//! the settings dialog) or `/c` (configure; also no arguments). On `/s` this
+//! the settings dialog) or `/c` (configure; also no arguments). The settings
+//! dialog's own Preview button runs `NAME.scr /w` (a window at half the
+//! display's size, closed by a click) or `/w full` (full screen, closed by a
+//! key; the mouse is ignored); either follows the dialog's edits live
+//! through `preview.ini` beside the settings file. On `/s` this
 //! reads the primary display's resolution and refresh rate, picks a random
 //! but cheap configuration, measures render speed to choose the text size,
 //! and draws platomon into its own borderless window covering the whole
@@ -29,7 +33,7 @@ fn main() {
 #[allow(clippy::upper_case_acronyms)] // Win32 names
 mod win {
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
     use std::time::{Duration, Instant};
 
     use platomon::aspect;
@@ -44,7 +48,7 @@ mod win {
     use platomon::render::{QualityGovernor, Renderer};
     use platomon::scrconfig;
     use platomon::tiles::TileCache;
-    use platomon::screensaver::{self, Display, PixelShift, Plan};
+    use platomon::screensaver::{self, Display, PixelShift, Plan, ScrSettings};
     use platomon::ui;
 
     // ------------------------------------------------------------ Win32
@@ -160,6 +164,8 @@ mod win {
         fn GetDC(h: HWND) -> HDC;
         fn ReleaseDC(h: HWND, dc: HDC) -> i32;
         fn FillRect(dc: HDC, r: *const RECT, brush: HGDIOBJ) -> i32;
+        fn AdjustWindowRectEx(r: *mut RECT, style: u32, menu: i32, ex_style: u32) -> i32;
+        fn LoadCursorW(instance: isize, name: *const u16) -> isize;
     }
 
     #[link(name = "gdi32")]
@@ -224,6 +230,11 @@ mod win {
     const SM_CYSCREEN: i32 = 1;
     const WS_POPUP: u32 = 0x8000_0000;
     const WS_VISIBLE: u32 = 0x1000_0000;
+    const WS_CAPTION: u32 = 0x00C0_0000;
+    const WS_SYSMENU: u32 = 0x0008_0000;
+    const WS_MINIMIZEBOX: u32 = 0x0002_0000;
+    const IDC_ARROW: usize = 32512;
+    const WM_PAINT: u32 = 0x000F;
     const WS_EX_TOPMOST: u32 = 0x0000_0008;
     const WS_EX_TOOLWINDOW: u32 = 0x0000_0080;
     const BLACK_BRUSH: i32 = 4;
@@ -255,6 +266,37 @@ mod win {
     const DIB_RGB_COLORS: u32 = 0;
 
     static QUIT: AtomicBool = AtomicBool::new(false);
+    /// The window was uncovered or moved: present the whole picture again.
+    static REPAINT: AtomicBool = AtomicBool::new(false);
+    /// The running [`Kind`], for the window procedure.
+    static KIND: AtomicU8 = AtomicU8::new(0);
+
+    /// What this run is: the screensaver itself, or the settings dialog's
+    /// preview in a window or full screen.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Kind {
+        /// Full screen; any key, click or mouse movement ends it.
+        Show = 0,
+        /// A window at half the display's size (half the render
+        /// resolution); a click inside it (or a key) closes it.
+        Window = 1,
+        /// Full screen at full resolution; the mouse is ignored, a key
+        /// closes it.
+        Full = 2,
+    }
+
+    impl Kind {
+        fn current() -> Self {
+            match KIND.load(Ordering::Relaxed) {
+                1 => Kind::Window,
+                2 => Kind::Full,
+                _ => Kind::Show,
+            }
+        }
+    }
+
+    /// How often a preview looks for new settings from the dialog.
+    const PREVIEW_POLL: Duration = Duration::from_millis(200);
 
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -299,16 +341,29 @@ mod win {
     // ------------------------------------------------------------ window
 
     unsafe extern "system" fn wndproc(h: HWND, msg: u32, w: usize, l: isize) -> isize {
+        let kind = Kind::current();
+        let quit = || {
+            QUIT.store(true, Ordering::SeqCst);
+            0
+        };
         match msg {
-            WM_KEYDOWN | WM_SYSKEYDOWN | WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_MOUSEWHEEL
-            | WM_CLOSE => {
-                QUIT.store(true, Ordering::SeqCst);
-                0
-            }
+            WM_KEYDOWN | WM_SYSKEYDOWN | WM_CLOSE => quit(),
+            WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN if kind != Kind::Full => quit(),
+            WM_MOUSEWHEEL if kind == Kind::Show => quit(),
+            // the full-screen preview ignores the mouse
+            WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_MOUSEWHEEL => 0,
+            // SAFETY: default handling: the class's arrow over the preview window.
+            WM_SETCURSOR if kind == Kind::Window => unsafe { DefWindowProcW(h, msg, w, l) },
             WM_SETCURSOR => {
                 // SAFETY: hiding the cursor over our own window.
                 unsafe { SetCursor(0) };
                 1
+            }
+            WM_PAINT => {
+                REPAINT.store(true, Ordering::SeqCst);
+                // SAFETY: default handling validates the region; the next
+                // frame presents the whole buffer.
+                unsafe { DefWindowProcW(h, msg, w, l) }
             }
             WM_ERASEBKGND => 1,
             // SAFETY: default handling for everything else.
@@ -433,12 +488,16 @@ mod win {
     }
 
     impl Screen {
-        fn new(d: &Display, font_px: i16) -> Result<Self, String> {
+        /// A `d`-sized picture: borderless over the whole display, or (for
+        /// [`Kind::Window`]) a captioned window with a `d`-sized client
+        /// area, centred on the primary display.
+        fn new(d: &Display, font_px: i16, kind: Kind) -> Result<Self, String> {
             // SAFETY: valid parameters for each call; strings outlive them;
             // every handle created here is released in Drop.
             unsafe {
                 let instance = GetModuleHandleW(std::ptr::null());
                 let class = wide("platomon-screensaver");
+                let windowed = kind == Kind::Window;
                 let wc = WNDCLASSEXW {
                     cb_size: std::mem::size_of::<WNDCLASSEXW>() as u32,
                     style: 0,
@@ -447,7 +506,7 @@ mod win {
                     wnd_extra: 0,
                     instance,
                     icon: 0,
-                    cursor: 0,
+                    cursor: if windowed { LoadCursorW(0, IDC_ARROW as *const u16) } else { 0 },
                     background: GetStockObject(BLACK_BRUSH),
                     menu_name: std::ptr::null(),
                     class_name: class.as_ptr(),
@@ -455,15 +514,25 @@ mod win {
                 };
                 RegisterClassExW(&wc);
                 let (w, h) = (d.width as i32, d.height as i32);
+                let (ex, style, title, (x, y, ow, oh)) = if windowed {
+                    let style = WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VISIBLE;
+                    let mut r = RECT { left: 0, top: 0, right: w, bottom: h };
+                    AdjustWindowRectEx(&mut r, style, 0, 0);
+                    let (ow, oh) = (r.right - r.left, r.bottom - r.top);
+                    let (sw, sh) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+                    (0, style, "platomon preview (click to close)", (((sw - ow) / 2).max(0), ((sh - oh) / 2).max(0), ow, oh))
+                } else {
+                    (WS_EX_TOPMOST | WS_EX_TOOLWINDOW, WS_POPUP | WS_VISIBLE, "platomon", (0, 0, w, h))
+                };
                 let hwnd = CreateWindowExW(
-                    WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+                    ex,
                     class.as_ptr(),
-                    wide("platomon").as_ptr(),
-                    WS_POPUP | WS_VISIBLE,
-                    0,
-                    0,
-                    w,
-                    h,
+                    wide(title).as_ptr(),
+                    style,
+                    x,
+                    y,
+                    ow,
+                    oh,
                     0,
                     0,
                     instance,
@@ -681,8 +750,58 @@ mod win {
 
     // ------------------------------------------------------------ run
 
-    fn run(plan: Plan, d: &Display, seed: u64) -> Result<(), String> {
-        let mut screen = Screen::new(d, plan.font_px)?;
+    /// A preview's link to the settings dialog: the settings it started
+    /// with and the last text read from the dialog's preview file.
+    struct Watch {
+        started: ScrSettings,
+        text: String,
+        next: Instant,
+    }
+
+    impl Watch {
+        /// The dialog's settings, when they changed since the last look
+        /// (only the ones a running preview can apply).
+        fn poll(&mut self) -> Option<ScrSettings> {
+            let now = Instant::now();
+            if now < self.next {
+                return None;
+            }
+            self.next = now + PREVIEW_POLL;
+            let text = std::fs::read_to_string(scrconfig::preview_path()).ok()?;
+            if text.is_empty() || text == self.text {
+                return None;
+            }
+            self.text = text;
+            Some(screensaver::preview_live(&self.started, &screensaver::preview_settings(&self.text)))
+        }
+    }
+
+    /// How a run of [`run_with`] ended.
+    enum Next {
+        Quit,
+        /// A preview's settings changed: run again with these.
+        Reload(ScrSettings),
+    }
+
+    /// Run `plan` on a `win`-sized picture (`full`: the display, for the
+    /// look and frame rate). A preview (`watch`) restarts the run in the same
+    /// window whenever the dialog's settings change.
+    fn run(plan: Plan, full: &Display, win: &Display, seed: u64, kind: Kind, mut watch: Option<Watch>) -> Result<(), String> {
+        KIND.store(kind as u8, Ordering::Relaxed);
+        let mut screen = Screen::new(win, plan.font_px, kind)?;
+        let mut plan = plan;
+        loop {
+            match run_with(&mut screen, &plan, seed, kind, watch.as_mut())? {
+                Next::Quit => return Ok(()),
+                Next::Reload(s) => {
+                    plan = Plan { config: screensaver::plan_config(full, seed, &s), settings: s, ..plan };
+                    screen.set_shift((0, 0));
+                }
+            }
+        }
+    }
+
+    fn run_with(screen: &mut Screen, plan: &Plan, seed: u64, kind: Kind, mut watch: Option<&mut Watch>) -> Result<Next, String> {
         let s = &plan.settings;
         let mut shift = s.shift.then(|| {
             PixelShift::new(seed ^ 0x0005_EED0_FB0B, s.shift_radius, s.shift_min_frames, s.shift_max_frames)
@@ -777,18 +896,28 @@ mod win {
 
         loop {
             screen.pump();
-            let moved = cursor().is_some_and(|p| {
-                if started.elapsed() < GRACE {
-                    origin = Some(p);
-                    false
-                } else {
-                    origin.is_some_and(|o| (p.0 - o.0).abs() > MOVE_PX || (p.1 - o.1).abs() > MOVE_PX)
-                }
-            });
+            // Only the screensaver itself ends on mouse movement.
+            let moved = kind == Kind::Show
+                && cursor().is_some_and(|p| {
+                    if started.elapsed() < GRACE {
+                        origin = Some(p);
+                        false
+                    } else {
+                        origin.is_some_and(|o| (p.0 - o.0).abs() > MOVE_PX || (p.1 - o.1).abs() > MOVE_PX)
+                    }
+                });
             if moved || QUIT.load(Ordering::SeqCst) {
-                let secs = started.elapsed().as_secs_f32();
-                report(full_frames, halo_frames, halo_cells, secs, &spent, sound.as_ref().filter(|_| halo_on), (shift_reach, shift_moves));
-                return Ok(());
+                if kind == Kind::Show {
+                    let secs = started.elapsed().as_secs_f32();
+                    report(full_frames, halo_frames, halo_cells, secs, &spent, sound.as_ref().filter(|_| halo_on), (shift_reach, shift_moves));
+                }
+                return Ok(Next::Quit);
+            }
+            if let Some(s) = watch.as_mut().and_then(|w| w.poll()).filter(|s| *s != plan.settings) {
+                return Ok(Next::Reload(s));
+            }
+            if REPAINT.swap(false, Ordering::SeqCst) {
+                screen.all_dirty = true;
             }
             let now = Instant::now();
             // Full frames keep rendering within the CPU budget: at most one
@@ -987,6 +1116,7 @@ mod win {
             levels,
             halo,
             halo_factors,
+            halo_color: cfg.halo_color,
             tags: tags.is_some(),
             tag_labels: tags.map_or(&[][..], |t| t.0),
             tag_ink: tags.map_or(color::NONE, |t| t.1),
@@ -1006,13 +1136,36 @@ mod win {
         if std::fs::create_dir_all(&dir).is_ok() {
             let _ = std::fs::write(dir.join("last-run.toml"), plan.to_toml(&d, seed));
         }
-        run(plan, &d, seed)
+        run(plan, &d, &d, seed, Kind::Show, None)
+    }
+
+    /// The settings dialog's preview: the dialog's current settings (from
+    /// its preview file, else the saved ones), followed live. The text size
+    /// is the full-screen run's: in a window half the display's size that
+    /// is half the render resolution per axis.
+    fn preview(fullscreen: bool) -> Result<(), String> {
+        let d = display();
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |t| t.as_nanos() as u64);
+        let text = std::fs::read_to_string(scrconfig::preview_path()).unwrap_or_default();
+        let settings = if text.is_empty() { scrconfig::load() } else { screensaver::preview_settings(&text) };
+        let plan = screensaver::plan(&d, seed, &settings)?;
+        let watch = Watch { started: settings, text, next: Instant::now() + PREVIEW_POLL };
+        if fullscreen {
+            run(plan, &d, &d, seed, Kind::Full, Some(watch))
+        } else {
+            let half = Display { width: (d.width / 2).max(320), height: (d.height / 2).max(200), refresh: d.refresh };
+            run(plan, &d, &half, seed, Kind::Window, Some(watch))
+        }
     }
 
     #[derive(Debug, PartialEq)]
     enum Mode {
         Show,
         Preview,
+        /// The settings dialog's preview: windowed, or full screen (`true`).
+        Window(bool),
         /// Settings dialog, owned by this window (0 = the foreground window).
         Configure(isize),
     }
@@ -1033,6 +1186,7 @@ mod win {
         match a.chars().next() {
             Some('s') => Mode::Show,
             Some('p') | Some('l') => Mode::Preview,
+            Some('w') => Mode::Window(a.contains("full") || args.get(1).is_some_and(|v| v.eq_ignore_ascii_case("full"))),
             _ => Mode::Configure(hwnd()),
         }
     }
@@ -1045,6 +1199,11 @@ mod win {
                 }
             }
             Mode::Preview => {} // no miniature preview
+            Mode::Window(fullscreen) => {
+                if let Err(e) = preview(fullscreen) {
+                    message(&format!("Could not start the preview:\n\n{e}"), true);
+                }
+            }
             Mode::Configure(owner) => {
                 // SAFETY: no arguments.
                 let owner = if owner != 0 { owner } else { unsafe { GetForegroundWindow() } };
