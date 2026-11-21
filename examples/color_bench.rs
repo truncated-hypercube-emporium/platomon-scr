@@ -174,6 +174,7 @@ fn main() {
                     tag_labels: &[],
                     tag_ink: platomon::color::NONE,
                     tag_blocks: false,
+                    tag_fixed: false,
                 };
                 let view = f.view();
                 let t0 = Instant::now();

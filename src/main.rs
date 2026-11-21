@@ -133,6 +133,12 @@ struct Cli {
     /// Draw tag text as three-row block letters, easier to read on small fonts.
     #[arg(long)]
     tag_blocks: bool,
+    /// Fixed tag length: leader lines keep one length, growing only to keep tags off other solids.
+    #[arg(long)]
+    tag_fixed_length: bool,
+    /// Extended floor: draw the ground plane 8x further out (shaded cheaply past the normal distance).
+    #[arg(long)]
+    far_ground: bool,
 
     // ---- colour
     /// Colour gradient: off, a preset (see --list gradients) or hex stops like "#000:#f80:#fff".
@@ -256,6 +262,12 @@ fn apply_cli(cfg: &mut Config, cli: &Cli) -> Result<(), String> {
     }
     if cli.auto_distance {
         cfg.auto_distance = true;
+    }
+    if cli.tag_fixed_length {
+        cfg.tag_fixed_len = true;
+    }
+    if cli.far_ground {
+        cfg.far_ground = true;
     }
     // Choosing a colour source (or reversing) without a gradient picks a default one.
     if (cli.color_by.is_some() || cli.color_reverse) && cli.color.is_none() && cfg.color.trim() == "off" {
@@ -503,7 +515,8 @@ fn build_scene(cfg: &Config, slots: &[SlotSpec]) -> Scene {
 fn render_settings(cfg: &Config, ratio: Option<f32>) -> RenderSettings {
     RenderSettings {
         spp: cfg.spp,
-        trace: TraceSettings { bounces: cfg.bounces, max_steps: cfg.max_steps, max_dist: cfg.max_dist },
+        trace: TraceSettings { bounces: cfg.bounces, max_steps: cfg.max_steps, max_dist: cfg.max_dist, ..TraceSettings::default() }
+            .with_far_ground(cfg.far_ground),
         char_aspect: cfg.char_aspect,
         fit_aspect: ratio,
     }
@@ -556,6 +569,7 @@ fn snapshot(cfg: &Config, slots: &[SlotSpec], ratio: Option<f32>, (w, h): (usize
         tag_labels: &labels,
         tag_ink: cfg.tag_ink(cmap.as_ref()),
         tag_blocks: cfg.tag_blocks,
+        tag_fixed: cfg.tag_fixed_len,
     };
     let mut overlays = Overlays::new(&scene);
     let mut s = String::new();
@@ -894,6 +908,7 @@ fn run(
             tag_labels: &tag_labels,
             tag_ink,
             tag_blocks: cfg.tag_blocks,
+            tag_fixed: cfg.tag_fixed_len,
         };
         if let Some(view) = renderer.view() {
             let cells = overlays.compose(&view, vp.w, vp.h, &scene, &opt);

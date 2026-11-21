@@ -991,6 +991,7 @@ mod win {
             tag_labels: tags.map_or(&[][..], |t| t.0),
             tag_ink: tags.map_or(color::NONE, |t| t.1),
             tag_blocks: tags.is_some_and(|t| t.2),
+            tag_fixed: cfg.tag_fixed_len,
         }
     }
 

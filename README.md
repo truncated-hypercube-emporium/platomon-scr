@@ -39,6 +39,8 @@ platomon [OPTIONS]
 | `--aspect-mode` | `letterbox\|crop` | `letterbox` |
 | **Camera** | | |
 | `--camera` | `static\|orbit\|focus\|tilt\|resonance` (focus: glide toward the busiest solid; tilt: orbit while rising 20–80° and back; resonance: orbit with three 20° waves per turn) | `static` |
+| `--far-ground` | flag: extended floor, drawn 8x further out toward the horizon; past the normal distance it is shaded in closed form (averaged pattern, exact light, no sampling), about +0–0.4 ms per frame | off |
+| `--tag-fixed-length` | flag: tag leader lines keep one length, following each solid as it grows and shrinks, and only lengthen to keep a tag off another solid | off |
 | `--auto-distance` | flag: dynamic camera distance, moving in and out so every solid stays in frame (all cameras but focus) | off |
 | `--focus-zoom` | `0..1`: 0 = only turn toward the busiest solid, 1 = close-up | 0.6 |
 | `--focus-tau` | glide time constant, seconds | 1.5 |
@@ -95,6 +97,16 @@ and at the same time lifts along a vertical arc over the orbit point, from 20° 
 above the look-at point (never straight down at the floor), at the overview distance throughout.
 The rise takes one orbital period, easing in and out; at each end it holds for half a period while
 the orbit carries on, then travels back. It starts on its way up at the overview's elevation.
+
+### Floating solids and the extended floor
+
+Solids float above the floor at a fixed height (rings) or with the whole sphere lifted, so that
+even the largest sound halo (1.8x a solid's radius, the ±60% swing) stays clear of it; the camera
+aims correspondingly higher. `--far-ground` draws the floor 8x further out, filling the band of sky
+that wide layouts and low camera angles otherwise show at the horizon. Out there the pattern has
+already faded to its mean tone and no solid's shadow reaches, so instead of sampling the light,
+tracing shadow rays and bouncing, each far floor point gets the light's direct contribution in
+closed form plus the averaged sky term: about 0–0.4 ms per frame at 640×240 cells.
 
 ### Dynamic camera distance
 
@@ -601,6 +613,8 @@ tags=on                ; solid tags with leader lines
 tag_color=complement   ; complement | theme | white | #RRGGBB (lifted to stay readable)
 tag_text=auto          ; auto (block letters under 10 px) | line | blocks
 auto_distance=off      ; dynamic camera distance (keep every solid in frame)
+far_ground=off         ; extended floor distance
+tag_fixed=off          ; fixed tag leader length
 tune_orbit_period=45   ; Tuning values (only those set): tune_<name>, see Tuning above
 shift=on
 shift_min_frames=600

@@ -24,6 +24,10 @@ pub const SPACING: f32 = 2.0 * BASE_RADIUS + 0.6;
 pub const RING_CAPACITY: usize = 8;
 /// Gap between a solid's circumsphere and the ground.
 pub const HOVER: f32 = 0.08;
+/// Solids float so that even the largest halo (1.8x the radius, the ±60%
+/// swing) stays this far above the ground.
+pub const HALO_REACH_MAX: f32 = 1.8;
+pub const FLOAT_GAP: f32 = 0.1;
 /// Layout extent the light and camera were tuned for (default 5-solid ring).
 const REF_EXTENT: f32 = MIN_RING_RADIUS + BASE_RADIUS;
 
@@ -295,6 +299,23 @@ impl Scene {
         };
         let extent = ring_pos.iter().map(|p| (*p - centroid).length()).fold(0.0, f32::max)
             + BASE_RADIUS * anim.max_scale;
+        // Float the solids so their largest halo clears the ground: rings
+        // hover at a fixed height (the camera's aim rises with them); a
+        // sphere of shells is lifted if its lowest halo would dip below.
+        let max_r = BASE_RADIUS * anim.max_scale.max(anim.min_scale);
+        let float_y = max_r * HALO_REACH_MAX + FLOAT_GAP;
+        let (mut ring_pos, mut centroid) = (ring_pos, centroid);
+        match layout {
+            Layout::Rings => centroid.y += float_y - (max_r + HOVER),
+            Layout::Sphere => {
+                let low = ring_pos.iter().map(|p| p.y).fold(f32::INFINITY, f32::min) - max_r * HALO_REACH_MAX;
+                let lift = (FLOAT_GAP - low).max(0.0);
+                for p in &mut ring_pos {
+                    p.y += lift;
+                }
+                centroid.y += lift;
+            }
+        }
         let k = extent / REF_EXTENT;
 
         let solids = slots
@@ -364,22 +385,29 @@ impl Scene {
 
     fn set_scale(&mut self, i: usize, scale: f32) {
         let r = (scale * BASE_RADIUS).max(1e-3);
+        let float_y = self.float_y();
         let inst = &mut self.solids[i];
         inst.scale = r;
         inst.inv_scale = 1.0 / r;
         inst.center = if self.grounded {
-            // Rest just above the ground at every scale so contact shadows stay visible.
-            self.ring_pos[i] + Vec3A::new(0.0, r + HOVER, 0.0)
+            // Float at a fixed height whatever the size, high enough that the
+            // largest halo never dips into the ground.
+            self.ring_pos[i] + Vec3A::new(0.0, float_y, 0.0)
         } else {
             self.ring_pos[i]
         };
     }
 
-    /// Where solid `i`'s centre is when it is at full size (rings: solids
-    /// rest on the ground, so a bigger solid sits higher).
+    /// Rings: the height every solid's centre floats at.
+    pub fn float_y(&self) -> f32 {
+        self.max_radius * HALO_REACH_MAX + FLOAT_GAP
+    }
+
+    /// Where solid `i`'s centre is when it is at full size (rings float at
+    /// a fixed height, so this is where it always is).
     pub fn full_size_center(&self, i: usize) -> Vec3A {
         let p = self.ring_pos.get(i).copied().unwrap_or(self.centroid);
-        if self.grounded { p + Vec3A::new(0.0, self.max_radius + HOVER, 0.0) } else { p }
+        if self.grounded { p + Vec3A::new(0.0, self.float_y(), 0.0) } else { p }
     }
 
     /// Slot the focus camera is on (or heading to).

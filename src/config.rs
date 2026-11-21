@@ -147,6 +147,12 @@ pub struct Config {
     /// Move the camera in and out so every solid stays in frame (all
     /// cameras but focus).
     pub auto_distance: bool,
+    /// Draw the ground plane 8x further out, shaded cheaply (averaged, no
+    /// sampling) past the normal render distance.
+    pub far_ground: bool,
+    /// Fixed tag length: tags placed for each solid's current size so the
+    /// leader keeps one length, growing only to keep tags off other solids.
+    pub tag_fixed_len: bool,
     /// RNG seed for random choices (orbit direction); unset = random.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seed: Option<u64>,
@@ -236,6 +242,8 @@ impl Default for Config {
             focus_zoom: 0.6,
             focus_tau: 1.5,
             auto_distance: false,
+            far_ground: false,
+            tag_fixed_len: false,
             camera: CameraMode::Static,
             orbit_period: 60.0,
             orbit_dir: OrbitDir::Random,

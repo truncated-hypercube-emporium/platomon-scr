@@ -648,8 +648,7 @@ fn build_template_counted() -> (Vec<u32>, usize) {
     // Right column: the configuration log. Every row is created (unused
     // ones hidden) so Apply can show new entries without reopening; the
     // details box runs down to the burn-in group's bottom edge.
-    let load_y = 34 + LOG_ROWS_MAX as i16 * 12 + 2;
-    let details_y = load_y + 17;
+    let details_y = 34 + LOG_ROWS_MAX as i16 * 12 + 2;
     let log_bottom = left_bottom.max(details_y + 60 + 6);
     t.item(BS_GROUPBOX, (LOG_X - 4, 22, LOG_W + 2, log_bottom - 22), ID_STATIC, BUTTON, "Configuration log");
     t.item(0, (LOG_X + 4, 36, LOG_W - 12, 20), ID_EMPTY as u16, STATIC, "No entries yet: each OK or Apply adds one.");
@@ -658,7 +657,6 @@ fn build_template_counted() -> (Vec<u32>, usize) {
         t.item(BS_PUSHBUTTON | WS_TABSTOP, (LOG_X + 2, y, 12, 11), (ID_PIN + k as i32) as u16, BUTTON, "+");
         t.item(BS_PUSHBUTTON | BS_FLAT | BS_LEFT | WS_TABSTOP, (LOG_X + 16, y, LOG_W - 22, 11), (ID_ROW + k as i32) as u16, BUTTON, "");
     }
-    t.item(BS_PUSHBUTTON | WS_TABSTOP, (LOG_X + 2, load_y, 80, 13), ID_LOAD as u16, BUTTON, "&Load into dialog");
     t.item(
         ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL | WS_BORDER,
         (LOG_X + 2, details_y, LOG_W - 8, log_bottom - 6 - details_y),
@@ -669,8 +667,10 @@ fn build_template_counted() -> (Vec<u32>, usize) {
     let right_bottom = log_bottom;
 
     let bottom = left_bottom.max(right_bottom) + 6;
-    t.item(0, (10, bottom, DLG_W - 20, 10), ID_STATUS as u16, STATIC, "Saved to %APPDATA%\\platomon\\screensaver.ini.");
-    let by = bottom + 14;
+    // Load sits under the details box, right above Apply.
+    t.item(BS_PUSHBUTTON | WS_TABSTOP, (DLG_W - 182, bottom - 2, 115, 13), ID_LOAD as u16, BUTTON, "&Load into dialog");
+    t.item(0, (10, bottom, DLG_W - 200, 10), ID_STATUS as u16, STATIC, "Saved to %APPDATA%\\platomon\\screensaver.ini.");
+    let by = bottom + 15;
     t.item(BS_PUSHBUTTON | WS_TABSTOP, (10, by, 52, 14), ID_DEFAULTS as u16, BUTTON, "&Defaults");
     t.item(BS_PUSHBUTTON | WS_TABSTOP, (66, by, 66, 14), ID_SET_DEFAULT as u16, BUTTON, "&Set as default");
     t.item(BS_PUSHBUTTON | WS_TABSTOP, (136, by, 70, 14), ID_TUNING as u16, BUTTON, "&Tuning...");

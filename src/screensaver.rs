@@ -166,7 +166,8 @@ pub fn build_scene(cfg: &Config, slots: &[SlotSpec]) -> Scene {
 pub fn render_settings(cfg: &Config, char_aspect: f32) -> RenderSettings {
     RenderSettings {
         spp: cfg.spp,
-        trace: TraceSettings { bounces: cfg.bounces, max_steps: cfg.max_steps, max_dist: cfg.max_dist },
+        trace: TraceSettings { bounces: cfg.bounces, max_steps: cfg.max_steps, max_dist: cfg.max_dist, ..TraceSettings::default() }
+            .with_far_ground(cfg.far_ground),
         char_aspect,
         fit_aspect: None,
     }
@@ -247,6 +248,8 @@ pub fn plan(d: &Display, seed: u64, s: &ScrSettings) -> Result<Plan, String> {
     }
     config.colors = s.colors;
     config.auto_distance = s.auto_distance;
+    config.far_ground = s.far_ground;
+    config.tag_fixed_len = s.tag_fixed;
     for &(k, v) in &s.tuning {
         set_tunable(&mut config, k, v);
     }
@@ -412,6 +415,10 @@ pub struct ScrSettings {
     pub halo_bands: bool,
     /// Dynamic camera distance: move in and out to keep every solid in frame.
     pub auto_distance: bool,
+    /// Extended floor: the ground plane drawn 8x further out.
+    pub far_ground: bool,
+    /// Fixed tag length: leader lines keep one length.
+    pub tag_fixed: bool,
     /// Solid tags: each solid's metric floats at a fixed place on screen,
     /// with a line to the solid that stops at its halo or wireframe.
     pub tags: bool,
@@ -456,6 +463,8 @@ impl Default for ScrSettings {
             halo_swing: 10,
             halo_bands: true,
             auto_distance: false,
+            far_ground: false,
+            tag_fixed: false,
             tags: true,
             tag_color: crate::color::TagColor::Complement,
             tag_text: TagText::Auto,
@@ -615,6 +624,8 @@ pub fn help(key: &str) -> &'static str {
         "sound" => "A second wireframe around each solid that swells and shrinks with the sound of the default output device.",
         "halo_swing" => "How far the sound halo grows and shrinks around 1.2x the solid's size: +-10%, +-30% or +-60% of its radius.",
         "halo_bands" => "On: each solid's halo follows its own frequency band, simple solids the bass and complex ones the treble. Off: every halo follows the overall level.",
+        "far_ground" => "Draw the floor 8 times further out, toward the horizon. Past the normal distance it is shaded cheaply (averaged pattern, exact lighting, no sampling), so it costs little.",
+        "tag_fixed" => "Leader lines keep one fixed length, following each solid as it grows and shrinks; a line only gets longer when its tag would otherwise cover another solid.",
         "auto_distance" => "The camera moves in and out so every solid stays in frame: closer when they are small or bunched up, further back as they grow or spread. Not with the focus camera.",
         "tags" => "A label with each solid's metric, joined to it by a short line.",
         "tag_color" => "Tag colour with a gradient on: complementary to the theme, a tint of the theme, or white. Always kept readable.",
@@ -772,6 +783,8 @@ pub fn choices() -> Vec<Choice> {
         ),
         always("halo_bands", "Halo bounce by frequency", on_off()),
         always("auto_distance", "Dynamic camera distance", on_off()),
+        always("far_ground", "Extended floor distance", on_off()),
+        always("tag_fixed", "Fixed tag length", on_off()),
         always("tags", "Solid tags", on_off()),
         always(
             "tag_color",
@@ -832,6 +845,8 @@ impl ScrSettings {
             ("halo_swing", self.halo_swing.to_string()),
             ("halo_bands", on_off(self.halo_bands)),
             ("auto_distance", on_off(self.auto_distance)),
+            ("far_ground", on_off(self.far_ground)),
+            ("tag_fixed", on_off(self.tag_fixed)),
             ("tags", on_off(self.tags)),
             ("tag_color", self.tag_color.id()),
             ("tag_text", self.tag_text.id().into()),
@@ -900,6 +915,8 @@ impl ScrSettings {
                 .collect(),
             halo_bands: flag("halo_bands", d.halo_bands),
             auto_distance: flag("auto_distance", d.auto_distance),
+            far_ground: flag("far_ground", d.far_ground),
+            tag_fixed: flag("tag_fixed", d.tag_fixed),
             tags: flag("tags", d.tags),
             tag_color: val("tag_color").and_then(|v| v.parse().ok()).unwrap_or(d.tag_color),
             tag_text: val("tag_text").and_then(|v| TagText::parse(&v)).unwrap_or(d.tag_text),
@@ -1154,6 +1171,8 @@ mod tests {
             tuning: vec![("orbit_period", 45.0), ("max_spin", 2.5)],
             halo_bands: false,
             auto_distance: true,
+            far_ground: true,
+            tag_fixed: true,
             tags: false,
             tag_color: crate::color::TagColor::Theme,
             tag_text: TagText::Blocks,
