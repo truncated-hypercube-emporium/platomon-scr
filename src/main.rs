@@ -130,6 +130,9 @@ struct Cli {
     /// Tag colour with a gradient: theme, complement (default), white or #RRGGBB; lifted to stay readable.
     #[arg(long, value_name = "MODE|#RRGGBB")]
     tag_color: Option<String>,
+    /// Draw tag text as three-row block letters, easier to read on small fonts.
+    #[arg(long)]
+    tag_blocks: bool,
 
     // ---- colour
     /// Colour gradient: off, a preset (see --list gradients) or hex stops like "#000:#f80:#fff".
@@ -245,6 +248,9 @@ fn apply_cli(cfg: &mut Config, cli: &Cli) -> Result<(), String> {
     }
     if cli.tags {
         cfg.tags = true;
+    }
+    if cli.tag_blocks {
+        cfg.tag_blocks = true;
     }
     if let Some(c) = &cli.tag_color {
         c.parse::<platomon::color::TagColor>().map_err(|e| format!("--tag-color: {e}"))?;
@@ -523,6 +529,7 @@ fn snapshot(cfg: &Config, slots: &[SlotSpec], ratio: Option<f32>, (w, h): (usize
         tags: cfg.tags,
         tag_labels: &labels,
         tag_ink: cfg.tag_ink(cmap.as_ref()),
+        tag_blocks: cfg.tag_blocks,
     };
     let mut overlays = Overlays::new(&scene);
     let mut s = String::new();
@@ -861,6 +868,7 @@ fn run(
             tags,
             tag_labels: &tag_labels,
             tag_ink,
+            tag_blocks: cfg.tag_blocks,
         };
         if let Some(view) = renderer.view() {
             let cells = overlays.compose(&view, vp.w, vp.h, &scene, &opt);

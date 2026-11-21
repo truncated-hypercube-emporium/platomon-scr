@@ -1,4 +1,4 @@
-# platomon 1.3.21
+# platomon 1.3.23
 
 A terminal system monitor: one path-traced polyhedron per metric, rendered in monochrome ASCII on
 concentric rings. Each solid's scale and spin follow its metric; the frame rate (5–150 fps) follows
@@ -340,7 +340,7 @@ At that resolution expect the adaptive quality to drop to `q-1`/`q-2` and tens o
 ## Windows screensaver
 
 **Download:** `platomon.scr` and `platomon-config.exe` are attached to the
-[v1.3.21 release](https://github.com/truncated-hypercube-emporium/platomon-scr/releases/tag/v1.3.21)
+[v1.3.23 release](https://github.com/truncated-hypercube-emporium/platomon-scr/releases/tag/v1.3.23)
 (64-bit Windows 10/11, no installer, no dependencies). To build them yourself,
 `scripts\build-scr.ps1` writes both to `dist\`.
 
@@ -349,6 +349,12 @@ To install, copy both files to `C:\Windows\System32` (administrator rights neede
 Screen saver. `platomon-config.exe` opens the same settings dialog as the Settings… button there.
 The `install` folder has both files and `install-platomon-scr.bat`, which moves them there (asking for
 administrator rights).
+
+**New in 1.3.23:**
+
+- **Block-letter tags on small text**: below 10 px cells, tags switch to three-row block letters made of ordinary glyphs (*Tag text*: automatic, always one line, or always block letters; INI `tag_text`).
+- **Tag boxes keep off the solids**: each tag box slides along its leader line as close to its solid as it can while staying clear of it (full size, halo room) and of every other solid.
+- **Luminosity levels** are 8, 16 (default) or 32: the random choice is gone and the 10-level ramp became an 8-level one (`" .:-=+#@"`). Saved `auto` reads as 16 and `10` as 8.
 
 **New in 1.3.21:**
 
@@ -452,8 +458,15 @@ straight into the back buffer, skipping cells that did not change; only the chan
 to the screen. Frame counts and per-stage timings of the last run are written to
 `%LOCALAPPDATA%\platomon\screensaver\last-run-frames.txt`.
 
-**Luminosity levels.** 10, 16 or 32 glyphs from dark to bright; Random keeps the random look's
-choice (usually 16, sometimes 10). The 32-level ramp `` `-.':"~=*+c7ix5ah6HmB80$MWNQg&@`` (after a
+**Tag text.** On small text (cells under 10 px tall) tags switch to three-row block letters drawn
+with ordinary glyphs (`_ | / \ ( )`), which stay readable where single letters are only a few pixels
+high; *Tag text* can also keep one line always, or use block letters always. Each tag is a solid box
+that hides what is behind it, and it slides along its leader line as close to its solid as it can while
+staying clear of that solid (at full size, with its halo's room) and of every other solid, going further
+out only when it must.
+
+**Luminosity levels.** 8, 16 (default) or 32 glyphs from dark to bright, the same every run. The
+8-level ramp `" .:-=+#@"` is the classic 10-level one without `*` and `%`. The 32-level ramp `` `-.':"~=*+c7ix5ah6HmB80$MWNQg&@`` (after a
 blank) is the Consolas glyphs whose measured ink coverage is nearest to 32 even steps. Settings are stored, like the Windows SDK screensaver sample does, in a private
 INI file through `WritePrivateProfileString`: `%APPDATA%\platomon\screensaver.ini`, section
 `[platomon]`:
@@ -474,12 +487,13 @@ extras=none            ; none | nic | disk | both
 fps_cap=display        ; or 30..240
 budget=15              ; percent
 density=2              ; 1 = standard | 2 = double
-levels=auto            ; auto | 10 | 16 | 32
+levels=16              ; 8 | 16 | 32 (older auto -> 16, 10 -> 8)
 sound=on               ; sound halo from the default output device
 halo_wide=off          ; on = halo size swing ±30% of the radius instead of ±5%
 halo_bands=on          ; on = each solid's halo follows its frequency band; off = overall level
 tags=on                ; solid tags with leader lines
 tag_color=complement   ; complement | theme | white | #RRGGBB (lifted to stay readable)
+tag_text=auto          ; auto (block letters under 10 px) | line | blocks
 shift=on
 shift_min_frames=600
 shift_max_frames=3600

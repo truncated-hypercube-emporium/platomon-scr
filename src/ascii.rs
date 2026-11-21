@@ -12,6 +12,9 @@ pub const CLASSIC_RAMP: &str = " .:-=+*#%@";
 /// 32 luminance levels: the Consolas glyphs whose measured ink coverage is
 /// closest to 32 evenly spaced steps, darkest first.
 pub const RAMP_32: &str = " `-.':\"~=*+c7ix5ah6HmB80$MWNQg&@";
+/// 8 luminance levels: the classic ramp without `*` and `%` (symbols only,
+/// so flat areas stay calm).
+pub const RAMP_8: &str = " .:-=+#@";
 
 /// Glyph ramp, darkest first.
 #[derive(Debug, Clone, PartialEq)]

@@ -118,9 +118,6 @@ pub fn randomize(rng: &mut fastrand::Rng, d: &Display) -> Config {
     c.legend = false;
     c.fps_invert = rng.u8(0..4) == 0;
     c.show_stats = rng.u8(0..5) == 0;
-    if rng.u8(0..5) == 0 {
-        c.ramp = crate::ascii::CLASSIC_RAMP.to_string();
-    }
     c.sanitize();
     c
 }
@@ -234,8 +231,7 @@ pub fn plan(d: &Display, seed: u64, s: &ScrSettings) -> Result<Plan, String> {
     config.sanitize();
     let spc = seconds_per_cell(&config)?;
     match s.levels {
-        Levels::Auto => {}
-        Levels::L10 => config.ramp = crate::ascii::CLASSIC_RAMP.to_string(),
+        Levels::L8 => config.ramp = crate::ascii::RAMP_8.to_string(),
         Levels::L16 => config.ramp = crate::ascii::DEFAULT_RAMP.to_string(),
         Levels::L32 => config.ramp = crate::ascii::RAMP_32.to_string(),
     }
@@ -277,27 +273,64 @@ pub enum Extras {
     Both,
 }
 
+/// How tag text is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagText {
+    /// Three-row block letters when the text is under [`TAG_BLOCK_PX`] tall.
+    Auto,
+    Line,
+    Blocks,
+}
+
+/// Below this text height (pixels) [`TagText::Auto`] uses block letters.
+pub const TAG_BLOCK_PX: i16 = 10;
+
+impl TagText {
+    pub fn id(self) -> &'static str {
+        match self {
+            TagText::Auto => "auto",
+            TagText::Line => "line",
+            TagText::Blocks => "blocks",
+        }
+    }
+
+    fn parse(v: &str) -> Option<Self> {
+        [TagText::Auto, TagText::Line, TagText::Blocks].into_iter().find(|t| t.id() == v)
+    }
+
+    /// Block letters for text `font_px` tall?
+    pub fn blocks(self, font_px: i16) -> bool {
+        match self {
+            TagText::Auto => font_px < TAG_BLOCK_PX,
+            TagText::Line => false,
+            TagText::Blocks => true,
+        }
+    }
+}
+
 /// Number of luminosity levels (glyphs in the ramp).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Levels {
-    /// Part of the random look: usually 16, sometimes 10.
-    Auto,
-    L10,
+    L8,
     L16,
     L32,
 }
 
 fn levels_id(l: Levels) -> &'static str {
     match l {
-        Levels::Auto => "auto",
-        Levels::L10 => "10",
+        Levels::L8 => "8",
         Levels::L16 => "16",
         Levels::L32 => "32",
     }
 }
 
 fn parse_levels(v: &str) -> Option<Levels> {
-    [Levels::Auto, Levels::L10, Levels::L16, Levels::L32].into_iter().find(|l| levels_id(*l) == v)
+    match v {
+        // the former 10-level setting maps to the nearest, 8 (`auto`, the
+        // former random choice, falls back to the default)
+        "10" => Some(Levels::L8),
+        _ => [Levels::L8, Levels::L16, Levels::L32].into_iter().find(|l| levels_id(*l) == v),
+    }
 }
 
 /// The user's choices from the configuration dialog, stored in the
@@ -347,6 +380,8 @@ pub struct ScrSettings {
     pub tags: bool,
     /// Tag colour with a colour gradient on (always lifted to stay readable).
     pub tag_color: crate::color::TagColor,
+    /// One line, or three-row block letters on small text.
+    pub tag_text: TagText,
     /// OLED burn-in protection: move the picture 1 px at random intervals.
     pub shift: bool,
     pub shift_min_frames: u32,
@@ -372,12 +407,13 @@ impl Default for ScrSettings {
             fps_cap: None,
             budget_pct: (RENDER_BUDGET * 100.0).round() as u8,
             density: 2,
-            levels: Levels::Auto,
+            levels: Levels::L16,
             sound: true,
             halo_wide: false,
             halo_bands: true,
             tags: true,
             tag_color: crate::color::TagColor::Complement,
+            tag_text: TagText::Auto,
             shift: true,
             shift_min_frames: 600,
             shift_max_frames: 3600,
@@ -492,7 +528,7 @@ pub fn choices() -> Vec<Choice> {
         always(
             "levels",
             "Luminosity levels",
-            vec![opt("auto", "Random (10 or 16)"), opt("10", "10"), opt("16", "16"), opt("32", "32")],
+            vec![opt("8", "8"), opt("16", "16"), opt("32", "32")],
         ),
         always("sound", "Sound halo (output device)", on_off()),
         always(
@@ -513,6 +549,15 @@ pub fn choices() -> Vec<Choice> {
             "tag_color",
             "Tag colour",
             crate::color::TagColor::CHOICES.iter().map(|c| opt(&c.id(), c.describe())).collect(),
+        ),
+        always(
+            "tag_text",
+            "Tag text",
+            vec![
+                opt("auto", "Block letters when text is under 10 px"),
+                opt("line", "Always one line"),
+                opt("blocks", "Always block letters (3 lines)"),
+            ],
         ),
         always(
             "shift_radius",
@@ -546,6 +591,7 @@ impl ScrSettings {
             ("halo_bands", on_off(self.halo_bands)),
             ("tags", on_off(self.tags)),
             ("tag_color", self.tag_color.id()),
+            ("tag_text", self.tag_text.id().into()),
             ("shift", on_off(self.shift)),
             ("shift_min_frames", self.shift_min_frames.to_string()),
             ("shift_max_frames", self.shift_max_frames.to_string()),
@@ -593,6 +639,7 @@ impl ScrSettings {
             halo_bands: flag("halo_bands", d.halo_bands),
             tags: flag("tags", d.tags),
             tag_color: val("tag_color").and_then(|v| v.parse().ok()).unwrap_or(d.tag_color),
+            tag_text: val("tag_text").and_then(|v| TagText::parse(&v)).unwrap_or(d.tag_text),
             shift: flag("shift", d.shift),
             shift_min_frames: shift_min,
             shift_max_frames: shift_max,
@@ -764,17 +811,36 @@ mod tests {
         assert_eq!(distinct.len(), 32, "32 different glyphs");
         assert!(crate::ascii::RAMP_32.starts_with(' '), "darkest is blank");
         for random in [true, false] {
-            for (l, n) in [(Levels::L10, 10), (Levels::L16, 16), (Levels::L32, 32)] {
+            for (l, n) in [(Levels::L8, 8), (Levels::L16, 16), (Levels::L32, 32)] {
                 let p = plan(&WQHD, 2, &ScrSettings { levels: l, random, ..ScrSettings::default() }).unwrap();
                 assert_eq!(crate::ascii::Ramp::new(&p.config.ramp).len(), n, "{l:?}");
             }
         }
-        // auto keeps the random look's ramp
+        // the 8-level ramp: distinct glyphs, the classic ramp's order, blank to @
+        let r8: Vec<char> = crate::ascii::RAMP_8.chars().collect();
+        assert_eq!(r8.iter().collect::<std::collections::HashSet<_>>().len(), 8);
+        let pos: Vec<usize> = r8.iter().map(|c| crate::ascii::CLASSIC_RAMP.chars().position(|d| d == *c).unwrap()).collect();
+        assert!(pos.windows(2).all(|p| p[0] < p[1]) && pos[0] == 0 && pos[7] == 9, "{pos:?}");
+        // no random choice any more: the default is 16 levels, every run
         for seed in 0..20 {
-            let mut rng = fastrand::Rng::with_seed(seed);
-            let c = randomize(&mut rng, &WQHD);
-            assert_eq!(plan(&WQHD, seed, &ScrSettings::default()).unwrap().config.ramp, c.ramp);
+            let p = plan(&WQHD, seed, &ScrSettings::default()).unwrap();
+            assert_eq!(p.config.ramp, crate::ascii::DEFAULT_RAMP, "seed {seed}");
         }
+        // older INI values: `auto` falls back to the default, `10` becomes 8
+        let s = ScrSettings::from_lookup(|k| (k == "levels").then(|| "auto".to_string()));
+        assert_eq!(s.levels, Levels::L16);
+        let s = ScrSettings::from_lookup(|k| (k == "levels").then(|| "10".to_string()));
+        assert_eq!(s.levels, Levels::L8);
+        // tag text: block letters below 10 px in auto, and as chosen otherwise
+        assert!(TagText::Auto.blocks(9) && !TagText::Auto.blocks(10));
+        assert!(TagText::Blocks.blocks(20) && !TagText::Line.blocks(4));
+        let s = ScrSettings::from_lookup(|k| (k == "tag_text").then(|| "blocks".to_string()));
+        assert_eq!(s.tag_text, TagText::Blocks);
+        assert_eq!(ScrSettings::default().tag_text, TagText::Auto);
+        // the dialog offers 8, 16 and 32 only
+        let lv = choices().into_iter().find(|c| c.key == "levels").unwrap();
+        let ids: Vec<&str> = lv.options.iter().map(|o| o.0.as_str()).collect();
+        assert_eq!(ids, ["8", "16", "32"]);
     }
 
     #[test]
@@ -818,6 +884,7 @@ mod tests {
             halo_bands: false,
             tags: false,
             tag_color: crate::color::TagColor::Theme,
+            tag_text: TagText::Blocks,
             shift: false,
             shift_min_frames: 10,
             shift_max_frames: 20,

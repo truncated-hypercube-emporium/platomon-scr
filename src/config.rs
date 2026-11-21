@@ -102,6 +102,8 @@ pub struct Config {
     /// Tag colour with a gradient on: `theme`, `complement`, `white` or
     /// `#RRGGBB` (always lifted to stay readable on black).
     pub tag_color: String,
+    /// Tag text as three-row block letters (for small text).
+    pub tag_blocks: bool,
 
     // --- colour ---
     /// `off`, a gradient preset (`inferno`, `viridis`, `traffic`, ...) or hex
@@ -207,6 +209,7 @@ impl Default for Config {
             wireframe: false,
             tags: false,
             tag_color: "complement".to_string(),
+            tag_blocks: false,
             color: "off".to_string(),
             color_by: ColorBy::Lum,
             color_depth: ColorDepth::True,

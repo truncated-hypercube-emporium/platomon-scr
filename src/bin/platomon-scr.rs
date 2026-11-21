@@ -728,6 +728,7 @@ mod win {
         // Solid tags: one short metric label per solid, refreshed every full frame.
         let tags_on = s.tags;
         let tag_ink = s.tag_color.resolve(cmap.as_ref().map(|m| &m.gradient));
+        let tag_blocks = s.tag_text.blocks(plan.font_px);
         let mut tag_labels: Vec<String> = Vec::new();
         let mut sound = s.sound.then(|| {
             let places = if s.halo_bands {
@@ -828,7 +829,7 @@ mod win {
                     let th = Instant::now();
                     if let Some(view) = renderer.view() {
                         let hl = sh.next();
-                        let opt = options(&cfg, &ramp, cmap.as_ref(), &levels, Some(hl), &sh.factors, tags_on.then_some((&tag_labels[..], tag_ink)));
+                        let opt = options(&cfg, &ramp, cmap.as_ref(), &levels, Some(hl), &sh.factors, tags_on.then_some((&tag_labels[..], tag_ink, tag_blocks)));
                         let u = overlays.update_halo(&view, vp.w, vp.h, &scene, &opt);
                         screen.draw_dirty(u.dirty, vp.w, u.chars, u.colors);
                         screen.present();
@@ -881,7 +882,7 @@ mod win {
             render_avg = if render_avg == 0.0 { r } else { 0.9 * render_avg + 0.1 * r };
             if let Some(view) = renderer.view() {
                 let factors = sound.as_ref().map_or(&[][..], |s| &s.factors[..]);
-                let opt = options(&cfg, &ramp, cmap.as_ref(), &levels, halo, factors, tags_on.then_some((&tag_labels[..], tag_ink)));
+                let opt = options(&cfg, &ramp, cmap.as_ref(), &levels, halo, factors, tags_on.then_some((&tag_labels[..], tag_ink, tag_blocks)));
                 let cells = overlays.compose(&view, vp.w, vp.h, &scene, &opt);
                 let t2 = Instant::now();
                 spent[1] += (t2 - t1).as_secs_f64();
@@ -981,7 +982,7 @@ mod win {
         halo: Option<Halo>,
         halo_factors: &'a [f32],
         // Tag labels and colour, when tags are on.
-        tags: Option<(&'a [String], u32)>,
+        tags: Option<(&'a [String], u32, bool)>,
     ) -> OverlayOptions<'a> {
         OverlayOptions {
             wireframe: cfg.wireframe,
@@ -997,6 +998,7 @@ mod win {
             tags: tags.is_some(),
             tag_labels: tags.map_or(&[][..], |t| t.0),
             tag_ink: tags.map_or(color::NONE, |t| t.1),
+            tag_blocks: tags.is_some_and(|t| t.2),
         }
     }
 

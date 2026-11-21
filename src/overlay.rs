@@ -399,6 +399,8 @@ pub struct OverlayOptions<'a> {
     pub tags: bool,
     /// One tag text per slot (falls back to the solid's name).
     pub tag_labels: &'a [String],
+    /// Draw tag text as three-row block letters (for small text).
+    pub tag_blocks: bool,
     /// Tag colour when colour is on ([`color::NONE`] = default text colour;
     /// see [`color::TagColor`]).
     pub tag_ink: u32,
@@ -432,6 +434,9 @@ const TAG_CLEAR_HALO: f32 = 1.5;
 const TAG_CLEAR_PLAIN: f32 = 1.05;
 /// Rows of leader line beyond that room.
 const TAG_GAP_ROWS: f32 = 3.0;
+/// How much further out (rows along the diagonal) a tag first looks for a
+/// spot clear of the other solids before trying its other sides.
+const TAG_SLACK_ROWS: f32 = 6.0;
 /// A tag only moves to the solid's other side once the solid is this far
 /// (share of the width) past the picture's centre, so it doesn't flicker.
 const TAG_FLIP: f32 = 0.06;
@@ -504,13 +509,97 @@ fn screen_circle(frame: &FrameView<'_>, center: Vec3A, radius: f32) -> Option<((
     Some((c, (up.1 - c.1).abs().max(0.5)))
 }
 
-/// Place every solid's tag for this frame, next to the solid: on the 45°
+/// Three-row block letters for tags on small text, built from ordinary
+/// glyphs (`_ | / \ ( ) < > . o`). Unknown characters show as `?`.
+fn block_glyph(c: char) -> [&'static str; 3] {
+    match c.to_ascii_uppercase() {
+        'A' => [" _ ", "|_|", "| |"],
+        'B' => [" _ ", "|_)", "|_)"],
+        'C' => [" _ ", "|  ", "|_ "],
+        'D' => [" _ ", "| \\", "|_/"],
+        'E' => [" _ ", "|_ ", "|_ "],
+        'F' => [" _ ", "|_ ", "|  "],
+        'G' => [" _ ", "|  ", "|_]"],
+        'H' => ["   ", "|_|", "| |"],
+        'I' => ["   ", " | ", " | "],
+        'J' => ["   ", "  |", "|_|"],
+        'K' => ["   ", "|_/", "| \\"],
+        'L' => ["   ", "|  ", "|_ "],
+        'M' => ["    ", "|\\/|", "|  |"],
+        'N' => ["    ", "|\\ |", "| \\|"],
+        'O' => [" _ ", "| |", "|_|"],
+        'P' => [" _ ", "|_)", "|  "],
+        'Q' => [" _ ", "| |", "|_\\"],
+        'R' => [" _ ", "|_)", "| \\"],
+        'S' => [" _ ", "(_ ", " _)"],
+        'T' => ["___", " | ", " | "],
+        'U' => ["   ", "| |", "|_|"],
+        'V' => ["   ", "\\ /", " v "],
+        'W' => ["    ", "|  |", "|/\\|"],
+        'X' => ["   ", "\\_/", "/ \\"],
+        'Y' => ["   ", "\\_/", " | "],
+        'Z' => ["__ ", " / ", "/_ "],
+        '0' => [" _ ", "|/|", "|_|"],
+        '1' => ["  ", "/|", " |"],
+        '2' => [" _ ", " _)", "(_ "],
+        '3' => [" _ ", " _)", " _)"],
+        '4' => ["   ", "|_|", "  |"],
+        '5' => [" _ ", "|_ ", " _)"],
+        '6' => [" _ ", "|_ ", "|_)"],
+        '7' => [" _ ", "  /", " / "],
+        '8' => [" _ ", "(_)", "(_)"],
+        '9' => [" _ ", "(_|", "  |"],
+        '%' => ["   ", "o/ ", "/o "],
+        '.' => [" ", " ", "."],
+        ',' => [" ", " ", ","],
+        ':' => [" ", ".", "."],
+        '-' => ["  ", "__", "  "],
+        '+' => ["   ", "_|_", " | "],
+        '/' => ["  ", " /", "/ "],
+        '(' => [" ", "(", "("],
+        ')' => [" ", ")", ")"],
+        '<' => ["  ", "/_", "\\ "],
+        '>' => ["  ", "_\\", " /"],
+        ' ' => ["  ", "  ", "  "],
+        _ => [" _ ", " _)", " . "],
+    }
+}
+
+/// The rows of one tag's text: one row (`__RAM 42%__`) normally, or three
+/// rows of [`block_glyph`] letters (one blank column between letters and
+/// either side, so the box hides what is behind it).
+fn tag_lines(label: &str, blocks: bool) -> Vec<Vec<char>> {
+    let label: String = label.chars().filter(|c| !c.is_control()).collect();
+    if !blocks {
+        return vec![format!("{TAG_RULE}{label}{TAG_RULE}").chars().collect()];
+    }
+    let mut rows = vec![vec![' '], vec![' '], vec![' ']];
+    for c in label.chars() {
+        for (row, part) in rows.iter_mut().zip(block_glyph(c)) {
+            row.extend(part.chars());
+            row.push(' ');
+        }
+    }
+    rows
+}
+
+/// A tag's box, (columns, rows); one-line tags reserve a little width (labels
+/// change length).
+fn tag_box(rows: &[Vec<char>]) -> (usize, usize) {
+    let wide = rows.iter().map(Vec::len).max().unwrap_or(0);
+    (if rows.len() == 1 { wide.max(TAG_MIN_W) } else { wide }, rows.len())
+}
+
+/// Place every solid's tag box for this frame, next to the solid: on the 45°
 /// diagonal away from the picture's centre (toward the periphery) and above
-/// it, just past the room its halo needs, with the text running outward so
-/// the leader line only spans the short gap between tag and solid. A tag
-/// that would leave the picture or overlap another tag tries the other
-/// diagonals, then one a little further out. `sides` keeps each tag's side
+/// it, with the text running outward so the leader line only spans the gap
+/// between box and solid. Along that diagonal (the leader line's path) the
+/// box sits as close to its solid as it can while staying clear of it (at
+/// full size, with the room its halo needs, plus a short gap for the line)
+/// and of every other solid. A box that would leave the picture or overlap
+/// another tag tries the other diagonals. `sides` keeps each tag's side
 /// from frame to frame (with hysteresis) so tags don't flip back and forth.
+/// `boxes` is each tag's (columns, rows).
 #[allow(clippy::too_many_arguments)]
 fn place_tags(
     sides: &mut Vec<(i8, i8)>,
@@ -518,7 +607,7 @@ fn place_tags(
     w: usize,
     h: usize,
     scene: &Scene,
-    labels: &[String],
+    boxes: &[(usize, usize)],
     halo: bool,
     aspect: f32,
 ) -> Vec<Option<TagAnchor>> {
@@ -528,28 +617,33 @@ fn place_tags(
     let clear = if halo { TAG_CLEAR_HALO } else { TAG_CLEAR_PLAIN };
     // Placed for each solid at full size (rings: a bigger solid also sits
     // higher), so a solid growing and shrinking with its load doesn't move
-    // its tag; only the camera does.
+    // its tag; only the camera does. The radius includes the halo's room.
     let circles: Vec<Option<((f32, f32), f32)>> = scene
         .solids
         .iter()
         .enumerate()
         .map(|(i, s)| screen_circle(frame, scene.full_size_center(i), s.scale.max(scene.max_radius)))
+        .map(|c| c.filter(|((x, y), _)| x.is_finite() && y.is_finite()).map(|(c, r)| (c, r * clear)))
         .collect();
+    // Does the box (rows r0..=r1, columns c0..=c1) come within `margin` rows
+    // of the circle?
+    let touches = |(r0, r1, c0, c1): (f32, f32, f32, f32), ((cx, cy), r): ((f32, f32), f32), margin: f32| {
+        let px = cx.clamp(c0, c1 + 1.0);
+        let py = cy.clamp(r0, r1 + 1.0);
+        ((px - cx) * aspect).hypot(py - cy) < r + margin
+    };
     // Nearer solids (larger on screen) choose first.
     let mut order: Vec<usize> = (0..n).collect();
     order.sort_by(|&a, &b| {
         let r = |i: usize| circles[i].map_or(0.0, |c| c.1);
         r(b).total_cmp(&r(a))
     });
-    let mut placed: Vec<(usize, usize, usize)> = Vec::new(); // (row, col0, col1)
+    let mut placed: Vec<(usize, usize, usize, usize)> = Vec::new(); // (row0, row1, col0, col1)
     let mut out = vec![None; n];
     for i in order {
         let Some(((cx, cy), rr)) = circles[i] else { continue };
-        if !(cx.is_finite() && cy.is_finite()) {
-            continue;
-        }
-        let label_w = labels.get(i).map_or(0, |l| l.chars().count());
-        let tw = label_w.max(TAG_MIN_W - 2 * TAG_RULE.len()) + 2 * TAG_RULE.len();
+        let (tw, th) = boxes.get(i).copied().unwrap_or((TAG_MIN_W, 1));
+        let (tw, th) = (tw.clamp(1, w.max(1)), th.clamp(1, h.max(1)));
         let (mut sx, mut sy) = sides[i];
         let outward = cx - hw;
         if sx == 0 {
@@ -560,54 +654,80 @@ fn place_tags(
         if sy == 0 {
             sy = -1;
         }
-        // Distance from the centre to the tag row: the halo room on the 45°
-        // diagonal, plus the gap.
-        let base = rr * clear * std::f32::consts::FRAC_1_SQRT_2 + TAG_GAP_ROWS;
-        let spot = |sx: i8, sy: i8, extra: f32| {
-            let dy = base + extra;
-            let y = (cy + sy as f32 * dy).round();
-            let x = (cx + sx as f32 * dy / aspect).round();
+        // The box with its inner corner `d` rows out along the diagonal:
+        // (near row, attach column, row0, row1, col0, col1).
+        let spot = |sx: i8, sy: i8, d: f32| {
+            let y = (cy + sy as f32 * d).round();
+            let x = (cx + sx as f32 * d / aspect).round();
+            let (r0, r1) = if sy < 0 { (y - th as f32 + 1.0, y) } else { (y, y + th as f32 - 1.0) };
             let (c0, c1) = if sx > 0 { (x, x + tw as f32 - 1.0) } else { (x - tw as f32 + 1.0, x) };
-            let on_screen = y >= 0.0 && y < h as f32 && c0 >= 0.0 && c1 < w as f32;
-            on_screen.then_some((y as usize, x as usize, c0 as usize, c1 as usize))
+            (r0 >= 0.0 && r1 < h as f32 && c0 >= 0.0 && c1 < w as f32).then_some((y, x, r0, r1, c0, c1))
         };
-        let clash = |(y, _, c0, c1): (usize, usize, usize, usize), placed: &[(usize, usize, usize)]| {
-            placed.iter().any(|&(py, p0, p1)| py.abs_diff(y) < 2 && c0 <= p1 + 1 && p0 <= c1 + 1)
+        let clash = |(r0, r1, c0, c1): (f32, f32, f32, f32), placed: &[(usize, usize, usize, usize)]| {
+            placed.iter().any(|&(p0, p1, q0, q1)| {
+                r0 <= p1 as f32 + 1.0 && p0 as f32 <= r1 + 1.0 && c0 <= q1 as f32 + 1.0 && q0 as f32 <= c1 + 1.0
+            })
+        };
+        // Closest spot along the diagonal: clear of its own solid by the
+        // leader gap, of the others outright (when `others`), and of tags.
+        // `slack`: how many rows past the closest spot clear of its own solid
+        // the search may go.
+        let own_d = |sx: i8, sy: i8| {
+            let mut d = 0.0;
+            while d <= rr + 4.0 * th as f32 + 12.0 {
+                if spot(sx, sy, d).is_some_and(|s| !touches((s.2, s.3, s.4, s.5), ((cx, cy), rr), TAG_GAP_ROWS)) {
+                    return d;
+                }
+                d += 1.0;
+            }
+            d
+        };
+        let nearest = |sx: i8, sy: i8, others: bool, slack: f32, placed: &[(usize, usize, usize, usize)]| {
+            let d0 = own_d(sx, sy);
+            let far = (d0 + slack).min(rr * 2.0 + 4.0 * th as f32 + 24.0);
+            let mut d = d0;
+            while d <= far {
+                if let Some(s) = spot(sx, sy, d) {
+                    let b = (s.2, s.3, s.4, s.5);
+                    let free = !touches(b, ((cx, cy), rr), TAG_GAP_ROWS)
+                        && !(others && circles.iter().enumerate().any(|(j, c)| j != i && c.is_some_and(|c| touches(b, c, 0.0))))
+                        && !clash(b, placed);
+                    if free {
+                        return Some(s);
+                    }
+                }
+                d += 1.0;
+            }
+            None
         };
         // Above is preferred: a tag below its solid goes back up once there
         // is room again.
-        let ys = if sy > 0 && spot(sx, -1, 2.0).is_some() { [-1, 1] } else { [sy, -sy] };
-        let mut choice = None;
-        'search: for extra in [0.0, 2.0, 4.0] {
-            for (hx, vy) in [(sx, ys[0]), (sx, ys[1]), (-sx, ys[0]), (-sx, ys[1])] {
-                if let Some(s) = spot(hx, vy, extra)
-                    && !clash(s, &placed)
-                {
-                    choice = Some((s, hx, vy));
-                    break 'search;
-                }
-            }
-        }
-        // Nowhere free: the preferred side, pulled onto the picture.
-        let ((y, x, c0, c1), hx, vy) = choice.unwrap_or_else(|| {
-            let dy = base;
-            let y = (cy + ys[0] as f32 * dy).round().clamp(0.0, h.saturating_sub(1) as f32) as usize;
-            let tw = tw.min(w);
-            let x = if sx > 0 {
-                ((cx + dy / aspect).round().max(0.0) as usize).min(w - tw)
-            } else {
-                ((cx - dy / aspect).round().max(0.0) as usize).clamp(tw - 1, w - 1)
-            };
-            let (c0, c1) = if sx > 0 { (x, x + tw - 1) } else { (x + 1 - tw, x) };
-            ((y, x, c0, c1), sx, ys[0])
+        let up_fits = nearest(sx, -1, true, TAG_SLACK_ROWS, &placed).is_some();
+        let ys = if sy > 0 && up_fits { [-1, 1] } else { [sy, -sy] };
+        let sides_to_try = [(sx, ys[0]), (sx, ys[1]), (-sx, ys[0]), (-sx, ys[1])];
+        // Clear of every solid and close; then clear of every solid however
+        // far; then clear of its own solid only.
+        let choice = [(true, TAG_SLACK_ROWS), (true, f32::INFINITY), (false, TAG_SLACK_ROWS)].into_iter().find_map(|(others, slack)| {
+            sides_to_try.iter().find_map(|&(hx, vy)| nearest(hx, vy, others, slack, &placed).map(|s| (s, hx, vy)))
         });
-        placed.push((y, c0, c1));
+        // Nowhere free: the preferred side, pulled onto the picture.
+        let ((y, x, r0, r1, c0, c1), hx, vy) = choice.unwrap_or_else(|| {
+            let d = rr + TAG_GAP_ROWS;
+            let vy = ys[0];
+            let y = (cy + vy as f32 * d).round();
+            let y = if vy < 0 { y.clamp(th as f32 - 1.0, h as f32 - 1.0) } else { y.clamp(0.0, (h - th) as f32) };
+            let x = (cx + sx as f32 * d / aspect).round();
+            let x = if sx > 0 { x.clamp(0.0, (w - tw) as f32) } else { x.clamp(tw as f32 - 1.0, w as f32 - 1.0) };
+            let (r0, r1) = if vy < 0 { (y - th as f32 + 1.0, y) } else { (y, y + th as f32 - 1.0) };
+            let (c0, c1) = if sx > 0 { (x, x + tw as f32 - 1.0) } else { (x - tw as f32 + 1.0, x) };
+            ((y, x, r0, r1, c0, c1), sx, vy)
+        });
+        placed.push((r0 as usize, r1 as usize, c0 as usize, c1 as usize));
         sides[i] = (hx, vy);
-        out[i] = Some(TagAnchor { y, x, rightward: hx > 0, above: vy < 0 });
+        out[i] = Some(TagAnchor { y: y as usize, x: x as usize, rightward: hx > 0, above: vy < 0 });
     }
     out
 }
-
 /// Width / height of a cell in the frame's projection.
 fn frame_aspect(frame: &FrameView<'_>) -> f32 {
     let p = frame.proj;
@@ -645,7 +765,17 @@ fn draw_tags(
     let ink = opt.tag_ink;
     let aspect = frame_aspect(frame);
     let sizes = opt.halo_sizes();
-    let anchors = place_tags(&mut t.sides, frame, w, h, scene, opt.tag_labels, sizes.is_some(), aspect);
+    let lines: Vec<Vec<Vec<char>>> = scene
+        .solids
+        .iter()
+        .enumerate()
+        .map(|(i, inst)| {
+            let label = opt.tag_labels.get(i).cloned().unwrap_or_else(|| inst.poly.kind().id().to_string());
+            tag_lines(&label, opt.tag_blocks)
+        })
+        .collect();
+    let boxes: Vec<(usize, usize)> = lines.iter().map(|l| tag_box(l)).collect();
+    let anchors = place_tags(&mut t.sides, frame, w, h, scene, &boxes, sizes.is_some(), aspect);
     let mut text_cells: Vec<usize> = Vec::new();
     let put = |c: usize, ch: char, t: &mut TagState, j: &mut Journal, cells: &mut [char], colors: &mut [u32]| {
         j.touch(c, cells, colors);
@@ -661,20 +791,27 @@ fn draw_tags(
     // All tag texts first, then the leader lines, which never cross any
     // tag's text.
     t.text_mask.resize(w * h, false);
-    for (i, inst) in scene.solids.iter().enumerate() {
+    for (i, rows) in lines.iter().enumerate() {
         let Some(a) = anchors[i] else { continue };
-        let label = opt.tag_labels.get(i).cloned().unwrap_or_else(|| inst.poly.kind().id().to_string());
-        let text: Vec<char> = format!("{TAG_RULE}{label}{TAG_RULE}").chars().filter(|c| !c.is_control()).collect();
-        // Text cells, clipped to the row.
-        let len = text.len();
-        let x0 = if a.rightward { a.x as isize } else { a.x as isize + 1 - len as isize };
-        for (k, &ch) in text.iter().enumerate() {
-            let x = x0 + k as isize;
-            if x >= 0 && (x as usize) < w && a.y < h {
-                let c = a.y * w + x as usize;
-                text_cells.push(c);
-                t.text_mask[c] = true;
-                put(c, ch, t, j, cells, colors);
+        // The box's rows run away from the solid from the near row `a.y`; its
+        // columns run outward from `a.x`. Every cell of the box is drawn
+        // (spaces included), so it hides what is behind it.
+        let (th, tw) = (rows.len(), rows.iter().map(Vec::len).max().unwrap_or(0));
+        let top = if a.above { a.y as isize + 1 - th as isize } else { a.y as isize };
+        let x0 = if a.rightward { a.x as isize } else { a.x as isize + 1 - tw as isize };
+        for (k, row) in rows.iter().enumerate() {
+            let y = top + k as isize;
+            if y < 0 || y >= h as isize {
+                continue;
+            }
+            for col in 0..tw {
+                let x = x0 + col as isize;
+                if x >= 0 && (x as usize) < w {
+                    let c = y as usize * w + x as usize;
+                    text_cells.push(c);
+                    t.text_mask[c] = true;
+                    put(c, row.get(col).copied().unwrap_or(' '), t, j, cells, colors);
+                }
             }
         }
     }
@@ -1239,6 +1376,7 @@ mod tests {
             tags: false,
             tag_labels: &[],
             tag_ink: color::NONE,
+            tag_blocks: false,
         };
         let out = o.compose(&view, W, H, &scene, &opt);
         (plain, out.chars.to_vec(), out.colors.map(<[u32]>::to_vec), view.ids.to_vec())
@@ -1314,6 +1452,7 @@ mod tests {
             tags: true,
             tag_labels: labels,
             tag_ink: color::NONE,
+            tag_blocks: false,
         }
     }
 
@@ -1347,7 +1486,8 @@ mod tests {
             plain_opt.tags = false;
             let plain = Overlays::new(&scene).compose(&view, w, h, &scene, &plain_opt).chars.to_vec();
             let chars = ov.compose(&view, w, h, &scene, &opt).chars.to_vec();
-            let anchors = place_tags(&mut sides, &view, w, h, &scene, &labels, false, aspect);
+            let boxes: Vec<(usize, usize)> = labels.iter().map(|l| tag_box(&tag_lines(l, false))).collect();
+            let anchors = place_tags(&mut sides, &view, w, h, &scene, &boxes, false, aspect);
             let mut at = Vec::new();
             for (i, s) in scene.solids.iter().enumerate() {
                 let a = anchors[i].unwrap_or_else(|| panic!("step {step}: solid {i} tagged"));
@@ -1362,9 +1502,27 @@ mod tests {
                 // next to the solid: past it (at full size), but only a short way
                 let dy = (a.y as f32 - cy).abs();
                 assert!(dy > rr * 0.7, "step {step}: tag {i} clear of its solid ({dy:.1} rows, r {rr:.1})");
-                let ((_, fy), fr) = screen_circle(&view, scene.full_size_center(i), scene.max_radius).unwrap();
+                // The box keeps clear of its own solid (full size) and, unless
+                // it sits close by, of every other solid too: it only goes
+                // further out along the leader to get clear of them.
+                let full = |j: usize| {
+                    let ((x, y), r) = screen_circle(&view, scene.full_size_center(j), scene.max_radius).unwrap();
+                    ((x, y), r * TAG_CLEAR_PLAIN)
+                };
+                let n = labels[i].len() + 2 * TAG_RULE.len();
+                let (c0, c1) = if a.rightward { (a.x, a.x + n.max(TAG_MIN_W) - 1) } else { (a.x + 1 - n.max(TAG_MIN_W), a.x) };
+                let hits = |j: usize, margin: f32| {
+                    let ((qx, qy), qr) = full(j);
+                    let px = qx.clamp(c0 as f32, c1 as f32 + 1.0);
+                    let py = qy.clamp(a.y as f32, a.y as f32 + 1.0);
+                    ((px - qx) * aspect).hypot(py - qy) < qr + margin - 0.75
+                };
+                assert!(!hits(i, TAG_GAP_ROWS), "step {step}: tag {i}'s box clear of its solid");
+                let ((_, fy), fr) = full(i);
                 let fdy = (a.y as f32 - fy).abs();
-                assert!(fdy <= fr * TAG_CLEAR_PLAIN * 0.71 + TAG_GAP_ROWS + 4.0 + 1.0, "step {step}: tag {i} close ({fdy:.1} rows, r {fr:.1})");
+                let close = fdy <= fr * 0.71 + TAG_GAP_ROWS + TAG_SLACK_ROWS + 2.0;
+                let clear_of_all = (0..5).all(|j| j == i || !hits(j, 0.0));
+                assert!(close || clear_of_all, "step {step}: tag {i} far out ({fdy:.1} rows) only to clear the other solids");
                 at.push((a.y, a.x));
             }
             // no two tags overlap
@@ -1418,6 +1576,59 @@ mod tests {
     }
 
     #[test]
+    fn block_letter_tags_are_three_even_rows_and_clear_their_solids() {
+        // every glyph's three rows line up
+        for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789%.,:-+/()<> ?".chars() {
+            let g = block_glyph(c);
+            assert!(g.iter().all(|r| r.chars().count() == g[0].chars().count()), "{c:?}: {g:?}");
+        }
+        let rows = tag_lines("RAM 42%", true);
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|r| r.len() == rows[0].len()));
+        let text: Vec<String> = rows.iter().map(|r| r.iter().collect()).collect();
+        assert_eq!(text[1], " |_) |_| |\\/|    |_|  _) o/  ", "{text:?}");
+        assert_eq!(text[2], " | \\ | | |  |      | (_  /o  ", "{text:?}");
+        // drawn: three rows per tag, in place, halo-only updates agree
+        let scene = Scene::demo(&AnimParams::default());
+        let (w, h) = (220, 80);
+        let mut r = Renderer::new();
+        r.render(&scene, w, h, &RenderSettings { spp: 1, ..RenderSettings::default() });
+        let view = r.view().unwrap();
+        let ramp = Ramp::default();
+        let labels: Vec<String> = ["CPU 12%", "RAM 40%", "GPU 3%", "DSK 1.0M", "NET 0.2M"].map(String::from).to_vec();
+        let opt = |f: f32| OverlayOptions { tag_blocks: true, ..tag_opts(&ramp, &labels, Some(Halo { factor: f, lum: 0.9 }), false) };
+        let mut inc = Overlays::new(&scene);
+        let mut chars = inc.compose(&view, w, h, &scene, &opt(1.2)).chars.to_vec();
+        let aspect = frame_aspect(&view);
+        let boxes: Vec<(usize, usize)> = labels.iter().map(|l| tag_box(&tag_lines(l, true))).collect();
+        let anchors = place_tags(&mut Vec::new(), &view, w, h, &scene, &boxes, true, aspect);
+        for (i, (a, l)) in anchors.iter().zip(&labels).enumerate() {
+            let a = a.unwrap();
+            let rows = tag_lines(l, true);
+            let tw = rows[0].len();
+            let top = if a.above { a.y - 2 } else { a.y };
+            let x0 = if a.rightward { a.x } else { a.x + 1 - tw };
+            for (k, row) in rows.iter().enumerate() {
+                let got: String = chars[(top + k) * w + x0..(top + k) * w + x0 + tw].iter().collect();
+                assert_eq!(got, row.iter().collect::<String>(), "tag {i} row {k}");
+            }
+            // the whole box is clear of its own solid's halo room
+            let ((cx, cy), rr) = screen_circle(&view, scene.full_size_center(i), scene.max_radius).unwrap();
+            let px = cx.clamp(x0 as f32, (x0 + tw) as f32);
+            let py = cy.clamp(top as f32, (top + 3) as f32);
+            assert!(((px - cx) * aspect).hypot(py - cy) >= rr * TAG_CLEAR_HALO, "tag {i} box clear of its solid");
+        }
+        for f in [1.4, 1.25, 1.5] {
+            let u = inc.update_halo(&view, w, h, &scene, &opt(f));
+            for &c in u.dirty {
+                chars[c] = u.chars[c];
+            }
+            let full = Overlays::new(&scene).compose(&view, w, h, &scene, &opt(f)).chars.to_vec();
+            assert_eq!(chars, full, "halo {f}: incremental matches full");
+        }
+    }
+
+    #[test]
     fn tags_hold_still_while_solids_grow_and_shrink() {
         let (w, h) = (200, 70);
         let anim = AnimParams::default();
@@ -1431,7 +1642,8 @@ mod tests {
             scene.update(&ch, &anim, 0.05);
             r.render(&scene, w, h, &RenderSettings { spp: 1, ..RenderSettings::default() });
             let view = r.view().unwrap();
-            let a = place_tags(&mut sides, &view, w, h, &scene, &labels, true, frame_aspect(&view));
+            let boxes: Vec<(usize, usize)> = labels.iter().map(|l| tag_box(&tag_lines(l, false))).collect();
+            let a = place_tags(&mut sides, &view, w, h, &scene, &boxes, true, frame_aspect(&view));
             assert!(a.iter().all(Option::is_some));
             match &first {
                 None => first = Some(a),
@@ -1572,6 +1784,7 @@ mod tests {
                 tags: false,
                 tag_labels: &[],
                 tag_ink: color::NONE,
+                tag_blocks: false,
             };
             let steps = [
                 Some(Halo { factor: 1.15, lum: 0.2 }),
@@ -1627,6 +1840,7 @@ mod tests {
             tags: false,
             tag_labels: &[],
             tag_ink: color::NONE,
+            tag_blocks: false,
         };
         let calm: &'static [f32] = &[1.15; 5];
         let base = Overlays::new(&scene).compose(&view, W, H, &scene, &opt(calm)).chars.to_vec();

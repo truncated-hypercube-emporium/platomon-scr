@@ -1,6 +1,6 @@
 [package]
 name = "platomon"
-version = "1.3.21"
+version = "1.3.23"
 edition = "2024"
 default-run = "platomon"
 description = "Platonic-solid ASCII system monitor: five path-traced solids, one per resource"
