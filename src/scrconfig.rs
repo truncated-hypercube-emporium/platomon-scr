@@ -671,15 +671,21 @@ fn choice_id(key: &str) -> Option<i32> {
     general_choices().iter().position(|c| c.key == key).map(|i| ID_COMBO + i as i32)
 }
 
-/// Lay out one group of settings from `y`, leaving `head` dialog units at
-/// its top for the caller's own row; returns the y below it.
-fn group(t: &mut Template, title: &str, y: i16, head: i16, items: &[(usize, &Choice)]) -> i16 {
+/// A check box of the dialog's own (not a setting) added at the end of a
+/// group's check-box grid: id, text, its width, and an optional small
+/// button right after its text (id, text).
+type ExtraToggle = (i32, &'static str, i16, Option<(i32, &'static str)>);
+
+/// Lay out one group of settings from `y`, with `extra` check boxes after
+/// the settings' own in its check-box grid; returns the y below it.
+fn group(t: &mut Template, title: &str, y: i16, items: &[(usize, &Choice)], extra: &[ExtraToggle]) -> i16 {
     let inline = |c: &Choice| INLINE_TOGGLES.iter().any(|&(_, k)| k == c.key);
     let toggles: Vec<&(usize, &Choice)> = items.iter().filter(|(_, c)| kind(c) == Kind::Toggle && !inline(c)).collect();
     let rest: Vec<&(usize, &Choice)> = items.iter().filter(|(_, c)| kind(c) != Kind::Toggle).collect();
-    let h = 14 + head + rest.len() as i16 * ROW + toggles.len().div_ceil(2) as i16 * 12 + 4;
+    let cells = toggles.len() + extra.len();
+    let h = 14 + rest.len() as i16 * ROW + cells.div_ceil(2) as i16 * 12 + 4;
     t.item(BS_GROUPBOX, (6, y, LEFT_W - 6, h), ID_STATIC, BUTTON, title);
-    let mut yy = y + 12 + head;
+    let mut yy = y + 12;
     for &&(i, c) in &rest {
         let id = ID_COMBO + i as i32;
         t.item(SS_NOTIFY, (14, yy + 2, 104, 10), (ID_LABEL + i as i32) as u16, STATIC, &format!("{}:", c.label));
@@ -709,14 +715,23 @@ fn group(t: &mut Template, title: &str, y: i16, head: i16, items: &[(usize, &Cho
         }
         yy += ROW;
     }
-    for (k, &&(i, c)) in toggles.iter().enumerate() {
+    for k in 0..cells {
         let x = if k % 2 == 0 { 14 } else { 152 };
-        t.item(BS_AUTOCHECKBOX | WS_TABSTOP, (x, yy, 136, 10), (ID_COMBO + i as i32) as u16, BUTTON, c.label);
+        match toggles.get(k) {
+            Some(&&(i, c)) => t.item(BS_AUTOCHECKBOX | WS_TABSTOP, (x, yy, 136, 10), (ID_COMBO + i as i32) as u16, BUTTON, c.label),
+            None => {
+                let (id, text, width, button) = extra[k - toggles.len()];
+                t.item(BS_AUTOCHECKBOX | WS_TABSTOP | WS_GROUP, (x, yy, width, 10), id as u16, BUTTON, text);
+                if let Some((bid, btext)) = button {
+                    t.item(BS_PUSHBUTTON | WS_TABSTOP, (x + width, yy - 1, 14, 12), bid as u16, BUTTON, btext);
+                }
+            }
+        }
         if k % 2 == 1 {
             yy += 12;
         }
     }
-    if toggles.len() % 2 == 1 {
+    if cells % 2 == 1 {
         yy += 12;
     }
     y + h.max(yy - y + 4)
@@ -732,12 +747,10 @@ fn build_template_counted() -> (Vec<u32>, usize) {
     let always: Vec<(usize, &Choice)> = general.iter().enumerate().filter(|(_, c)| !c.look).collect();
     // left column, measured first on a scratch template
     let mut t = Template::new("platomon screensaver settings", DLG_W, 100);
-    // The Look group's first row: Randomize, and a button that rolls a look now.
-    let look_y = LOG_TOP;
-    t.item(BS_AUTOCHECKBOX | WS_TABSTOP | WS_GROUP, (14, look_y + 12, 50, 10), ID_RANDOM as u16, BUTTON, "&Randomize");
-    t.item(BS_PUSHBUTTON | WS_TABSTOP, (64, look_y + 11, 14, 12), ID_REROLL as u16, BUTTON, REROLL_TEXT);
-    let y = group(&mut t, "Look", look_y, ROW, &looks);
-    let y = group(&mut t, "Performance && features", y + 4, 0, &always);
+    // Randomize, and a button that rolls a look now, close the Look group's check boxes.
+    let randomize: ExtraToggle = (ID_RANDOM, "&Randomize", 50, Some((ID_REROLL, REROLL_TEXT)));
+    let y = group(&mut t, "Look", LOG_TOP, &looks, &[randomize]);
+    let y = group(&mut t, "Performance && features", y + 4, &always, &[]);
     let (gy, gh) = (y + 4, 46i16);
     t.item(BS_GROUPBOX, (6, gy, LEFT_W - 6, gh), ID_STATIC, BUTTON, "OLED burn-in protection");
     t.item(
@@ -802,8 +815,8 @@ fn pin_text(pinned: bool) -> &'static str {
     if pinned { "\u{2212}" } else { "+" }
 }
 
-/// The small button after Randomize (a die).
-const REROLL_TEXT: &str = "\u{2684}";
+/// The small button after Randomize.
+const REROLL_TEXT: &str = "\u{229b}";
 
 /// Secondary dialog `p`: its drop-downs and check boxes, then its sliders.
 fn panel_template(p: Panel) -> (Vec<u32>, usize) {

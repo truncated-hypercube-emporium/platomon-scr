@@ -507,12 +507,12 @@ as the shift opens on the other side.
 
 **Settings.** Screen Saver Settings › Settings… (`platomon.scr /c`) and `platomon-config.exe` open
 the same dialog, run by a dialog procedure named `ScreenSaverConfigureDialog` as in the Win32
-screensaver interface. **Randomize** at the top of the *Look* group (on by default) picks the look
-anew every run; turn it off to use the look chosen below it instead: layout, camera, colour gradient
-and source, background colour, background pattern and luminosity, wireframe, stats bar, inverted
-frame rate and extra metrics (greyed out while Randomize is on). The small die button beside it
-rolls a random look into those settings now and turns Randomize off so it is kept (saved with OK or
-*Apply*). The *Performance & features* group always applies: the frame-rate cap (the display's
+screensaver interface. **Randomize**, the last check box of the *Look* group (on by default), picks
+the look anew every run; turn it off to use the look chosen in the group instead: layout, camera,
+colour gradient and source, background colour, background pattern and luminosity, wireframe, stats
+bar, inverted frame rate and extra metrics (greyed out while Randomize is on). The small *⊛* button
+beside it rolls a random look into those settings now and turns Randomize off so it is kept (saved
+with OK or *Apply*). The *Performance & features* group always applies: the frame-rate cap (the display's
 refresh rate by default), the CPU budget used to size the text, the text density, the number of
 luminosity levels, the palette size, the sound halo and tags; so does the burn-in shift (on/off,
 frame interval, range). On/off settings are check boxes, settings with three or more numeric steps
