@@ -677,13 +677,23 @@ fn choice_id(key: &str) -> Option<i32> {
 type ExtraToggle = (i32, &'static str, i16, Option<(i32, &'static str)>);
 
 /// Lay out one group of settings from `y`, with `extra` check boxes after
-/// the settings' own in its check-box grid; returns the y below it.
-fn group(t: &mut Template, title: &str, y: i16, items: &[(usize, &Choice)], extra: &[ExtraToggle]) -> i16 {
+/// the settings' own in its check-box grid and `tail` dialog units left
+/// free at its bottom (for a nested group); returns the tail's top and the
+/// y below the group.
+fn group(
+    t: &mut Template,
+    title: &str,
+    y: i16,
+    items: &[(usize, &Choice)],
+    extra: &[ExtraToggle],
+    tail: i16,
+) -> (i16, i16) {
     let inline = |c: &Choice| INLINE_TOGGLES.iter().any(|&(_, k)| k == c.key);
     let toggles: Vec<&(usize, &Choice)> = items.iter().filter(|(_, c)| kind(c) == Kind::Toggle && !inline(c)).collect();
     let rest: Vec<&(usize, &Choice)> = items.iter().filter(|(_, c)| kind(c) != Kind::Toggle).collect();
     let cells = toggles.len() + extra.len();
-    let h = 14 + rest.len() as i16 * ROW + cells.div_ceil(2) as i16 * 12 + 4;
+    let body = 14 + rest.len() as i16 * ROW + cells.div_ceil(2) as i16 * 12 + 4;
+    let h = body + tail;
     t.item(BS_GROUPBOX, (6, y, LEFT_W - 6, h), ID_STATIC, BUTTON, title);
     let mut yy = y + 12;
     for &&(i, c) in &rest {
@@ -734,8 +744,13 @@ fn group(t: &mut Template, title: &str, y: i16, items: &[(usize, &Choice)], extr
     if cells % 2 == 1 {
         yy += 12;
     }
-    y + h.max(yy - y + 4)
+    (y + body - 4, y + h)
 }
+
+/// Height of the burn-in group nested at the bottom of Performance &
+/// Features, with the gap above it.
+const BURN_IN_H: i16 = 46;
+const BURN_IN_TAIL: i16 = BURN_IN_H + 4;
 
 fn build_template() -> Vec<u32> {
     build_template_counted().0
@@ -743,32 +758,32 @@ fn build_template() -> Vec<u32> {
 
 fn build_template_counted() -> (Vec<u32>, usize) {
     let general = general_choices();
-    let looks: Vec<(usize, &Choice)> = general.iter().enumerate().filter(|(_, c)| c.look).collect();
-    let always: Vec<(usize, &Choice)> = general.iter().enumerate().filter(|(_, c)| !c.look).collect();
+    let looks: Vec<(usize, &Choice)> = general.iter().enumerate().filter(|(_, c)| c.appearance).collect();
+    let always: Vec<(usize, &Choice)> = general.iter().enumerate().filter(|(_, c)| !c.appearance).collect();
     // left column, measured first on a scratch template
     let mut t = Template::new("platomon screensaver settings", DLG_W, 100);
-    // Randomize, and a button that rolls a look now, close the Look group's check boxes.
+    // Randomize, and a button that rolls a look now, close the Appearance group's check boxes.
     let randomize: ExtraToggle = (ID_RANDOM, "&Randomize", 50, Some((ID_REROLL, REROLL_TEXT)));
-    let y = group(&mut t, "Look", LOG_TOP, &looks, &[randomize]);
-    let y = group(&mut t, "Performance && features", y + 4, &always, &[]);
-    let (gy, gh) = (y + 4, 46i16);
-    t.item(BS_GROUPBOX, (6, gy, LEFT_W - 6, gh), ID_STATIC, BUTTON, "OLED burn-in protection");
+    let (_, y) = group(&mut t, "Appearance", LOG_TOP, &looks, &[randomize], 0);
+    // the burn-in shift is nested at the bottom of Performance & Features
+    let (gy, left_bottom) = group(&mut t, "Performance && Features", y + 4, &always, &[], BURN_IN_TAIL);
+    let gh = BURN_IN_H;
+    t.item(BS_GROUPBOX, (12, gy, LEFT_W - 18, gh), ID_STATIC, BUTTON, "OLED burn-in protection");
     t.item(
         BS_AUTOCHECKBOX | WS_TABSTOP | WS_GROUP,
-        (14, gy + 12, 270, 10),
+        (20, gy + 12, 266, 10),
         ID_SHIFT as u16,
         BUTTON,
         "Shift the picture by 1 x 1 px at random frame intervals",
     );
     let ry = gy + 27;
-    t.item(0, (14, ry + 2, 22, 10), ID_STATIC, STATIC, "Every");
-    t.item(ES_NUMBER | ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP, (38, ry, 34, 12), ID_SHIFT_MIN as u16, EDIT, "");
-    t.item(0, (75, ry + 2, 10, 10), ID_STATIC, STATIC, "to");
-    t.item(ES_NUMBER | ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP, (86, ry, 34, 12), ID_SHIFT_MAX as u16, EDIT, "");
-    t.item(0, (123, ry + 2, 50, 10), ID_STATIC, STATIC, "frames, within");
-    t.slider(TBS_AUTOTICKS, (172, ry - 1, 88, 14), ID_RADIUS);
-    t.item(SS_NOTIFY, (262, ry + 2, 30, 10), ID_RADIUS_VALUE as u16, STATIC, "");
-    let left_bottom = gy + gh;
+    t.item(0, (20, ry + 2, 22, 10), ID_STATIC, STATIC, "Every");
+    t.item(ES_NUMBER | ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP, (44, ry, 34, 12), ID_SHIFT_MIN as u16, EDIT, "");
+    t.item(0, (81, ry + 2, 10, 10), ID_STATIC, STATIC, "to");
+    t.item(ES_NUMBER | ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP, (92, ry, 34, 12), ID_SHIFT_MAX as u16, EDIT, "");
+    t.item(0, (129, ry + 2, 50, 10), ID_STATIC, STATIC, "frames, within");
+    t.slider(TBS_AUTOTICKS, (178, ry - 1, 80, 14), ID_RADIUS);
+    t.item(SS_NOTIFY, (260, ry + 2, 30, 10), ID_RADIUS_VALUE as u16, STATIC, "");
 
     // Right column: the configuration log. Every row is created (unused
     // ones hidden) so Apply can show new entries without reopening; the
@@ -816,7 +831,7 @@ fn pin_text(pinned: bool) -> &'static str {
 }
 
 /// The small button after Randomize.
-const REROLL_TEXT: &str = "\u{229b}";
+const REROLL_TEXT: &str = "\0";
 
 /// Secondary dialog `p`: its drop-downs and check boxes, then its sliders.
 fn panel_template(p: Panel) -> (Vec<u32>, usize) {
@@ -826,7 +841,7 @@ fn panel_template(p: Panel) -> (Vec<u32>, usize) {
     let mut t = Template::new(panel_title(p), 300, cy);
     let intro = match p {
         Panel::Tuning => "Move a slider to set that value for every run; auto keeps the random look's or the default value.",
-        Panel::Layout => "How the solids are placed, every run (the layout itself is in the Look group); auto keeps the default spacing.",
+        Panel::Layout => "How the solids are placed, every run (the layout itself is in the Appearance group); auto keeps the default spacing.",
         Panel::Rendering => "How the picture is traced, every run; auto keeps the screensaver's own cheap settings (1 sample, 1 bounce).",
     };
     t.item(0, (10, 6, 280, 20), ID_STATIC, STATIC, intro);
@@ -1102,7 +1117,7 @@ fn tuning_label(h: HWND) {
     }
 }
 
-/// Roll a random look into the Look group (and turn Randomize off so the
+/// Roll a random look into the Appearance group (and turn Randomize off so the
 /// rolled look is what runs).
 unsafe fn reroll(h: HWND) {
     let mut rng = fastrand::Rng::new();

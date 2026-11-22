@@ -426,7 +426,8 @@ To install, copy both files to `C:\Windows\System32` (administrator rights neede
 `platomon.scr` › Install, then choose **platomon** in Settings › Personalization › Lock screen ›
 Screen saver. `platomon-config.exe` opens the same settings dialog as the Settings… button there.
 The `install` folder has both files and `install-platomon-scr.bat`, which moves them there (asking for
-administrator rights).
+administrator rights) and then adds Windows Defender exclusions for both installed files (remove them
+later in Windows Security › Virus & threat protection › Exclusions).
 
 **New in 1.4:**
 
@@ -507,15 +508,17 @@ as the shift opens on the other side.
 
 **Settings.** Screen Saver Settings › Settings… (`platomon.scr /c`) and `platomon-config.exe` open
 the same dialog, run by a dialog procedure named `ScreenSaverConfigureDialog` as in the Win32
-screensaver interface. **Randomize**, the last check box of the *Look* group (on by default), picks
-the look anew every run; turn it off to use the look chosen in the group instead: layout, camera,
-colour gradient and source, background colour, background pattern and luminosity, wireframe, stats
-bar, inverted frame rate and extra metrics (greyed out while Randomize is on). The small *⊛* button
-beside it rolls a random look into those settings now and turns Randomize off so it is kept (saved
-with OK or *Apply*). The *Performance & features* group always applies: the frame-rate cap (the display's
-refresh rate by default), the CPU budget used to size the text, the text density, the number of
-luminosity levels, the palette size, the sound halo and tags; so does the burn-in shift (on/off,
-frame interval, range). On/off settings are check boxes, settings with three or more numeric steps
+screensaver interface. **Randomize**, the last check box of the *Appearance* group (on by default),
+picks the look anew every run; turn it off to use the look chosen in the group instead: layout,
+camera, colour gradient and source, background colour, background pattern and luminosity, wireframe,
+stats bar, inverted frame rate and extra metrics (greyed out while Randomize is on). The small blank
+button beside it rolls a random look into those settings now and turns Randomize off so it is kept
+(saved with OK or *Apply*). The rest of *Appearance* always applies, Randomize or not: halo size
+swing, halo colour, tag colour, *Tag style*, sound halo, halo bounce by frequency, extended floor
+distance and *Tags*. The *Performance & Features* group always applies too: the frame-rate cap (the
+display's refresh rate by default), the CPU budget used to size the text, the text density, the
+number of luminosity levels, the palette size, dynamic camera distance and fixed tag length, with
+the OLED burn-in shift (on/off, frame interval, range) nested at its bottom. On/off settings are check boxes, settings with three or more numeric steps
 are sliders showing their value, and drop-downs show each option by its leading word, capitalised
 (the settings file keeps the lowercase names).
 
@@ -618,9 +621,9 @@ table for the tone curve (within 2e-6 of the exact curve), the colour pipeline t
 per frame (compose + draw) at 16 colours, down from 4.2–4.6 ms. Larger palettes cost almost nothing to
 compose; colouring by brightness at 64 or 128 colours redraws more cells (finer steps change more
 often), about +0.9–1.0 ms of drawing per frame.
-**Tag text.** On small text (cells under 10 px tall) tags switch to three-row block letters drawn
+**Tag style.** On small text (cells under 10 px tall) tags switch to three-row block letters drawn
 with ordinary glyphs (`_ | / \ ( )`), which stay readable where single letters are only a few pixels
-high; *Tag text* can also keep one line always, or use block letters always. Each tag is a solid box
+high; *Tag style* (INI `tag_text`) can also keep one line always, or use block letters always. Each tag is a solid box
 that hides what is behind it, and it slides along its leader line as close to its solid as it can while
 staying clear of that solid (at full size, with its halo's room) and of every other solid, going further
 out only when it must.

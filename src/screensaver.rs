@@ -821,6 +821,9 @@ pub struct Choice {
     pub label: &'static str,
     pub options: Vec<(String, String)>,
     pub look: bool,
+    /// Shown in the Appearance group (every look setting is; so are a few
+    /// that always apply).
+    pub appearance: bool,
     /// Shown in this secondary dialog instead of the main one.
     pub panel: Option<Panel>,
 }
@@ -844,9 +847,12 @@ pub fn choices() -> Vec<Choice> {
     let mut caps = vec![opt("display", "Display refresh rate")];
     caps.extend([30, 60, 75, 90, 120, 144, 165, 240].map(|f| opt(&f.to_string(), &format!("{f} fps"))));
     let budgets = [5, 10, 15, 20, 25, 30, 40, 50].map(|b| opt(&b.to_string(), &format!("{b}%"))).to_vec();
-    let look = |key, label, options| Choice { key, label, options, look: true, panel: None };
-    let always = |key, label, options| Choice { key, label, options, look: false, panel: None };
-    let in_panel = |panel, key, label, options| Choice { key, label, options, look: false, panel: Some(panel) };
+    let look = |key, label, options| Choice { key, label, options, look: true, appearance: true, panel: None };
+    // shown with the look, but kept as set (not randomised) every run
+    let styled = |key, label, options| Choice { key, label, options, look: false, appearance: true, panel: None };
+    let always = |key, label, options| Choice { key, label, options, look: false, appearance: false, panel: None };
+    let in_panel =
+        |panel, key, label, options| Choice { key, label, options, look: false, appearance: false, panel: Some(panel) };
     vec![
         look("layout", "Layout", Layout::ALL.iter().map(|l| opt(l.id(), &capitalized(l.id()))).collect()),
         in_panel(
@@ -910,14 +916,14 @@ pub fn choices() -> Vec<Choice> {
             "Palette size",
             color::PALETTE_SIZES.iter().map(|n| opt(&n.to_string(), &format!("{n} colours"))).collect(),
         ),
-        always("sound", "Sound halo", on_off()),
-        always(
+        styled("sound", "Sound halo", on_off()),
+        styled(
             "halo_swing",
             "Halo size swing",
             HALO_SWING_PCT.iter().map(|p| opt(&p.to_string(), &format!("\u{b1}{p}%"))).collect(),
         ),
-        always("halo_bands", "Halo bounce by frequency", on_off()),
-        always(
+        styled("halo_bands", "Halo bounce by frequency", on_off()),
+        styled(
             "halo_color",
             "Halo colour",
             vec![
@@ -928,17 +934,17 @@ pub fn choices() -> Vec<Choice> {
             ],
         ),
         always("auto_distance", "Dynamic camera distance", on_off()),
-        always("far_ground", "Extended floor distance", on_off()),
+        styled("far_ground", "Extended floor distance", on_off()),
         always("tag_fixed", "Fixed tag length", on_off()),
-        always("tags", "Solid tags", on_off()),
-        always(
+        styled("tags", "Tags", on_off()),
+        styled(
             "tag_color",
             "Tag colour",
             crate::color::TagColor::CHOICES.iter().map(|c| opt(&c.id(), c.describe())).collect(),
         ),
-        always(
+        styled(
             "tag_text",
-            "Tag text",
+            "Tag style",
             vec![
                 opt("auto", "Auto (block letters under 10 px)"),
                 opt("line", "Line (always one line)"),
