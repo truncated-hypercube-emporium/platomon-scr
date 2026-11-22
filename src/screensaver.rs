@@ -712,8 +712,8 @@ pub fn get_tunable(c: &Config, key: &str) -> f32 {
 /// dialog's own controls); empty when there is none.
 pub fn help(key: &str) -> &'static str {
     match key {
-        "random" => "On: every run picks a new random look (layout, camera, colours, background...). Off: the look chosen in this group is used every time.",
-        "reroll" => "Roll a random look into the settings of this group now (and turn Randomize off so it is kept). Nothing is saved until OK or Apply.",
+        "random" => "Random start. On: every run starts with a new random look (layout, camera, colours, background...). Off: the look chosen in this group is used every time.",
+        "reroll" => "Roll a random look into the settings of this group and random values into the Tuning dialog's sliders now (and turn Random start off so they are kept). Nothing is saved until OK or Apply.",
         "layout" => "Rings: the solids stand in rings on the floor. Sphere: they float on concentric spherical shells. Line: one evenly spaced row. Stack: one above another in the centre. Ordering and spacing are in the Layout dialog.",
         "ordering" => "Which solid takes which place: in metric order, from the simplest solid (fewest edges) to the most complex, the reverse, or shuffled. The first place is the inner ring's front, the inner shell, the line's left end or the stack's bottom.",
         "adaptive" => "When frames run late, render with fewer samples, then fewer bounces, and step back up when there is time again.",

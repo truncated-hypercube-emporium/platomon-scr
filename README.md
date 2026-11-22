@@ -508,12 +508,13 @@ as the shift opens on the other side.
 
 **Settings.** Screen Saver Settings › Settings… (`platomon.scr /c`) and `platomon-config.exe` open
 the same dialog, run by a dialog procedure named `ScreenSaverConfigureDialog` as in the Win32
-screensaver interface. **Randomize**, the last check box of the *Appearance* group (on by default),
-picks the look anew every run; turn it off to use the look chosen in the group instead: layout,
-camera, colour gradient and source, background colour, background pattern and luminosity, wireframe,
-stats bar, inverted frame rate and extra metrics (greyed out while Randomize is on). The small blank
-button beside it rolls a random look into those settings now and turns Randomize off so it is kept
-(saved with OK or *Apply*). The rest of *Appearance* always applies, Randomize or not: halo size
+screensaver interface. **Random start**, the last check box of the *Appearance* group (on by
+default), picks the look anew every run; turn it off to use the look chosen in the group instead:
+layout, camera, colour gradient and source, background colour, background pattern and luminosity,
+wireframe, stats bar, inverted frame rate and extra metrics (greyed out while Random start is on).
+The **Randomize** button beside it rolls a random look into those settings and random values into
+every *Tuning* slider now, and turns Random start off so they are kept (saved with OK or *Apply*).
+The rest of *Appearance* always applies, Random start or not: halo size
 swing, halo colour, tag colour, *Tag style*, sound halo, halo bounce by frequency, extended floor
 distance and *Tags*. The *Performance & Features* group always applies too: the frame-rate cap (the
 display's refresh rate by default), the CPU budget used to size the text, the text density, the
@@ -547,11 +548,14 @@ closes the preview. Run it directly with `platomon.scr /w` or `/w full`.
 
 **Configuration log.** Each OK or *Apply* (which saves without closing) adds an entry to the log on
 the right, titled with a random English word and the time, holding the settings and the arguments
-the dialog was launched with. Entries always hold the look with *Randomize* off, so
+the dialog was launched with. Entries always hold the look with *Random start* off, so
 loading one brings back that look; a save whose settings are already logged adds no new entry. Pick an entry to see them; *Load into dialog* puts its settings back in the
 controls (saved only with OK). The newest 10 entries are kept; the `+` beside an entry keeps it
 (the button turns to `−`, which lets it go again) and saves it to `configuration.log` beside the
-settings file, and kept entries are never dropped. The log itself is `config-log.ini`.
+settings file, and kept entries are never dropped. The `⊗` at an entry's right takes it off the list
+without deleting it: it stays in the log file (marked `hidden=1`, and never dropped), and a kept
+entry stays in `configuration.log` too; saving the same settings again puts it back on the list.
+The log itself is `config-log.ini`.
 
 **Defaults.** *Set as default* saves the dialog's current settings as your defaults (in
 `configuration.log`); a first run with no settings file starts from them.

@@ -335,6 +335,9 @@ const ID_STATUS: i32 = 1203;
 /// Log row `k`: its pin (`+`) button and its title button.
 const ID_PIN: i32 = 1500;
 const ID_ROW: i32 = 1600;
+/// Log row `k`'s `⊗` button: take the entry off the list (kept in the files).
+const ID_HIDE: i32 = 1800;
+const HIDE_TEXT: &str = "\u{2297}";
 const ID_DETAILS: i32 = 1700;
 const ID_LOAD: i32 = 1701;
 const ID_EMPTY: i32 = 1702;
@@ -473,6 +476,12 @@ fn main_tips() -> Vec<(i32, String)> {
         v.push((
             ID_PIN + k,
             "+ keeps this entry: it is saved to configuration.log and never dropped from the log. \u{2212} lets it go again.".into(),
+        ));
+        v.push((
+            ID_HIDE + k,
+            "\u{2297} takes this entry off the list. It is not deleted: previously saved log entries persist in the \
+             configuration log (and kept ones in configuration.log); saving the same settings again brings it back."
+                .into(),
         ));
     }
     v
@@ -733,7 +742,7 @@ fn group(
                 let (id, text, width, button) = extra[k - toggles.len()];
                 t.item(BS_AUTOCHECKBOX | WS_TABSTOP | WS_GROUP, (x, yy, width, 10), id as u16, BUTTON, text);
                 if let Some((bid, btext)) = button {
-                    t.item(BS_PUSHBUTTON | WS_TABSTOP, (x + width, yy - 1, 14, 12), bid as u16, BUTTON, btext);
+                    t.item(BS_PUSHBUTTON | WS_TABSTOP, (x + width, yy - 1, 44, 12), bid as u16, BUTTON, btext);
                 }
             }
         }
@@ -763,7 +772,7 @@ fn build_template_counted() -> (Vec<u32>, usize) {
     // left column, measured first on a scratch template
     let mut t = Template::new("platomon screensaver settings", DLG_W, 100);
     // Randomize, and a button that rolls a look now, close the Appearance group's check boxes.
-    let randomize: ExtraToggle = (ID_RANDOM, "&Randomize", 50, Some((ID_REROLL, REROLL_TEXT)));
+    let randomize: ExtraToggle = (ID_RANDOM, "Rando&m start", 58, Some((ID_REROLL, REROLL_TEXT)));
     let (_, y) = group(&mut t, "Appearance", LOG_TOP, &looks, &[randomize], 0);
     // the burn-in shift is nested at the bottom of Performance & Features
     let (gy, left_bottom) = group(&mut t, "Performance && Features", y + 4, &always, &[], BURN_IN_TAIL);
@@ -795,7 +804,8 @@ fn build_template_counted() -> (Vec<u32>, usize) {
     for k in 0..LOG_ROWS_MAX {
         let y = LOG_TOP + 12 + k as i16 * 12;
         t.item(BS_PUSHBUTTON | WS_TABSTOP, (LOG_X + 2, y, 12, 11), (ID_PIN + k as i32) as u16, BUTTON, "+");
-        t.item(BS_PUSHBUTTON | BS_FLAT | BS_LEFT | WS_TABSTOP, (LOG_X + 16, y, LOG_W - 22, 11), (ID_ROW + k as i32) as u16, BUTTON, "");
+        t.item(BS_PUSHBUTTON | BS_FLAT | BS_LEFT | WS_TABSTOP, (LOG_X + 16, y, LOG_W - 36, 11), (ID_ROW + k as i32) as u16, BUTTON, "");
+        t.item(BS_PUSHBUTTON | WS_TABSTOP, (LOG_X + LOG_W - 18, y, 12, 11), (ID_HIDE + k as i32) as u16, BUTTON, HIDE_TEXT);
     }
     t.item(
         ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL | WS_BORDER,
@@ -830,8 +840,8 @@ fn pin_text(pinned: bool) -> &'static str {
     if pinned { "\u{2212}" } else { "+" }
 }
 
-/// The small button after Randomize.
-const REROLL_TEXT: &str = "\0";
+/// The button after Random start.
+const REROLL_TEXT: &str = "Randomi&ze";
 
 /// Secondary dialog `p`: its drop-downs and check boxes, then its sliders.
 fn panel_template(p: Panel) -> (Vec<u32>, usize) {
@@ -1117,8 +1127,9 @@ fn tuning_label(h: HWND) {
     }
 }
 
-/// Roll a random look into the Appearance group (and turn Randomize off so the
-/// rolled look is what runs).
+/// Roll a random look into the Appearance group and random values into
+/// the Tuning dialog's sliders (and turn Random start off so the rolled
+/// look is what runs).
 unsafe fn reroll(h: HWND) {
     let mut rng = fastrand::Rng::new();
     // SAFETY: control ids from our template.
@@ -1132,7 +1143,17 @@ unsafe fn reroll(h: HWND) {
         CheckDlgButton(h, ID_RANDOM, 0);
         enable_look(h);
     }
-    status(h, "Rolled a random look (not saved until OK or Apply).");
+    // and every slider of the Tuning dialog
+    UI.with(|u| {
+        let mut u = u.borrow_mut();
+        for t in panel_tunables(Panel::Tuning) {
+            let v = t.value_at(rng.u32(0..=t.steps()));
+            u.tuning.retain(|(k, _)| *k != t.key);
+            u.tuning.push((t.key, v));
+        }
+    });
+    tuning_label(h);
+    status(h, "Rolled a random look and tuning (not saved until OK or Apply).");
 }
 
 /// Open secondary dialog `p` over the main dialog `h`; OK keeps its edits.
@@ -1252,12 +1273,22 @@ fn log_save(s: &ScrSettings) -> Result<Logged, String> {
     let settings = pairs_of(&ScrSettings { random: false, ..s.clone() });
     UI.with(|u| {
         let mut u = u.borrow_mut();
+        let u = &mut *u;
         if let Some(e) = scrlog::find_same(&u.log, &settings) {
-            return Ok(Logged::Duplicate(e.title.clone()));
+            let (id, title, hidden) = (e.id, e.title.clone(), e.hidden);
+            if hidden {
+                // saved again: put the hidden entry back on the list
+                for e in u.log.iter_mut().chain(u.prefs.pinned.iter_mut()).filter(|e| e.id == id) {
+                    e.hidden = false;
+                }
+                write_text(&log_path(), &scrlog::render_log(&u.log))?;
+                write_text(&prefs_path(), &scrlog::render_prefs(&u.prefs))?;
+            }
+            return Ok(Logged::Duplicate(title));
         }
         let (id, time) = now_text();
         let title = scrlog::random_word(&mut fastrand::Rng::new()).to_string();
-        let entry = LogEntry { id, title: title.clone(), time, args: launch_args(), settings, pinned: false };
+        let entry = LogEntry { id, title: title.clone(), time, args: launch_args(), settings, pinned: false, hidden: false };
         scrlog::push(&mut u.log, entry);
         write_text(&log_path(), &scrlog::render_log(&u.log)).map(|_| Logged::Added(title))
     })
@@ -1267,25 +1298,25 @@ fn log_save(s: &ScrSettings) -> Result<Logged, String> {
 fn refresh_log(h: HWND) {
     let rows: Vec<(String, bool)> = UI.with(|u| {
         let mut u = u.borrow_mut();
-        let ids: Vec<u64> = u.log.iter().take(LOG_ROWS_MAX).map(|e| e.id).collect();
+        let ids: Vec<u64> = scrlog::listed(&u.log).take(LOG_ROWS_MAX).map(|e| e.id).collect();
         u.rows = ids;
-        u.log.iter().take(LOG_ROWS_MAX).map(|e| (e.label(), e.pinned)).collect()
+        scrlog::listed(&u.log).take(LOG_ROWS_MAX).map(|e| (e.label(), e.pinned)).collect()
     });
     // SAFETY: control ids from our template.
     unsafe {
         for k in 0..LOG_ROWS_MAX {
-            let (row, pin) = (GetDlgItem(h, ID_ROW + k as i32), GetDlgItem(h, ID_PIN + k as i32));
-            match rows.get(k) {
+            let k = k as i32;
+            let ctls = [GetDlgItem(h, ID_ROW + k), GetDlgItem(h, ID_PIN + k), GetDlgItem(h, ID_HIDE + k)];
+            let show = match rows.get(k as usize) {
                 Some((label, pinned)) => {
-                    SetDlgItemTextW(h, ID_ROW + k as i32, wide(label).as_ptr());
-                    SetDlgItemTextW(h, ID_PIN + k as i32, wide(pin_text(*pinned)).as_ptr());
-                    ShowWindow(row, SW_SHOW);
-                    ShowWindow(pin, SW_SHOW);
+                    SetDlgItemTextW(h, ID_ROW + k, wide(label).as_ptr());
+                    SetDlgItemTextW(h, ID_PIN + k, wide(pin_text(*pinned)).as_ptr());
+                    SW_SHOW
                 }
-                None => {
-                    ShowWindow(row, SW_HIDE);
-                    ShowWindow(pin, SW_HIDE);
-                }
+                None => SW_HIDE,
+            };
+            for c in ctls {
+                ShowWindow(c, show);
             }
         }
         ShowWindow(GetDlgItem(h, ID_EMPTY), if rows.is_empty() { SW_SHOW } else { SW_HIDE });
@@ -1511,6 +1542,26 @@ pub unsafe extern "system" fn ScreenSaverConfigureDialog(h: HWND, msg: u32, w: u
                                         },
                                     );
                                 }
+                                Err(err) => status(h, &err),
+                            }
+                        }
+                        1
+                    }
+                    _ if (ID_HIDE..ID_HIDE + LOG_ROWS_MAX as i32).contains(&id) && code == BN_CLICKED => {
+                        if let Some(e) = entry_at((id - ID_HIDE) as usize) {
+                            let r = UI.with(|u| {
+                                let mut u = u.borrow_mut();
+                                let u = &mut *u;
+                                scrlog::hide(&mut u.log, &mut u.prefs, e.id);
+                                if u.selected == Some(e.id) {
+                                    u.selected = None;
+                                }
+                                write_text(&log_path(), &scrlog::render_log(&u.log))
+                                    .and_then(|_| if e.pinned { write_text(&prefs_path(), &scrlog::render_prefs(&u.prefs)) } else { Ok(()) })
+                            });
+                            refresh_log(h);
+                            match r {
+                                Ok(()) => status(h, &format!("\"{}\" taken off the list (still in the configuration log).", e.title)),
                                 Err(err) => status(h, &err),
                             }
                         }

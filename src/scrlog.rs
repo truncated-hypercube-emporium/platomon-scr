@@ -29,6 +29,9 @@ pub struct LogEntry {
     /// The settings as `(INI key, value)`, in INI order.
     pub settings: Vec<(String, String)>,
     pub pinned: bool,
+    /// Taken off the dialog's list with its `⊗` button; still kept in the
+    /// files (and still counted as logged).
+    pub hidden: bool,
 }
 
 impl LogEntry {
@@ -85,18 +88,19 @@ fn entry_from(name: &str, keys: &[(String, String)]) -> Option<LogEntry> {
         .iter()
         .filter_map(|(k, v)| k.strip_prefix("set.").map(|k| (k.to_string(), v.clone())))
         .collect();
-    Some(LogEntry { id, title: get("title"), time: get("time"), args: get("args"), settings, pinned: get("pinned") == "1" })
+    Some(LogEntry { id, title: get("title"), time: get("time"), args: get("args"), settings, pinned: get("pinned") == "1", hidden: get("hidden") == "1" })
 }
 
 fn push_entry(s: &mut String, e: &LogEntry) {
     let _ = write!(
         s,
-        "[entry {}]\ntitle={}\ntime={}\nargs={}\npinned={}\n",
+        "[entry {}]\ntitle={}\ntime={}\nargs={}\npinned={}\nhidden={}\n",
         e.id,
         one_line(&e.title),
         one_line(&e.time),
         one_line(&e.args),
-        e.pinned as u8
+        e.pinned as u8,
+        e.hidden as u8
     );
     for (k, v) in &e.settings {
         let _ = writeln!(s, "set.{k}={}", one_line(v));
@@ -121,14 +125,14 @@ pub fn render_log(entries: &[LogEntry]) -> String {
     s
 }
 
-/// Add `e` as the newest entry; then keep every pinned entry and the
-/// newest [`LOG_KEEP`] unpinned ones.
+/// Add `e` as the newest entry; then keep every pinned entry, every hidden
+/// one (taken off the list, not deleted) and the newest [`LOG_KEEP`] other ones.
 pub fn push(entries: &mut Vec<LogEntry>, e: LogEntry) {
     entries.insert(0, e);
     entries.sort_by_key(|e| std::cmp::Reverse(e.id));
     let mut unpinned = 0;
     entries.retain(|e| {
-        if e.pinned {
+        if e.pinned || e.hidden {
             return true;
         }
         unpinned += 1;
@@ -183,7 +187,9 @@ pub fn render_prefs(p: &Prefs) -> String {
 /// wins: an entry pinned there is pinned, and kept even if the log lost it).
 pub fn merge_pinned(log: &mut Vec<LogEntry>, prefs: &Prefs) {
     for e in log.iter_mut() {
-        e.pinned = prefs.pinned.iter().any(|p| p.id == e.id);
+        let kept = prefs.pinned.iter().find(|p| p.id == e.id);
+        e.pinned = kept.is_some();
+        e.hidden |= kept.is_some_and(|p| p.hidden);
     }
     for p in &prefs.pinned {
         if !log.iter().any(|e| e.id == p.id) {
@@ -204,6 +210,22 @@ pub fn toggle_pin(log: &mut [LogEntry], prefs: &mut Prefs, id: u64) -> bool {
         prefs.pinned.sort_by_key(|e| std::cmp::Reverse(e.id));
     }
     e.pinned
+}
+
+/// Take entry `id` off the dialog's list (in the log and, when pinned, in
+/// the preferences); it stays in both files. Returns whether it was found.
+pub fn hide(log: &mut [LogEntry], prefs: &mut Prefs, id: u64) -> bool {
+    let Some(e) = log.iter_mut().find(|e| e.id == id) else { return false };
+    e.hidden = true;
+    for p in prefs.pinned.iter_mut().filter(|p| p.id == id) {
+        p.hidden = true;
+    }
+    true
+}
+
+/// The entries the dialog lists: every one not hidden, newest first.
+pub fn listed(log: &[LogEntry]) -> impl Iterator<Item = &LogEntry> {
+    log.iter().filter(|e| !e.hidden)
 }
 
 /// Words for entry titles: short, common, unambiguous English.
@@ -241,6 +263,7 @@ mod tests {
             args: "/c:1234".into(),
             settings: vec![("random".into(), "off".into()), ("camera".into(), "tilt".into())],
             pinned,
+            hidden: false,
         }
     }
 
@@ -288,6 +311,30 @@ mod tests {
         assert!(!toggle_pin(&mut log, &mut prefs, 8));
         assert!(prefs.pinned.is_empty());
         assert!(!toggle_pin(&mut log, &mut prefs, 77), "unknown id");
+    }
+
+    #[test]
+    fn hidden_entries_leave_the_list_but_stay_in_the_files() {
+        let mut log = vec![entry(9, false), entry(8, true), entry(7, false)];
+        let mut prefs = Prefs { default: None, pinned: vec![entry(8, true)] };
+        assert!(hide(&mut log, &mut prefs, 7) && hide(&mut log, &mut prefs, 8));
+        assert!(!hide(&mut log, &mut prefs, 77), "unknown id");
+        assert_eq!(listed(&log).map(|e| e.id).collect::<Vec<_>>(), [9]);
+        // both files keep them, marked hidden
+        let back = parse_log(&render_log(&log));
+        assert_eq!(back.iter().map(|e| (e.id, e.hidden)).collect::<Vec<_>>(), [(9, false), (8, true), (7, true)]);
+        let kept = parse_prefs(&render_prefs(&prefs));
+        assert!(kept.pinned[0].hidden);
+        // a pinned entry the log lost comes back hidden
+        let mut fresh = vec![entry(9, false)];
+        merge_pinned(&mut fresh, &kept);
+        assert_eq!(listed(&fresh).count(), 1);
+        // hidden entries are never pushed out by new ones
+        for id in 10..=40 {
+            push(&mut log, entry(id, false));
+        }
+        assert!(log.iter().any(|e| e.id == 7));
+        assert_eq!(listed(&log).count(), LOG_KEEP, "the ten newest unpinned, visible ones");
     }
 
     #[test]
