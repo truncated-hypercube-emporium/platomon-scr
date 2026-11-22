@@ -750,9 +750,6 @@ fn group(
             yy += 12;
         }
     }
-    if cells % 2 == 1 {
-        yy += 12;
-    }
     (y + body - 4, y + h)
 }
 
