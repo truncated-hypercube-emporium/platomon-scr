@@ -29,8 +29,9 @@ pub const RENDER_BUDGET: f32 = 0.15;
 /// factor).
 pub const FONT_MIN: i16 = 8;
 pub const FONT_MAX: i16 = 40;
-/// Smallest font after the density factor, pixels.
-pub const FONT_FLOOR: i16 = 4;
+/// Smallest font after the density factor, pixels (low enough that every
+/// rendering resolution up to Industrial Boiler, 6x, still differs).
+pub const FONT_FLOOR: i16 = 2;
 /// Width / height of a Consolas cell (only used to plan; the real value is
 /// measured once the font is set).
 pub const EST_CHAR_ASPECT: f32 = 0.55;
@@ -732,7 +733,7 @@ pub fn help(key: &str) -> &'static str {
         "fps_cap" => "Highest frame rate: the display's refresh rate, or a lower fixed cap.",
         "budget" => "Share of CPU time the rendering may use; the text size is chosen so it fits.",
         "overdrive" => "Ignore the CPU budget: rendering takes all the CPU time it wants (the text is sized for the whole CPU at the full frame rate, and frames render back to back). Expect full CPU load, heat and fan noise.",
-        "density" => "Double halves the text height (twice the characters per axis) at about 4x the rendering cost.",
+        "density" => "Space heating value",
         "levels" => "How many glyphs from dark to bright: 8, 16 or 32.",
         "colors" => "Colours per gradient: 16, 32, 64 or 128. More gives smoother colour; brightness colouring then redraws more cells each frame.",
         "sound" => "A second wireframe around each solid that swells and shrinks with the sound of the default output device.",
@@ -771,6 +772,8 @@ pub const WAVE_SPEEDS: [(&str, &str); 5] =
     [("0", "Still"), ("0.3", "Slow"), ("0.6", "Medium"), ("1.2", "Fast"), ("2.4", "Very fast")];
 /// Largest burn-in drift from the centred position, pixels per axis.
 pub const SHIFT_RADIUS_MAX: u8 = 25;
+/// Highest rendering resolution (Industrial Boiler: 6x the characters per axis).
+pub const DENSITY_MAX: u8 = 6;
 
 fn on_off(v: bool) -> String {
     if v { "on" } else { "off" }.to_string()
@@ -851,6 +854,10 @@ pub fn choices() -> Vec<Choice> {
     // shown with the look, but kept as set (not randomised) every run
     let styled = |key, label, options| Choice { key, label, options, look: false, appearance: true, panel: None };
     let always = |key, label, options| Choice { key, label, options, look: false, appearance: false, panel: None };
+    // sliders shown in the Tuning dialog: part of the look, or always applied
+    let tuning_look = |key, label, options| Choice { key, label, options, look: true, appearance: false, panel: Some(Panel::Tuning) };
+    let tuning_styled =
+        |key, label, options| Choice { key, label, options, look: false, appearance: false, panel: Some(Panel::Tuning) };
     let in_panel =
         |panel, key, label, options| Choice { key, label, options, look: false, appearance: false, panel: Some(panel) };
     vec![
@@ -891,9 +898,9 @@ pub fn choices() -> Vec<Choice> {
         ),
         look("bg_color", "Background colour", bg_colors),
         look("bg_pattern", "Background pattern", patterns),
-        look("bg_lum", "Background luminosity", lums),
-        look("bg_waves", "Quasicrystal waves (symmetry)", waves),
-        look("bg_wave_speed", "Quasicrystal flow", speeds),
+        tuning_look("bg_lum", "Background luminosity", lums),
+        tuning_look("bg_waves", "Quasicrystal waves", waves),
+        tuning_look("bg_wave_speed", "Quasicrystal flow", speeds),
         look("wireframe", "Wireframe overlay", on_off()),
         look("stats", "Stats bar", on_off()),
         look("fps_invert", "Inverted frame rate", on_off()),
@@ -905,7 +912,19 @@ pub fn choices() -> Vec<Choice> {
         always("fps_cap", "Frame-rate cap", caps),
         always("budget", "CPU budget", budgets),
         always("overdrive", "Overdrive", on_off()),
-        always("density", "Text density", vec![opt("1", "Standard"), opt("2", "Double (about 4x CPU)")]),
+        always(
+            "density",
+            "Rendering resolution",
+            vec![
+                opt("1", "Standard"),
+                opt("2", "Double"),
+                opt("3", "Triple"),
+                opt("4", "Quadruple"),
+                opt("5", "Quintuple"),
+                // a no-break space keeps both words in the drop-down
+                opt("6", "Industrial\u{a0}Boiler"),
+            ],
+        ),
         always(
             "levels",
             "Luminosity levels",
@@ -917,7 +936,7 @@ pub fn choices() -> Vec<Choice> {
             color::PALETTE_SIZES.iter().map(|n| opt(&n.to_string(), &format!("{n} colours"))).collect(),
         ),
         styled("sound", "Sound halo", on_off()),
-        styled(
+        tuning_styled(
             "halo_swing",
             "Halo size swing",
             HALO_SWING_PCT.iter().map(|p| opt(&p.to_string(), &format!("\u{b1}{p}%"))).collect(),
@@ -1060,7 +1079,7 @@ impl ScrSettings {
             },
             budget_pct: num("budget").filter(|b| (1..=100).contains(b)).map_or(d.budget_pct, |b| b as u8),
             overdrive: flag("overdrive", d.overdrive),
-            density: num("density").filter(|v| (1..=2).contains(v)).map_or(d.density, |v| v as u8),
+            density: num("density").filter(|v| (1..=DENSITY_MAX as u32).contains(v)).map_or(d.density, |v| v as u8),
             levels: val("levels").and_then(|v| parse_levels(&v)).unwrap_or(d.levels),
             colors: num("colors").map(|n| n as usize).filter(|n| color::PALETTE_SIZES.contains(n)).unwrap_or(d.colors),
             sound: flag("sound", d.sound),
@@ -1289,8 +1308,9 @@ mod tests {
         let (px2, cols2, rows2) = apply_density(&WQHD, 20, 2);
         assert_eq!(px2, 10);
         assert_eq!((cols2, rows2), (465, 144));
-        assert_eq!(apply_density(&WQHD, FONT_MIN, 2).0, FONT_FLOOR);
-        assert_eq!(apply_density(&WQHD, 5, 2).0, FONT_FLOOR, "never below the floor");
+        assert_eq!(apply_density(&WQHD, FONT_MIN, 2).0, 4);
+        assert_eq!(apply_density(&WQHD, 18, 6).0, 3, "Industrial Boiler: a sixth of the height");
+        assert_eq!(apply_density(&WQHD, 5, 6).0, FONT_FLOOR, "never below the floor");
         // the plan uses it: density 2 ⇒ half the font (or the floor) of the
         // budget size from the plan's own speed test (two separate speed
         // tests can differ, so compare against the same measurement)

@@ -436,7 +436,7 @@ later in Windows Security › Virus & threat protection › Exclusions).
 - **Palettes instead of 24-bit colour**: 16 (default), 32, 64 or 128 colours per gradient (*Palette size*, `--colors`).
 - **New colour sources**: each solid by its **spin** (speed and direction seen from the camera) or by the **sound** of its own frequency band, low frequencies on the simplest solids and high on the most complex.
 - **Background colour on its own**: auto, off, the solids' gradient, or a gradient of its own (*Background colour*, `--bg-color`).
-- **Settings dialog**: check boxes and sliders, one-word option names, *Tuning*, *Layout* (ordering, spacing) and *Rendering* dialogs, a live **Preview** (windowed, or *Fullscreen*), a **configuration log** of the last 10 OKs (each titled with a random word; `+` keeps one for good in `configuration.log`), and *Set as default*.
+- **Settings dialog**: check boxes and sliders, one-word option names, *Tuning*, *Layout* (ordering, spacing) and *Rendering* dialogs, a live **Preview** (windowed, or *Fullscreen*), a **configuration log** of the last 10 OKs (each titled with a random word; `+` keeps one for good in `configuration.log`).
 - **Halo size swing** is ±10% (was ±5%), ±30% or the new ±60%.
 - **Faster colour**: a palette-sized tile cache, a single glyph-and-colour pass and a tone-curve table make the colour pipeline 35–45% faster.
 - **Quasicrystal background** (`quasicrystal` pattern, with wave count and flow speed settings), and tags no longer cover the legend.
@@ -510,17 +510,19 @@ as the shift opens on the other side.
 the same dialog, run by a dialog procedure named `ScreenSaverConfigureDialog` as in the Win32
 screensaver interface. **Random start**, the last check box of the *Appearance* group (on by
 default), picks the look anew every run; turn it off to use the look chosen in the group instead:
-layout, camera, colour gradient and source, background colour, background pattern and luminosity,
-wireframe, stats bar, inverted frame rate and extra metrics (greyed out while Random start is on).
-The **Randomize** button beside it rolls a random look into those settings and random values into
-every *Tuning* slider now, and turns Random start off so they are kept (saved with OK or *Apply*).
-The rest of *Appearance* always applies, Random start or not: halo size
-swing, halo colour, tag colour, *Tag style*, sound halo, halo bounce by frequency, extended floor
-distance and *Tags*. The *Performance & Features* group always applies too: the frame-rate cap (the
-display's refresh rate by default), the CPU budget used to size the text, the text density, the
+layout, camera, colour gradient and source, background colour and pattern, wireframe, stats bar,
+inverted frame rate and extra metrics, plus the background luminosity and quasicrystal sliders in
+*Tuning* (all greyed out while Random start is on). The **Randomize** button beside it rolls a
+random look into those settings and random values into every *Tuning* slider now, and turns Random
+start off so they are kept (saved with OK or *Apply*). The rest of *Appearance* always applies,
+Random start or not: halo colour, tag colour, *Tag style*, sound halo, halo bounce by frequency,
+extended floor distance and *Tags*. The *Performance & Features* group always applies too: the frame-rate cap (the
+display's refresh rate by default), the CPU budget used to size the text, the *Rendering resolution*, the
 number of luminosity levels, the palette size, dynamic camera distance and fixed tag length, with
-the OLED burn-in shift (on/off, frame interval, range) nested at its bottom. On/off settings are check boxes, settings with three or more numeric steps
-are sliders showing their value, and drop-downs show each option by its leading word, capitalised
+the OLED burn-in shift (on/off, frame interval, range) nested at its bottom. On/off settings are
+check boxes, settings with three or more numeric steps are sliders showing their value (the main
+dialog's are the CPU budget, luminosity levels, palette size and burn-in range; the rest are in
+*Tuning*), and drop-downs show each option by its leading word, capitalised
 (the settings file keeps the lowercase names).
 
 **Layout and Rendering.** *Layout…* (beside *Tuning…*) opens the layout settings that apply every
@@ -530,7 +532,9 @@ settings: samples per cell, light bounces, march steps and render distance (auto
 own 1 sample and 1 bounce) and adaptive quality. Their sliders work like *Tuning*'s and are saved the
 same way (`tune_spacing`, `tune_spp`, ...); `ordering` and `adaptive` are plain keys.
 
-**Tuning.** *Tuning…* opens a dialog of sliders for numeric values: orbit period and bob,
+**Tuning.** *Tuning…* opens a dialog of sliders: background luminosity, quasicrystal waves and
+flow and halo size swing (stepped like the main dialog's sliders, saved as plain keys), then numeric
+values: orbit period and bob,
 focus zoom and glide, floor contrast, tile size, sway and its period, floor turn period, smallest
 and largest solid size, idle and fastest spin, and exposure. Moving a slider sets that value for
 every run (random look or not); *×* or *Reset all* returns it to auto (the random look's or the
@@ -541,7 +545,7 @@ half the screen's size, rendered at half resolution with the full-screen run's t
 inside the window closes it. With *Fullscreen* ticked it covers the whole screen at full
 resolution instead; it ignores the mouse and closes on any key. While it runs, edits show live (the
 dialog writes them to `preview.ini` beside the settings file, and the preview reads that a few times
-a second, keeping its random look). Edits to the CPU budget, overdrive, text density and frame-rate cap set the
+a second, keeping its random look). Edits to the CPU budget, overdrive, rendering resolution and frame-rate cap set the
 text size, which is fixed once the preview's window exists; after one of those, or after ticking or
 unticking *Fullscreen*, the button reads *Restart* and starts a new preview. Closing the dialog
 closes the preview. Run it directly with `platomon.scr /w` or `/w full`.
@@ -549,20 +553,23 @@ closes the preview. Run it directly with `platomon.scr /w` or `/w full`.
 **Configuration log.** Each OK or *Apply* (which saves without closing) adds an entry to the log on
 the right, titled with a random English word and the time, holding the settings and the arguments
 the dialog was launched with. Entries always hold the look with *Random start* off, so
-loading one brings back that look; a save whose settings are already logged adds no new entry. Pick an entry to see them; *Load into dialog* puts its settings back in the
-controls (saved only with OK). The newest 10 entries are kept; the `+` beside an entry keeps it
+loading one brings back that look; a save whose settings are already logged adds no new entry. Pick an entry to see them in the box below the
+list; the box can be edited, and *Load config* puts the settings it holds (its `key=value` lines
+after `[platomon]`, as edited) back in the controls (saved only with OK). The newest 10 entries are kept; the `+` beside an entry keeps it
 (the button turns to `−`, which lets it go again) and saves it to `configuration.log` beside the
-settings file, and kept entries are never dropped. The `⊗` at an entry's right takes it off the list
+settings file, and kept entries are never dropped. The `x` at an entry's right takes it off the list
 without deleting it: it stays in the log file (marked `hidden=1`, and never dropped), and a kept
 entry stays in `configuration.log` too; saving the same settings again puts it back on the list.
 The log itself is `config-log.ini`.
 
-**Defaults.** *Set as default* saves the dialog's current settings as your defaults (in
-`configuration.log`); a first run with no settings file starts from them.
+**Defaults.** Defaults saved earlier with the (now removed) *Set as default* button stay in
+`configuration.log`, and a first run with no settings file still starts from them.
 
-**Text density.** The text is first sized so rendering fits the CPU budget, then (with the default
-double density) set at half that height, never below 4 px: twice the characters per axis, about 4x
-the rendering cost of the budget. Choose Standard to keep the budget-sized text.
+**Rendering resolution.** The text is first sized so rendering fits the CPU budget, then divided:
+Standard keeps the budget-sized text, Double (the default) halves its height, and Triple,
+Quadruple, Quintuple and Industrial Boiler divide it by 3, 4, 5 and 6, never below 2 px. N times the
+characters per axis costs about N² times the budget's rendering: Industrial Boiler is about 36x
+(INI `density=1`..`6`).
 
 **Overdrive.** The check box beside the CPU budget slider ignores the budget: the text is sized for
 the whole CPU at the full frame rate, and full frames render back to back with no pause between

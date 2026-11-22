@@ -29,7 +29,7 @@ pub struct LogEntry {
     /// The settings as `(INI key, value)`, in INI order.
     pub settings: Vec<(String, String)>,
     pub pinned: bool,
-    /// Taken off the dialog's list with its `⊗` button; still kept in the
+    /// Taken off the dialog's list with its `x` button; still kept in the
     /// files (and still counted as logged).
     pub hidden: bool,
 }
