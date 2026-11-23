@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use crate::aspect::AspectMode;
 use crate::clock::FpsCurve;
 use crate::color::{self, ColorBy, ColorMap, Gradient, HaloColor};
-use crate::scene::{Arrangement, Layout, OrbitCenter, OrbitParams, Ordering, SPACING_RANGE};
+use crate::scene::{Arrangement, DISTANCE_SCALE_RANGE, Layout, OrbitCenter, OrbitParams, Ordering, SPACING_RANGE};
 use crate::metrics::{MetricKind, MetricSpec};
 use crate::overlay::{LEGEND_SIZE_MAX, LEGEND_SIZE_MIN, LegendParams, LegendPos};
 use crate::scene::camera::{CameraMode, OrbitDir};
@@ -133,6 +133,9 @@ pub struct Config {
     pub ordering: Ordering,
     /// Neighbour spacing as a multiple of the standard, 0.8..=2.5.
     pub spacing: f32,
+    /// Distance scaling, -2..=2: each solid's size times 1 + k × (its
+    /// nearest neighbour's distance / the standard spacing − 1); 0 = off.
+    pub distance_scale: f32,
     /// Orbit layout: the solid in the centre, `cpu`, `ram`, `net`, `disk`,
     /// `size` (the largest at the moment) or `spin` (the fastest).
     pub orbit_center: OrbitCenter,
@@ -262,6 +265,7 @@ impl Default for Config {
             layout: Layout::Rings,
             ordering: Ordering::Listed,
             spacing: 1.0,
+            distance_scale: 0.0,
             orbit_center: OrbitParams::default().center,
             orbit_velocity: OrbitParams::default().velocity,
             orbit_inclination: OrbitParams::default().inclination,
@@ -374,6 +378,7 @@ impl Config {
         self.max_steps = self.max_steps.clamp(8, 1024);
         self.max_dist = finite_or(self.max_dist, d.max_dist).clamp(5.0, 1000.0);
         self.spacing = finite_or(self.spacing, d.spacing).clamp(SPACING_RANGE.0, SPACING_RANGE.1);
+        self.distance_scale = finite_or(self.distance_scale, 0.0).clamp(DISTANCE_SCALE_RANGE.0, DISTANCE_SCALE_RANGE.1);
         let o = self.orbit_params().sanitized();
         (self.orbit_velocity, self.orbit_inclination, self.orbit_eccentricity, self.orbit_variation) =
             (o.velocity, o.inclination, o.eccentricity, o.variation);
@@ -459,6 +464,7 @@ impl Config {
             layout: self.layout,
             ordering: self.ordering,
             spacing: self.spacing,
+            distance_scale: self.distance_scale,
             seed: self.seed.unwrap_or(0),
             orbit: self.orbit_params(),
             center_slot,

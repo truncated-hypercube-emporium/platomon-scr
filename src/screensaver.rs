@@ -634,7 +634,7 @@ macro_rules! tunable {
 /// Every numeric setting set with a slider, in the Tuning, Layout and
 /// Rendering dialogs ([`Tunable::panel`]). A set value applies every run
 /// (random look or not); unset ones keep the random or default value.
-pub const TUNABLES: [Tunable; 23] = [
+pub const TUNABLES: [Tunable; 24] = [
     tunable!(Tuning, "orbit_period", "Orbit period (s)", 15.0, 180.0, 5.0, "Seconds per camera orbit (orbit, tilt and resonance cameras). Tilt also takes one period per rise or fall."),
     tunable!(Tuning, "orbit_bob", "Orbit bob", 0.0, 1.0, 0.05, "How far the orbiting camera rises and falls twice per turn, in world units."),
     tunable!(Tuning, "focus_zoom", "Focus zoom", 0.0, 1.0, 0.05, "Focus camera: 0 only turns toward the busiest solid, 1 comes in to a close-up."),
@@ -650,6 +650,7 @@ pub const TUNABLES: [Tunable; 23] = [
     tunable!(Tuning, "max_spin", "Fastest spin (rad/s)", 0.5, 8.0, 0.25, "How fast a solid spins at full load."),
     tunable!(Tuning, "exposure", "Exposure", 0.3, 3.0, 0.1, "Overall picture brightness before it is turned into glyphs."),
     tunable!(Layout, "spacing", "Spacing", 0.8, 2.5, 0.05, "Distance between neighbouring solids (and between rings, shells or orbits), as a multiple of the standard spacing."),
+    tunable!(Layout, "distance_scale", "Distance scaling", -2.0, 2.0, 0.1, "Scales each solid's size by how far away its nearest neighbour is: size x (1 + this x (distance / standard spacing - 1)). Positive grows solids with room around them and shrinks crowded ones; negative does the reverse; 0 is off. Moving solids (Orbit layout) resize smoothly as they pass each other."),
     tunable!(Layout, "orbit_velocity", "Orbit velocity", 0.05, 2.0, 0.05, "Orbit layout: how fast the innermost orbit goes round, in radians per second (0.35 is about 18 s per turn). Outer orbits take longer."),
     tunable!(Layout, "orbit_inclination", "Orbital inclination", 0.0, 90.0, 5.0, "Orbit layout: how far the orbits tilt from the floor, in degrees (0 = flat, 90 = upright)."),
     tunable!(Layout, "orbit_eccentricity", "Orbital eccentricity", 0.0, 0.8, 0.05, "Orbit layout: 0 = circular orbits, higher = longer ellipses, the solids speeding up as they swing close to the centre."),
@@ -678,6 +679,7 @@ pub fn set_tunable(c: &mut Config, key: &str, v: f32) {
         "max_spin" => c.max_spin = v,
         "exposure" => c.exposure = v,
         "spacing" => c.spacing = v,
+        "distance_scale" => c.distance_scale = v,
         "orbit_velocity" => c.orbit_velocity = v,
         "orbit_inclination" => c.orbit_inclination = v,
         "orbit_eccentricity" => c.orbit_eccentricity = v,
@@ -719,6 +721,7 @@ pub fn get_tunable(c: &Config, key: &str) -> f32 {
         "max_spin" => c.max_spin,
         "exposure" => c.exposure,
         "spacing" => c.spacing,
+        "distance_scale" => c.distance_scale,
         "orbit_velocity" => c.orbit_velocity,
         "orbit_inclination" => c.orbit_inclination,
         "orbit_eccentricity" => c.orbit_eccentricity,

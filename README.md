@@ -29,6 +29,7 @@ platomon [OPTIONS]
 | `--layout` | `rings` (on the ground), `sphere` (concentric spherical shells), `line` (one evenly spaced row), `stack` (one above another in the centre) or `orbit` (one solid in the centre, the others orbiting it) | `rings` |
 | `--ordering` | which solid takes which place: `listed` (metric order), `simple` (simplest first), `complex` (most complex first) or `random` | `listed` |
 | `--spacing` | neighbour spacing as a multiple of the standard, 0.8–2.5 | `1` |
+| `--distance-scale` | each solid's size times 1 + N × (nearest neighbour's distance ÷ standard spacing − 1), −2–2; 0 = off | `0` |
 | `--orbit-center` | orbit layout: the solid in the centre, `cpu`, `ram`, `net`, `disk`, `size` (largest now) or `spin` (fastest now) | `cpu` |
 | `--orbit-velocity` | orbit layout: angular speed of the innermost orbit, radians/s, 0.05–2 | `0.35` |
 | `--orbit-inclination` | orbit layout: tilt of the orbits, degrees, 0–90 | `15` |
@@ -141,6 +142,14 @@ solid (fewest edges, faces breaking ties) first and the most complex last, `comp
 and `random` shuffles them (the same for a given seed). The first place is the inner ring's front,
 the inner shell, the line's left end or the stack's bottom. `--spacing` scales the distance between
 neighbours (and between rings and shells).
+
+`--distance-scale N` (−2 to 2, default 0 = off) sizes each solid by the room around it: its size is
+multiplied by 1 + N × (d ÷ the standard spacing − 1), where d is the distance to its nearest
+neighbour, clamped to 0.2×–2.5×. A solid exactly the standard spacing from its neighbour keeps its
+size; with a positive N, solids with more room grow and crowded ones shrink, and a negative N does
+the reverse. It works in every layout (wider `--spacing` gives it more to work with); in the orbit
+layout the distances change as the solids move, so their sizes change smoothly with them. Floating
+heights and camera framing allow for the largest size it can give.
 
 ### Orbit layout
 
@@ -556,12 +565,12 @@ dialog's are the CPU budget, luminosity levels, palette size and burn-in range; 
 **Layout and Rendering.** *Layout…* (beside *Tuning…*) opens the layout settings that apply every
 run: *Ordering* (as listed, simple to complex, complex to simple, or random; see *Line and stack
 layouts* above), *Orbit centre* (CPU, RAM, Network, Disk, Size or Spin) and the sliders *Spacing*,
-*Orbit velocity*, *Orbital inclination*, *Orbital eccentricity* and *Orbital variation* (see *Orbit
+*Distance scaling* (−2 to 2, centred on 0 = off; see *Line and stack layouts* above), *Orbit velocity*, *Orbital inclination*, *Orbital eccentricity* and *Orbital variation* (see *Orbit
 layout* above; the orbit settings only matter with the Orbit layout, and a random look rolls its own
 orbit sliders unless they are set). *Rendering…* (in the frame-rate cap's row) opens the rendering
 settings: samples per cell, light bounces, march steps and render distance (auto: the screensaver's
 own 1 sample and 1 bounce) and adaptive quality. Their sliders work like *Tuning*'s and are saved the
-same way (`tune_spacing`, `tune_orbit_velocity`, `tune_spp`, ...); `ordering`, `orbit_center` and
+same way (`tune_spacing`, `tune_distance_scale`, `tune_orbit_velocity`, `tune_spp`, ...); `ordering`, `orbit_center` and
 `adaptive` are plain keys.
 
 **Tuning.** *Tuning…* opens a dialog of sliders: background luminosity, quasicrystal waves and

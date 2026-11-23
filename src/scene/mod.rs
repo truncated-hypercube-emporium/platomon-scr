@@ -368,6 +368,9 @@ pub struct Arrangement {
     pub ordering: Ordering,
     /// Neighbour spacing as a multiple of the standard (1 = as tuned).
     pub spacing: f32,
+    /// Distance scaling, -2..=2: each solid's size times
+    /// [`distance_factor`] of its nearest neighbour's distance (0 = off).
+    pub distance_scale: f32,
     /// Seed for [`Ordering::Random`] (and the orbits' variation).
     pub seed: u64,
     /// The orbit layout's settings.
@@ -383,6 +386,7 @@ impl Default for Arrangement {
             layout: Layout::Rings,
             ordering: Ordering::Listed,
             spacing: 1.0,
+            distance_scale: 0.0,
             seed: 0,
             orbit: OrbitParams::default(),
             center_slot: None,
@@ -392,6 +396,39 @@ impl Default for Arrangement {
 
 /// Spacing range for [`Arrangement::spacing`].
 pub const SPACING_RANGE: (f32, f32) = (0.8, 2.5);
+/// Range of [`Arrangement::distance_scale`] (0 = off).
+pub const DISTANCE_SCALE_RANGE: (f32, f32) = (-2.0, 2.0);
+/// Smallest and largest size multiplier distance scaling gives.
+pub const DISTANCE_FACTOR: (f32, f32) = (0.2, 2.5);
+
+fn clamp_distance_scale(k: f32) -> f32 {
+    if k.is_finite() { k.clamp(DISTANCE_SCALE_RANGE.0, DISTANCE_SCALE_RANGE.1) } else { 0.0 }
+}
+
+/// Distance scaling: the size multiplier for a solid whose nearest
+/// neighbour is `d` away, `1 + k × (d / SPACING − 1)`: at the standard
+/// spacing it keeps its size; further out a positive `k` grows it and a
+/// negative one shrinks it (closer in, the other way round). Clamped to
+/// [`DISTANCE_FACTOR`]; 1 with no neighbour.
+pub fn distance_factor(k: f32, d: f32) -> f32 {
+    if k == 0.0 || !d.is_finite() {
+        return 1.0;
+    }
+    (1.0 + k * (d / SPACING - 1.0)).clamp(DISTANCE_FACTOR.0, DISTANCE_FACTOR.1)
+}
+
+/// [`distance_factor`] for every point of `pos` from its nearest neighbour.
+fn nearest_factors(k: f32, pos: &[Vec3A]) -> Vec<f32> {
+    (0..pos.len())
+        .map(|i| {
+            if k == 0.0 {
+                return 1.0;
+            }
+            let d = (0..pos.len()).filter(|&j| j != i).map(|j| (pos[i] - pos[j]).length()).fold(f32::INFINITY, f32::min);
+            distance_factor(k, d)
+        })
+        .collect()
+}
 
 /// Camera distance multiplier for the sphere layout.
 const SPHERE_FRAMING: f32 = 1.45;
@@ -442,6 +479,10 @@ pub struct Scene {
     challenger: Option<(usize, f32)>,
     /// Orbit layout: the orbits (`ring_pos` follows them every frame).
     pub orbits: Option<Orbits>,
+    /// Distance scaling factor, -2..=2 (0 = off).
+    distance_scale: f32,
+    /// Per solid: its size multiplier from distance scaling.
+    pub size_factor: Vec<f32>,
 }
 
 impl Scene {
@@ -465,11 +506,22 @@ impl Scene {
         let rings: Vec<Option<u32>> = order.iter().map(|&i| slots[i].ring).collect();
         let max_r = BASE_RADIUS * anim.max_scale.max(anim.min_scale);
         let float_y = max_r * HALO_REACH_MAX + FLOAT_GAP;
+        let k_dist = clamp_distance_scale(arr.distance_scale);
         // Orbits: the centre is raised so the lowest point of any orbit
         // keeps the largest halo clear of the ground.
-        let orbits = (layout == Layout::Orbit).then(|| {
+        let mut orbits = (layout == Layout::Orbit).then(|| {
             Orbits::new(&order, &arr.orbit, arr.center_slot, SPACING * spacing, MIN_RING_RADIUS * spacing, float_y, arr.seed)
         });
+        // Orbiting solids' neighbours come and go: allow for the largest
+        // size distance scaling can give them (a negative factor grows
+        // solids as they pass close; a positive one as they spread out).
+        let orbit_grow = orbits.as_ref().map(|o| match k_dist {
+            k if k < 0.0 => DISTANCE_FACTOR.1,
+            k => distance_factor(k, 2.0 * o.reach),
+        });
+        if let (Some(o), Some(g)) = (&mut orbits, orbit_grow) {
+            o.centre.y += max_r * (g - 1.0).max(0.0) * HALO_REACH_MAX;
+        }
         let (placed, placed_index, centroid) = match layout {
             Layout::Orbit => {
                 let o = orbits.as_ref().expect("orbit layout has orbits");
@@ -492,9 +544,17 @@ impl Scene {
             ring_pos[i] = placed[k];
             ring_index[i] = placed_index[k];
         }
+        // Distance scaling: each solid's size factor from its nearest
+        // neighbour (fixed, but for orbits, where it follows them), and the
+        // largest it can get, which sets how high everything floats.
+        let size_factor = nearest_factors(k_dist, &ring_pos);
+        let grow = orbit_grow.unwrap_or_else(|| size_factor.iter().copied().fold(0.0, f32::max)).max(DISTANCE_FACTOR.0);
+        let max_r = max_r * grow;
+        let float_y = max_r * HALO_REACH_MAX + FLOAT_GAP;
         // (orbiting solids reach their apoapsis, wherever they start)
         let reach = orbits.as_ref().map_or(0.0, |o| o.reach);
-        let extent = ring_pos.iter().map(|p| (*p - centroid).length()).fold(reach, f32::max) + BASE_RADIUS * anim.max_scale;
+        let extent =
+            ring_pos.iter().map(|p| (*p - centroid).length()).fold(reach, f32::max) + BASE_RADIUS * anim.max_scale * grow;
         // Float the solids so their largest halo clears the ground: rings
         // and lines hover at a fixed height (the camera's aim rises with
         // them); a sphere of shells or a stack is lifted if its lowest halo
@@ -561,14 +621,16 @@ impl Scene {
             // Rotation centre: the focal point the camera looks at, on the ground.
             ground: Ground::new(&GroundParams::default(), Vec2::new(centroid.x, centroid.z)),
             slab_top: 2.0 * BASE_RADIUS + HOVER,
-            max_radius: BASE_RADIUS * anim.max_scale.max(anim.min_scale),
+            max_radius: max_r,
             grounded,
             focus: None,
             challenger: None,
             orbits,
+            distance_scale: k_dist,
+            size_factor,
         };
         for i in 0..s.solids.len() {
-            s.set_scale(i, anim.min_scale);
+            s.set_scale(i, anim.min_scale * s.size_factor[i]);
         }
         s.refresh_transforms();
         s
@@ -692,11 +754,15 @@ impl Scene {
             for (i, p) in self.ring_pos.iter_mut().enumerate() {
                 *p = o.position(i);
             }
+            if self.distance_scale != 0.0 {
+                self.size_factor = nearest_factors(self.distance_scale, &self.ring_pos);
+            }
         }
         for i in 0..self.solids.len() {
             let c = channels.get(i).copied().unwrap_or_default();
             let (level, sy, sx) = if c.available { (c.level, c.spin_y, c.spin_x) } else { (0.0, 0.0, 0.0) };
-            let scale = anim.min_scale + (anim.max_scale - anim.min_scale) * level.clamp(0.0, 1.0);
+            let scale = (anim.min_scale + (anim.max_scale - anim.min_scale) * level.clamp(0.0, 1.0))
+                * self.size_factor.get(i).copied().unwrap_or(1.0);
             self.set_scale(i, scale);
             let yaw_rate = anim.idle_spin + span * sy.clamp(0.0, 1.0);
             let pitch_rate = 0.5 * anim.idle_spin + span * sx.clamp(0.0, 1.0);
@@ -970,6 +1036,48 @@ mod tests {
         assert!((s.solids[2].center - s.centroid).length() < 1e-4, "CPU's solid holds the centre");
         assert!(s.solids.iter().zip(&start).enumerate().all(|(i, (a, b))| i == 2 || (a.center - *b).length() > 0.1), "the rest moved");
         assert_eq!("orbit".parse::<Layout>().unwrap(), Layout::Orbit);
+    }
+
+    #[test]
+    fn distance_scaling_sizes_solids_by_their_nearest_neighbour() {
+        let anim = AnimParams::default();
+        // a line at double spacing: every neighbour is 2 standard spacings away
+        let slots: Vec<SlotLayout> = DEFAULT_SOLIDS.iter().map(|&solid| SlotLayout { solid, ring: None }).collect();
+        let build = |layout, distance_scale| {
+            let arr = Arrangement { layout, spacing: 2.0, distance_scale, ..Arrangement::default() };
+            let mut s = Scene::arranged(&slots, &anim, &CameraParams::default(), &arr);
+            s.update(&full(5), &anim, 0.1);
+            s
+        };
+        let plain = build(Layout::Line, 0.0);
+        let big = build(Layout::Line, 0.5);
+        let small = build(Layout::Line, -0.5);
+        for i in 0..5 {
+            let r = plain.solids[i].scale;
+            assert!((big.solids[i].scale - 1.5 * r).abs() < 1e-4, "1 + 0.5 x (2 - 1)");
+            assert!((small.solids[i].scale - 0.5 * r).abs() < 1e-4);
+            assert!(big.solids[i].center.y - big.solids[i].scale * HALO_REACH_MAX >= FLOAT_GAP - 1e-3, "grown halos clear the floor");
+        }
+        assert!(big.extent > plain.extent);
+        // clamped at both ends
+        assert_eq!(distance_factor(2.0, 100.0), DISTANCE_FACTOR.1);
+        assert_eq!(distance_factor(-2.0, 100.0), DISTANCE_FACTOR.0);
+        assert_eq!(distance_factor(1.5, SPACING), 1.0);
+        assert_eq!(distance_factor(1.5, f32::INFINITY), 1.0, "no neighbour");
+        // orbits: sizes follow the moving neighbours, and stay clear of the floor
+        for k in [-0.5, 0.5] {
+            let arr = Arrangement { layout: Layout::Orbit, distance_scale: k, ..Arrangement::default() };
+            let mut s = Scene::arranged(&slots, &anim, &CameraParams::default(), &arr);
+            let mut seen = Vec::new();
+            for _ in 0..300 {
+                s.update(&full(5), &anim, 1.0 / 30.0);
+                seen.push(s.size_factor[1]);
+                for inst in &s.solids {
+                    assert!(inst.center.y - inst.scale * HALO_REACH_MAX >= FLOAT_GAP - 1e-3, "k={k}");
+                }
+            }
+            assert!(seen.iter().any(|f| (f - seen[0]).abs() > 1e-3), "k={k}: the factor changes as solids move");
+        }
     }
 
     #[test]

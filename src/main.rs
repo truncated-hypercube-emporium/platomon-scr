@@ -187,6 +187,11 @@ struct Cli {
     /// Neighbour spacing as a multiple of the standard, 0.8..2.5 (default 1).
     #[arg(long, value_name = "FLOAT")]
     spacing: Option<f32>,
+    /// Distance scaling, -2..2: each solid's size times 1 + N x (its nearest neighbour's
+    /// distance / the standard spacing - 1); positive grows isolated solids, negative shrinks
+    /// them (default 0 = off).
+    #[arg(long, value_name = "-2..2", allow_hyphen_values = true)]
+    distance_scale: Option<f32>,
 
     // ---- display ratio
     /// Picture ratio: fill, a preset (vga, wxga, fhd, uwqhd, ... see --list aspects) or W:H.
@@ -277,7 +282,7 @@ fn apply_cli(cfg: &mut Config, cli: &Cli) -> Result<(), String> {
     set!(bg_lum, bg_pattern, bg_contrast, bg_scale, bg_sway, bg_sway_period, bg_rotate, bg_rotate_period, bg_waves, bg_wave_speed);
     set!(legend_size, legend_opacity, legend_pos);
     set!(color, color_by, bg_color, layout, ordering, spacing, focus_zoom, focus_tau);
-    set!(orbit_center, orbit_velocity, orbit_inclination, orbit_eccentricity, orbit_variation);
+    set!(distance_scale, orbit_center, orbit_velocity, orbit_inclination, orbit_eccentricity, orbit_variation);
     if let Some(n) = &cli.colors {
         cfg.colors = n.parse().unwrap_or(color::DEFAULT_COLORS);
     }
