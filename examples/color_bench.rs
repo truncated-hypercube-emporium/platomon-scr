@@ -174,7 +174,7 @@ fn main() {
                     tags: false,
                     tag_labels: &[],
                     tag_ink: platomon::color::NONE,
-                    tag_blocks: false,
+                    tag_scale: 0,
                     tag_fixed: false,
                 };
                 let view = f.view();

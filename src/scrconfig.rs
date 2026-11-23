@@ -704,8 +704,9 @@ const LOG_W: i16 = 176;
 const DLG_W: i16 = LOG_X + LOG_W + 8;
 
 /// Check boxes drawn at the end of another setting's row instead of in the
-/// group's check-box grid: (row's setting, check box's setting).
-const INLINE_TOGGLES: [(&str, &str); 1] = [("budget", "overdrive")];
+/// group's check-box grid: (row's setting, check box's setting, whether the
+/// box being on greys out the row).
+const INLINE_TOGGLES: [(&str, &str, bool); 2] = [("budget", "overdrive", true), ("density", "density_manual", false)];
 
 /// Buttons drawn between a drop-down's label and the drop-down: (row's
 /// setting, button id, text).
@@ -736,7 +737,7 @@ fn group(
     extra: &[ExtraToggle],
     tail: i16,
 ) -> (i16, i16) {
-    let inline = |c: &Choice| INLINE_TOGGLES.iter().any(|&(_, k)| k == c.key);
+    let inline = |c: &Choice| INLINE_TOGGLES.iter().any(|&(_, k, _)| k == c.key);
     let toggles: Vec<&(usize, &Choice)> = items.iter().filter(|(_, c)| kind(c) == Kind::Toggle && !inline(c)).collect();
     let rest: Vec<&(usize, &Choice)> = items.iter().filter(|(_, c)| kind(c) != Kind::Toggle).collect();
     let cells = toggles.len() + extra.len();
@@ -750,9 +751,14 @@ fn group(
         // a check box of this group that sits at the end of this row
         let beside = INLINE_TOGGLES
             .iter()
-            .filter(|&&(row, _)| row == c.key)
-            .find_map(|&(_, k)| items.iter().find(|(_, tc)| tc.key == k));
+            .filter(|&&(row, _, _)| row == c.key)
+            .find_map(|&(_, k, _)| items.iter().find(|(_, tc)| tc.key == k));
         match kind(c) {
+            Kind::Combo if beside.is_some() => {
+                let &(j, tc) = beside.expect("checked");
+                t.item(CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, (120, yy, 116, 160), id as u16, COMBOBOX, "");
+                t.item(BS_AUTOCHECKBOX | WS_TABSTOP, (242, yy + 2, 52, 10), (ID_COMBO + j as i32) as u16, BUTTON, tc.label);
+            }
             Kind::Slider if beside.is_some() => {
                 let &(j, tc) = beside.expect("checked");
                 t.slider(TBS_AUTOTICKS, (120, yy - 1, 84, 14), id);
@@ -1260,7 +1266,7 @@ unsafe fn enable_look(h: HWND) {
 /// Grey out each row whose inline check box takes over its setting (the
 /// CPU budget while overdrive is on).
 unsafe fn enable_inline(h: HWND) {
-    for (row, k) in INLINE_TOGGLES {
+    for (row, k, _) in INLINE_TOGGLES.into_iter().filter(|t| t.2) {
         let (Some(row_id), Some(box_id)) = (choice_id(row), choice_id(k)) else { continue };
         // SAFETY: control ids from our template.
         unsafe {
@@ -1667,7 +1673,7 @@ pub unsafe extern "system" fn ScreenSaverConfigureDialog(h: HWND, msg: u32, w: u
                     _ => 0,
                 };
                 if !matches!(id, IDOK | IDCANCEL) {
-                    if code == BN_CLICKED && INLINE_TOGGLES.iter().any(|(_, k)| choice_id(k) == Some(id)) {
+                    if code == BN_CLICKED && INLINE_TOGGLES.iter().any(|(_, k, _)| choice_id(k) == Some(id)) {
                         enable_inline(h);
                     }
                     sync_preview(h);

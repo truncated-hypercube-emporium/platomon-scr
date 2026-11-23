@@ -602,7 +602,7 @@ fn snapshot(cfg: &Config, slots: &[SlotSpec], ratio: Option<f32>, (w, h): (usize
         tags: cfg.tags,
         tag_labels: &labels,
         tag_ink: cfg.tag_ink(cmap.as_ref()),
-        tag_blocks: cfg.tag_blocks,
+        tag_scale: cfg.tag_blocks as u8,
         tag_fixed: cfg.tag_fixed_len,
     };
     let mut overlays = Overlays::new(&scene);
@@ -942,7 +942,7 @@ fn run(
             tags,
             tag_labels: &tag_labels,
             tag_ink,
-            tag_blocks: cfg.tag_blocks,
+            tag_scale: cfg.tag_blocks as u8,
             tag_fixed: cfg.tag_fixed_len,
         };
         if let Some(view) = renderer.view() {

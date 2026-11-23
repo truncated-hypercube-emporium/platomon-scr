@@ -827,7 +827,7 @@ mod win {
         // Solid tags: one short metric label per solid, refreshed every full frame.
         let tags_on = s.tags;
         let tag_ink = s.tag_color.resolve(cmap.as_ref().map(|m| &m.gradient));
-        let tag_blocks = s.tag_text.blocks(plan.font_px);
+        let tag_blocks = s.tag_text.scale(plan.font_px);
         let mut tag_labels: Vec<String> = Vec::new();
         // Sound: the halo, and/or the solids' colours by their frequency band.
         let halo_on = s.sound;
@@ -1102,8 +1102,8 @@ mod win {
         levels: &'a [f32],
         halo: Option<Halo>,
         halo_factors: &'a [f32],
-        // Tag labels and colour, when tags are on.
-        tags: Option<(&'a [String], u32, bool)>,
+        // Tag labels, colour and text size, when tags are on.
+        tags: Option<(&'a [String], u32, u8)>,
     ) -> OverlayOptions<'a> {
         OverlayOptions {
             wireframe: cfg.wireframe,
@@ -1120,7 +1120,7 @@ mod win {
             tags: tags.is_some(),
             tag_labels: tags.map_or(&[][..], |t| t.0),
             tag_ink: tags.map_or(color::NONE, |t| t.1),
-            tag_blocks: tags.is_some_and(|t| t.2),
+            tag_scale: tags.map_or(0, |t| t.2),
             tag_fixed: cfg.tag_fixed_len,
         }
     }

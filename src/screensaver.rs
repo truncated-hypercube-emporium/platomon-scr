@@ -253,21 +253,39 @@ pub fn plan(d: &Display, seed: u64, s: &ScrSettings) -> Result<Plan, String> {
     let config = plan_config(d, seed, s);
     let spc = seconds_per_cell(&config)?;
     let budget = s.budget();
-    let (px, ..) = font_height(d, config.fps_max, spc, budget);
-    let (font_px, cols, rows) = apply_density(d, px, s.density);
+    let (font_px, cols, rows) = if s.density_manual {
+        manual_font(d, s.density)
+    } else {
+        let (px, ..) = font_height(d, config.fps_max, spc, budget);
+        apply_density(d, px, s.density)
+    };
     Ok(Plan { config, font_px, est_grid: (cols, rows), sec_per_cell: spc, budget, settings: s.clone() })
+}
+
+/// Manual rendering resolution: rows of text on the screen at Standard
+/// (each step adds as many again: Double = 120, Industrial Boiler = 360).
+pub const MANUAL_ROWS: u32 = 60;
+
+/// The font for a manual rendering resolution: the display's height over
+/// [`MANUAL_ROWS`] × `density` rows (never below [`FONT_FLOOR`] or above
+/// [`FONT_MAX`]). Returns (height, est. cols, est. rows).
+pub fn manual_font(d: &Display, density: u8) -> (i16, u32, u32) {
+    let h = d.height.max(200) as f32;
+    let rows = (MANUAL_ROWS * density.max(1) as u32) as f32;
+    let px = (h / rows).round().clamp(FONT_FLOOR as f32, FONT_MAX as f32) as i16;
+    apply_density(d, px, 1)
 }
 
 /// The settings a running preview cannot pick up: they set the text size
 /// (CPU budget, density, and the frame-rate cap the budget is spread
 /// over), which is fixed once its window is made.
-pub const PREVIEW_RESTART_KEYS: [&str; 4] = ["budget", "overdrive", "density", "fps_cap"];
+pub const PREVIEW_RESTART_KEYS: [&str; 5] = ["budget", "overdrive", "density", "density_manual", "fps_cap"];
 
 /// Whether `edited` changes a setting the preview started with `running`
 /// cannot apply live (see [`PREVIEW_RESTART_KEYS`]).
 pub fn preview_needs_restart(running: &ScrSettings, edited: &ScrSettings) -> bool {
-    (running.budget_pct, running.overdrive, running.density, running.fps_cap)
-        != (edited.budget_pct, edited.overdrive, edited.density, edited.fps_cap)
+    (running.budget_pct, running.overdrive, running.density, running.density_manual, running.fps_cap)
+        != (edited.budget_pct, edited.overdrive, edited.density, edited.density_manual, edited.fps_cap)
 }
 
 /// `edited` as a running preview applies it: everything but the
@@ -277,6 +295,7 @@ pub fn preview_live(running: &ScrSettings, edited: &ScrSettings) -> ScrSettings 
         budget_pct: running.budget_pct,
         overdrive: running.overdrive,
         density: running.density,
+        density_manual: running.density_manual,
         fps_cap: running.fps_cap,
         ..edited.clone()
     }
@@ -367,34 +386,50 @@ pub enum Extras {
 /// How tag text is drawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TagText {
-    /// Three-row block letters when the text is under [`TAG_BLOCK_PX`] tall.
+    /// Sized to the text: one line from [`TAG_BLOCK_PX`] up, then block
+    /// letters, larger the finer the text ([`TAG_AUTO_SCALES`]).
     Auto,
     Line,
-    Blocks,
+    /// Three-row block letters drawn 1 to [`TAG_SCALE_MAX`] times as large.
+    Blocks(u8),
 }
 
 /// Below this text height (pixels) [`TagText::Auto`] uses block letters.
 pub const TAG_BLOCK_PX: i16 = 10;
+/// [`TagText::Auto`]'s block letter size by text height: (from this many
+/// pixels up, scale). Finer text gets larger letters, so tags stay about
+/// 15 to 30 px tall.
+pub const TAG_AUTO_SCALES: [(i16, u8); 3] = [(5, 1), (3, 2), (0, 3)];
+/// Largest block letter size offered.
+pub const TAG_SCALE_MAX: u8 = 4;
 
 impl TagText {
+    pub const ALL: [TagText; 6] =
+        [TagText::Auto, TagText::Line, TagText::Blocks(1), TagText::Blocks(2), TagText::Blocks(3), TagText::Blocks(4)];
+
     pub fn id(self) -> &'static str {
         match self {
             TagText::Auto => "auto",
             TagText::Line => "line",
-            TagText::Blocks => "blocks",
+            TagText::Blocks(2) => "blocks2",
+            TagText::Blocks(3) => "blocks3",
+            TagText::Blocks(4) => "blocks4",
+            TagText::Blocks(_) => "blocks",
         }
     }
 
     fn parse(v: &str) -> Option<Self> {
-        [TagText::Auto, TagText::Line, TagText::Blocks].into_iter().find(|t| t.id() == v)
+        Self::ALL.into_iter().find(|t| t.id() == v)
     }
 
-    /// Block letters for text `font_px` tall?
-    pub fn blocks(self, font_px: i16) -> bool {
+    /// The tag text size for text `font_px` tall: 0 = one line, k = block
+    /// letters k times as large.
+    pub fn scale(self, font_px: i16) -> u8 {
         match self {
-            TagText::Auto => font_px < TAG_BLOCK_PX,
-            TagText::Line => false,
-            TagText::Blocks => true,
+            TagText::Auto if font_px >= TAG_BLOCK_PX => 0,
+            TagText::Auto => TAG_AUTO_SCALES.iter().find(|&&(px, _)| font_px >= px).map_or(3, |&(_, k)| k),
+            TagText::Line => 0,
+            TagText::Blocks(k) => k.clamp(1, TAG_SCALE_MAX),
         }
     }
 }
@@ -492,6 +527,10 @@ pub struct ScrSettings {
     /// Glyphs per axis relative to the budget-sized font (1 or 2); 2 costs
     /// about 4x the budget.
     pub density: u8,
+    /// Manual rendering resolution: the text size comes from `density`
+    /// alone ([`MANUAL_ROWS`] rows of text per step), not from the speed
+    /// test and CPU budget.
+    pub density_manual: bool,
     pub levels: Levels,
     /// Draw with [`ScrSettings::ramp`] instead of the luminosity levels' ramp.
     pub custom_ramp: bool,
@@ -562,6 +601,7 @@ impl Default for ScrSettings {
             budget_pct: (RENDER_BUDGET * 100.0).round() as u8,
             overdrive: false,
             density: 2,
+            density_manual: false,
             levels: Levels::L16,
             custom_ramp: false,
             ramp: crate::ascii::DEFAULT_RAMP.into(),
@@ -797,6 +837,7 @@ pub fn help(key: &str) -> &'static str {
         "budget" => "Share of CPU time the rendering may use; the text size is chosen so it fits.",
         "overdrive" => "Ignore the CPU budget: rendering takes all the CPU time it wants (the text is sized for the whole CPU at the full frame rate, and frames render back to back). Expect full CPU load, heat and fan noise.",
         "density" => "Space heating value",
+        "density_manual" => "Manual: the text size comes from the rendering resolution alone (Standard = 60 rows of text, Double = 120, ... Industrial Boiler = 360), not from the speed test and CPU budget. Expect more CPU load at high resolutions.",
         "levels" => "How many glyphs from dark to bright: 8, 16 or 32 (a custom character ramp, in the Rendering dialog, takes their place).",
         "custom_ramp" => "Draw with a character ramp of your own instead of the luminosity levels' 8, 16 or 32 glyphs. It is saved with the other settings, on or off.",
         "ramp" => "The glyphs from darkest to brightest, 2 or more; start with a space for black. Each cell takes the glyph whose place in this string matches its brightness.",
@@ -806,11 +847,11 @@ pub fn help(key: &str) -> &'static str {
         "halo_color" => "Colour of the sound halo (with a colour gradient on). Under: whatever it passes over. Solid: its own solid's colour. Size: quiet halos at the gradient's start, loud ones at its end. Bass: the bass level, which also sets its brightness.",
         "halo_bands" => "On: each solid's halo follows its own frequency band, simple solids the bass and complex ones the treble. Off: every halo follows the overall level.",
         "far_ground" => "Draw the floor 8 times further out, toward the horizon. Past the normal distance it is shaded cheaply (averaged pattern, exact lighting, no sampling), so it costs little.",
-        "tag_fixed" => "Leader lines keep one fixed length, following each solid as it grows and shrinks; a line only gets longer when its tag would otherwise cover another solid.",
+        "tag_fixed" => "On: each tag sits beside its solid and its leader line keeps one length, following the solid as it grows and shrinks. Off: the tags sit on a circle 80% of the picture's height across, each gliding round to the point nearest its solid.",
         "auto_distance" => "The camera moves in and out so every solid stays in frame: closer when they are small or bunched up, further back as they grow or spread. Not with the focus camera.",
         "tags" => "A label with each solid's metric, joined to it by a short line.",
         "tag_color" => "Tag colour with a gradient on: complementary to the theme, a tint of the theme, or white. Always kept readable.",
-        "tag_text" => "Auto: three-row block letters when the text is under 10 px tall. Line: always one line. Blocks: always block letters.",
+        "tag_text" => "Auto: one line from 10 px text up; finer text gets three-row block letters, drawn 2x or 3x as large on the finest. Line: always one line. Blocks to Blocks 4x: always block letters at that size, for fine pitch resolutions.",
         "shift" => "OLED burn-in protection: move the whole picture by one pixel at random intervals.",
         "shift_min_frames" => "Fewest frames between burn-in shifts.",
         "shift_max_frames" => "Most frames between burn-in shifts.",
@@ -991,6 +1032,7 @@ pub fn choices() -> Vec<Choice> {
                 opt("6", "Industrial\u{a0}Boiler"),
             ],
         ),
+        always("density_manual", "Manual", on_off()),
         always(
             "levels",
             "Luminosity levels",
@@ -1020,7 +1062,7 @@ pub fn choices() -> Vec<Choice> {
         ),
         always("auto_distance", "Dynamic camera distance", on_off()),
         styled("far_ground", "Extended floor distance", on_off()),
-        always("tag_fixed", "Fixed tag length", on_off()),
+        styled("tag_fixed", "Fixed tag length", on_off()),
         styled("tags", "Tags", on_off()),
         styled(
             "tag_color",
@@ -1031,9 +1073,12 @@ pub fn choices() -> Vec<Choice> {
             "tag_text",
             "Tag style",
             vec![
-                opt("auto", "Auto (block letters under 10 px)"),
+                opt("auto", "Auto (sized to the text: one line, or block letters 1x to 3x)"),
                 opt("line", "Line (always one line)"),
-                opt("blocks", "Blocks (always 3-line block letters)"),
+                opt("blocks", "Blocks"),
+                opt("blocks2", "Blocks 2x"),
+                opt("blocks3", "Blocks 3x"),
+                opt("blocks4", "Blocks 4x"),
             ],
         ),
         always(
@@ -1082,6 +1127,7 @@ impl ScrSettings {
             ("budget", self.budget_pct.to_string()),
             ("overdrive", on_off(self.overdrive)),
             ("density", self.density.to_string()),
+            ("density_manual", on_off(self.density_manual)),
             ("levels", levels_id(self.levels).into()),
             ("custom_ramp", on_off(self.custom_ramp)),
             // quoted, so a leading space (the usual darkest glyph) survives
@@ -1151,6 +1197,7 @@ impl ScrSettings {
             budget_pct: num("budget").filter(|b| (1..=100).contains(b)).map_or(d.budget_pct, |b| b as u8),
             overdrive: flag("overdrive", d.overdrive),
             density: num("density").filter(|v| (1..=DENSITY_MAX as u32).contains(v)).map_or(d.density, |v| v as u8),
+            density_manual: flag("density_manual", d.density_manual),
             levels: val("levels").and_then(|v| parse_levels(&v)).unwrap_or(d.levels),
             custom_ramp: flag("custom_ramp", d.custom_ramp),
             ramp: get("ramp").and_then(|v| parse_ramp(&v)).unwrap_or(d.ramp.clone()),
@@ -1423,11 +1470,22 @@ mod tests {
         assert_eq!(s.levels, Levels::L16);
         let s = ScrSettings::from_lookup(|k| (k == "levels").then(|| "10".to_string()));
         assert_eq!(s.levels, Levels::L8);
-        // tag text: block letters below 10 px in auto, and as chosen otherwise
-        assert!(TagText::Auto.blocks(9) && !TagText::Auto.blocks(10));
-        assert!(TagText::Blocks.blocks(20) && !TagText::Line.blocks(4));
-        let s = ScrSettings::from_lookup(|k| (k == "tag_text").then(|| "blocks".to_string()));
-        assert_eq!(s.tag_text, TagText::Blocks);
+        // tag text: auto is one line from 10 px, then block letters growing
+        // as the text gets finer; the manual sizes are as chosen
+        let auto: Vec<u8> = [12, 10, 9, 5, 4, 3, 2].iter().map(|&px| TagText::Auto.scale(px)).collect();
+        assert_eq!(auto, [0, 0, 1, 1, 2, 2, 3]);
+        assert_eq!((TagText::Blocks(1).scale(20), TagText::Blocks(4).scale(20), TagText::Line.scale(2)), (1, 4, 0));
+        for (v, t) in [("blocks", TagText::Blocks(1)), ("blocks3", TagText::Blocks(3)), ("line", TagText::Line)] {
+            let s = ScrSettings::from_lookup(|k| (k == "tag_text").then(|| v.to_string()));
+            assert_eq!(s.tag_text, t);
+            assert_eq!(t.id(), v, "round trip");
+        }
+        // manual rendering resolution: 60 rows per step, whatever the budget
+        let d = Display { width: 2560, height: 1440, refresh: 60 };
+        assert_eq!(manual_font(&d, 1).0, 24);
+        assert_eq!(manual_font(&d, 2).0, 12);
+        assert_eq!(manual_font(&d, 6).0, 4);
+        assert!(preview_needs_restart(&ScrSettings::default(), &ScrSettings { density_manual: true, ..ScrSettings::default() }));
         assert_eq!(ScrSettings::default().tag_text, TagText::Auto);
         // the dialog offers 8, 16 and 32 only
         let lv = choices().into_iter().find(|c| c.key == "levels").unwrap();
@@ -1475,6 +1533,7 @@ mod tests {
             overdrive: true,
             density: 1,
             levels: Levels::L32,
+            density_manual: true,
             custom_ramp: true,
             // a leading space and a quote inside: both must survive
             ramp: " .:\"=x@".into(),
@@ -1492,7 +1551,7 @@ mod tests {
             tag_fixed: true,
             tags: false,
             tag_color: crate::color::TagColor::Theme,
-            tag_text: TagText::Blocks,
+            tag_text: TagText::Blocks(3),
             shift: false,
             shift_min_frames: 10,
             shift_max_frames: 20,
