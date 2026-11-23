@@ -74,6 +74,12 @@ platomon [OPTIONS]
 | `--bg-waves` | quasicrystal: plane waves, 3..24 (its rotational symmetry) | 7 |
 | `--bg-wave-speed` | flow of the moving patterns: the quasicrystal's wave phase speed, radians/s (0 = still, negative = reverse); rain, ocean, julia and clouds move in proportion (0.6 = their natural pace) | 0.6 |
 | `--bg-drops` | rain: raindrops rippling at once, 1..48 | 12 |
+| `--bg-ripple`, `--bg-drop-life` | rain: distance between ripples (tiles); seconds a drop's rings last | 0.9, 4.5 |
+| `--bg-wind`, `--bg-chop` | ocean: wind direction (degrees); crest sharpness (0 = plain sine waves) | 30, 0.6 |
+| `--bg-julia-shape`, `--bg-julia-iter` | julia: radius of the circle the constant drifts round; iterations (edge detail) | 0.7885, 28 |
+| `--bg-carpet-levels` | carpet: sizes of square cut out | 5 |
+| `--bg-octaves`, `--bg-roughness` | clouds: noise octaves; each finer octave's strength | 5, 0.5 |
+| `--bg-sectors` | radial: sectors round the focal point | 12 |
 | **Overlays** | | |
 | `--legend` | flag: corner panel with a wireframe of each solid and its metric | off |
 | `--legend-size` | `1..5` font size: 1–2 terminal text, 3–5 block letters (1–3 cells per font pixel); icons grow with it | 2 |
@@ -639,9 +645,16 @@ drop-downs and above its check boxes, opens the background's settings (the patte
 *Quasicrystal waves* and *Pattern flow* (the speed of every moving pattern: quasicrystal, rain,
 ocean, julia and clouds; Still holds them all; these four are part of the look, greyed out while
 Random start is on), then the sliders moved here from *Tuning*: floor contrast, tile size, sway and
-its period and floor turn period, and the new *Raindrops* (how many drops ripple at once in the
-rain pattern, 1–48). The sliders work like *Tuning*'s (`tune_bg_contrast`, ..., `tune_bg_drops`);
-the button shows how many of its settings are set.
+its period and floor turn period, and new sliders: floor scroll X and Z, and each pattern's own
+settings: *Radial sectors*; for rain *Ripple spacing*, *Drop life* and *Raindrops* (how many drops
+ripple at once, 1–48); for the ocean *Wind direction* and *Wave choppiness*; for julia *Julia shape*
+and *Julia detail*; *Carpet levels*; for clouds *Cloud octaves* and *Cloud roughness*. **Only the
+settings the chosen *Background pattern* uses are shown** (the dialog's title names it): the plain
+floor shows just colour and luminosity, a still pattern has no flow, and only the quasicrystal shows
+its waves. With *Random start* on, the pattern is random, so every setting is shown. Settings
+hidden for the current pattern keep their values. The sliders work like *Tuning*'s
+(`tune_bg_contrast`, ..., `tune_bg_drops`, `tune_bg_wind`, ...); the button shows how many of its
+settings are set.
 
 **Tuning.** *Tuning…* opens a dialog of sliders: halo size swing (stepped like the main dialog's
 sliders, saved as a plain key), then numeric values: orbit period and bob, focus zoom and glide,

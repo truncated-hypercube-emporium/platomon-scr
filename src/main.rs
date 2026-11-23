@@ -287,6 +287,36 @@ struct Cli {
     /// Rain background: raindrops rippling at once, 1..48 (default 12).
     #[arg(long, value_name = "N")]
     bg_drops: Option<u32>,
+    /// Rain background: distance between ripples, tiles (default 0.9).
+    #[arg(long, value_name = "TILES")]
+    bg_ripple: Option<f32>,
+    /// Rain background: seconds a drop's rings last (default 4.5).
+    #[arg(long, value_name = "SECS")]
+    bg_drop_life: Option<f32>,
+    /// Ocean background: wind direction, degrees (default 30).
+    #[arg(long, value_name = "DEG")]
+    bg_wind: Option<f32>,
+    /// Ocean background: crest sharpness, 0 = plain sine waves (default 0.6).
+    #[arg(long, value_name = "FLOAT")]
+    bg_chop: Option<f32>,
+    /// Julia background: iterations, more = finer edge detail (default 28).
+    #[arg(long, value_name = "N")]
+    bg_julia_iter: Option<u32>,
+    /// Julia background: radius of the circle its constant drifts round (default 0.7885).
+    #[arg(long, value_name = "FLOAT")]
+    bg_julia_shape: Option<f32>,
+    /// Carpet background: scales the squares are cut out at (default 5).
+    #[arg(long, value_name = "N")]
+    bg_carpet_levels: Option<u32>,
+    /// Clouds background: octaves of noise (default 5).
+    #[arg(long, value_name = "N")]
+    bg_octaves: Option<u32>,
+    /// Clouds background: each finer octave's strength, 0.1..0.9 (default 0.5).
+    #[arg(long, value_name = "FLOAT")]
+    bg_roughness: Option<f32>,
+    /// Radial background: sectors round the focal point (default 12).
+    #[arg(long, value_name = "N")]
+    bg_sectors: Option<u32>,
 }
 
 fn fail(msg: impl std::fmt::Display) -> ! {
@@ -300,6 +330,7 @@ fn apply_cli(cfg: &mut Config, cli: &Cli) -> Result<(), String> {
     }
     set!(spp, bounces, fps_min, fps_max, ramp, char_aspect, aspect, aspect_mode, camera, orbit_period, orbit_dir, orbit_bob);
     set!(bg_lum, bg_pattern, bg_contrast, bg_scale, bg_sway, bg_sway_period, bg_rotate, bg_rotate_period, bg_waves, bg_wave_speed, bg_drops);
+    set!(bg_ripple, bg_drop_life, bg_wind, bg_chop, bg_julia_iter, bg_julia_shape, bg_carpet_levels, bg_octaves, bg_roughness, bg_sectors);
     set!(legend_size, legend_opacity, legend_pos, tag_place);
     set!(color, color_by, bg_color, layout, ordering, spacing, focus_zoom, focus_tau);
     set!(distance_scale, orbit_center, orbit_velocity, orbit_inclination, orbit_eccentricity, orbit_variation);

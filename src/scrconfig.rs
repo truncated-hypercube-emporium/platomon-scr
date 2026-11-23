@@ -24,6 +24,7 @@ use std::path::PathBuf;
 use crate::screensaver::{
     self, Binding, Choice, Drive, INI_SECTION, Input, Panel, SHIFT_FRAMES_MAX, ScrSettings, TUNABLES, Tunable, help, short_label,
 };
+use crate::scene::ground::Pattern;
 use crate::scene::sdf::SolidKind;
 use crate::scrlog::{self, LogEntry, Prefs};
 
@@ -531,11 +532,11 @@ fn main_tips() -> Vec<(i32, String)> {
 
 fn panel_tips(p: Panel) -> Vec<(i32, String)> {
     let mut v = Vec::new();
-    for (k, c) in panel_choices(p).iter().enumerate() {
+    for (k, c) in shown_choices(p).iter().enumerate() {
         v.push((ID_PANEL_CHOICE + k as i32, help(c.key).to_string()));
         v.push((ID_PANEL_LABEL + k as i32, help(c.key).to_string()));
     }
-    for (k, t) in panel_tunables(p).iter().enumerate() {
+    for (k, t) in shown_tunables(p).iter().enumerate() {
         v.push((ID_TUNE + k as i32, t.help.to_string()));
         v.push((ID_TUNE_LABEL + k as i32, t.help.to_string()));
         v.push((ID_TUNE_VALUE + k as i32, t.help.to_string()));
@@ -673,6 +674,25 @@ fn panel_choices(p: Panel) -> Vec<Choice> {
 /// The sliders of secondary dialog `p`.
 fn panel_tunables(p: Panel) -> Vec<&'static Tunable> {
     TUNABLES.iter().filter(|t| t.panel == p).collect()
+}
+
+/// The floor pattern Background options is showing settings for (`None`:
+/// a random look, so every pattern's).
+fn shown_pattern() -> Option<Pattern> {
+    UI.with(|u| u.borrow().bg_pattern)
+}
+
+/// The drop-downs and check boxes dialog `p` shows: Background options
+/// only those of the floor pattern chosen in the main dialog.
+fn shown_choices(p: Panel) -> Vec<Choice> {
+    let pat = shown_pattern();
+    panel_choices(p).into_iter().filter(|c| p != Panel::Background || screensaver::bg_applies(c.key, pat)).collect()
+}
+
+/// The sliders dialog `p` shows (see [`shown_choices`]).
+fn shown_tunables(p: Panel) -> Vec<&'static Tunable> {
+    let pat = shown_pattern();
+    panel_tunables(p).into_iter().filter(|t| p != Panel::Background || screensaver::bg_applies(t.key, pat)).collect()
 }
 
 fn panel_title(p: Panel) -> &'static str {
@@ -917,17 +937,27 @@ const REROLL_TEXT: &str = "Randomi&ze";
 
 /// Secondary dialog `p`: its drop-downs and check boxes, then its sliders.
 fn panel_template(p: Panel) -> (Vec<u32>, usize) {
-    let (choices, tunables) = (panel_choices(p), panel_tunables(p));
+    let (choices, tunables) = (shown_choices(p), shown_tunables(p));
     // Rendering has one more row: the custom character ramp's button
     let ramp_row = p == Panel::Rendering;
     let rows = (choices.len() + tunables.len() + ramp_row as usize) as i16;
     let cy = 30 + rows * 15 + 26;
-    let mut t = Template::new(panel_title(p), 300, cy);
+    let title = match (p, shown_pattern()) {
+        (Panel::Background, Some(pat)) => format!("{} \u{2013} {}", panel_title(p), pattern_name(pat)),
+        _ => panel_title(p).to_string(),
+    };
+    let mut t = Template::new(&title, 300, cy);
     let intro = match p {
         Panel::Tuning => "Move a slider to set that value for every run; auto keeps the random look's or the default value.",
         Panel::Layout => "How the solids are placed, every run (the layout itself is in the Appearance group); the orbit settings apply to the Orbit layout. Auto keeps the default.",
         Panel::Rendering => "How the picture is traced, every run; auto keeps the screensaver's own cheap settings (1 sample, 1 bounce).",
-        Panel::Background => "The floor (its pattern is in Appearance): colour, brightness, tiles, motion and the moving patterns. Auto keeps the random look's or the default value.",
+        Panel::Background => match shown_pattern() {
+            Some(pat) => match pat {
+                Pattern::Solid => "The plain floor's colour and brightness (pick a pattern in Appearance for more settings).",
+                _ => "The floor and its pattern's own settings (only those this pattern uses are shown). Auto keeps the random look's or the default value.",
+            },
+            None => "Random start is on, so every pattern's settings are shown. Auto keeps the random look's or the default value.",
+        },
     };
     t.item(0, (10, 6, 280, 20), ID_STATIC, STATIC, intro);
     for (k, c) in choices.iter().enumerate() {
@@ -994,6 +1024,9 @@ struct Ui {
     preview: Option<Preview>,
     /// The Metrics dialog's metric drop-downs: each option's metric key.
     metric_opts: Vec<String>,
+    /// Background options: the floor pattern chosen when it opened (`None`
+    /// with Random start on).
+    bg_pattern: Option<Pattern>,
 }
 
 /// A running preview.
@@ -1271,6 +1304,16 @@ unsafe fn open_panel(h: HWND, p: Panel) {
         // SAFETY: control id from our template.
         u.random_look = unsafe { IsDlgButtonChecked(h, ID_RANDOM) } == 1;
     });
+    // Background options shows the chosen floor pattern's settings only
+    let pattern = (!UI.with(|u| u.borrow().random_look))
+        .then(|| {
+            let i = general_choices().iter().position(|c| c.key == "bg_pattern")?;
+            let c = &general_choices()[i];
+            // SAFETY: control id from our template.
+            unsafe { get_choice(h, ID_COMBO + i as i32, c) }.parse::<Pattern>().ok()
+        })
+        .flatten();
+    UI.with(|u| u.borrow_mut().bg_pattern = pattern);
     let (tpl, _) = panel_template(p);
     // SAFETY: a valid DWORD-aligned template; the procedure matches DLGPROC.
     let ok = unsafe { DialogBoxIndirectParamW(GetModuleHandleW(std::ptr::null()), tpl.as_ptr() as *const u16, h, Some(tuning_dialog), 0) } == 1;
@@ -1756,7 +1799,7 @@ unsafe fn tune_row(h: HWND, k: usize, t: &Tunable) {
 /// Show the open dialog's choices from its working copy.
 unsafe fn panel_fill(h: HWND, p: Panel) {
     let values = UI.with(|u| u.borrow().panel_edit.clone());
-    for (k, c) in panel_choices(p).iter().enumerate() {
+    for (k, c) in shown_choices(p).iter().enumerate() {
         let v = values.iter().find(|(key, _)| *key == c.key).map(|(_, v)| v.clone()).unwrap_or_default();
         // SAFETY: control ids from the panel template.
         unsafe { set_choice(h, ID_PANEL_CHOICE + k as i32, ID_PANEL_VALUE + k as i32, c, &v) };
@@ -1765,7 +1808,7 @@ unsafe fn panel_fill(h: HWND, p: Panel) {
 
 /// The open dialog's choices into its working copy.
 unsafe fn panel_take(h: HWND, p: Panel) {
-    for (k, c) in panel_choices(p).iter().enumerate() {
+    for (k, c) in shown_choices(p).iter().enumerate() {
         // SAFETY: control ids from the panel template.
         let v = unsafe { get_choice(h, ID_PANEL_CHOICE + k as i32, c) };
         UI.with(|u| {
@@ -1919,7 +1962,7 @@ unsafe extern "system" fn tuning_dialog(h: HWND, msg: u32, w: usize, l: isize) -
             WM_INITDIALOG => {
                 let p = UI.with(|u| u.borrow().panel).unwrap_or(Panel::Tuning);
                 let random_look = UI.with(|u| u.borrow().random_look);
-                for (k, c) in panel_choices(p).iter().enumerate() {
+                for (k, c) in shown_choices(p).iter().enumerate() {
                     let id = ID_PANEL_CHOICE + k as i32;
                     match kind(c) {
                         Kind::Combo => {
@@ -1940,7 +1983,7 @@ unsafe extern "system" fn tuning_dialog(h: HWND, msg: u32, w: usize, l: isize) -
                     }
                 }
                 panel_fill(h, p);
-                for (k, t) in panel_tunables(p).iter().enumerate() {
+                for (k, t) in shown_tunables(p).iter().enumerate() {
                     SendDlgItemMessageW(h, ID_TUNE + k as i32, TBM_SETRANGE, 1, (t.steps() as isize) << 16);
                     tune_row(h, k, t);
                 }
@@ -1953,14 +1996,14 @@ unsafe extern "system" fn tuning_dialog(h: HWND, msg: u32, w: usize, l: isize) -
             WM_HSCROLL => {
                 let p = UI.with(|u| u.borrow().panel).unwrap_or(Panel::Tuning);
                 let id = GetDlgCtrlID(l as HWND);
-                let choices = panel_choices(p);
+                let choices = shown_choices(p);
                 if let Some(c) = (id >= ID_PANEL_CHOICE).then(|| choices.get((id - ID_PANEL_CHOICE) as usize)).flatten() {
                     let pos = SendDlgItemMessageW(h, id, TBM_GETPOS, 0, 0).max(0) as usize;
                     show_slider(h, ID_PANEL_VALUE + (id - ID_PANEL_CHOICE), c, pos);
                     return 0;
                 }
                 let k = (id - ID_TUNE) as usize;
-                let list = panel_tunables(p);
+                let list = shown_tunables(p);
                 if let Some(t) = list.get(k).filter(|_| id >= ID_TUNE) {
                     let pos = SendDlgItemMessageW(h, id, TBM_GETPOS, 0, 0).max(0) as u32;
                     let v = t.value_at(pos);
@@ -1976,7 +2019,7 @@ unsafe extern "system" fn tuning_dialog(h: HWND, msg: u32, w: usize, l: isize) -
             WM_COMMAND => {
                 let id = (w & 0xFFFF) as i32;
                 let p = UI.with(|u| u.borrow().panel).unwrap_or(Panel::Tuning);
-                let list = panel_tunables(p);
+                let list = shown_tunables(p);
                 match id {
                     IDOK => {
                         panel_take(h, p);
@@ -1999,7 +2042,7 @@ unsafe extern "system" fn tuning_dialog(h: HWND, msg: u32, w: usize, l: isize) -
                         UI.with(|u| {
                             let mut u = u.borrow_mut();
                             u.tuning_edit.retain(|(key, _)| !list.iter().any(|t| t.key == *key));
-                            for c in panel_choices(p) {
+                            for c in shown_choices(p) {
                                 u.panel_edit.retain(|(key, _)| *key != c.key);
                                 if let Some((_, v)) = defaults.iter().find(|(k, _)| *k == c.key) {
                                     u.panel_edit.push((c.key, v.clone()));
@@ -2032,6 +2075,13 @@ unsafe extern "system" fn tuning_dialog(h: HWND, msg: u32, w: usize, l: isize) -
 }
 
 // ------------------------------------------------------------------ metrics dialog
+
+/// A floor pattern's name as the drop-down shows it.
+fn pattern_name(p: Pattern) -> String {
+    let id = p.id();
+    let mut c = id.chars();
+    c.next().map_or_else(String::new, |f| f.to_uppercase().chain(c).collect())
+}
 
 /// The Metrics button's text with nothing counted yet.
 const METRICS_TEXT: &str = "M&etrics...";
@@ -2446,6 +2496,39 @@ mod tests {
             let most = if c.key == "density" { 17 } else { 14 };
             assert!(labels.iter().all(|l| l.chars().count() <= most), "{}: {labels:?}", c.key);
         }
+    }
+
+    #[test]
+    fn background_options_show_only_the_patterns_settings() {
+        let keys = |pat| {
+            UI.with(|u| u.borrow_mut().bg_pattern = pat);
+            let mut k: Vec<&str> = shown_choices(Panel::Background).iter().map(|c| c.key).collect();
+            k.extend(shown_tunables(Panel::Background).iter().map(|t| t.key));
+            // the dialog is built from the same rows
+            let (_, n) = panel_template(Panel::Background);
+            let rows: usize = shown_choices(Panel::Background).iter().map(|c| if kind(c) == Kind::Combo { 2 } else { 3 }).sum();
+            assert_eq!(n, 1 + rows + shown_tunables(Panel::Background).len() * 4 + 3, "{pat:?}");
+            k
+        };
+        assert_eq!(keys(Some(Pattern::Solid)), ["bg_color", "bg_lum"]);
+        let rain = keys(Some(Pattern::Rain));
+        for k in ["bg_color", "bg_lum", "bg_wave_speed", "bg_contrast", "bg_scale", "bg_scroll_x", "bg_drops", "bg_ripple", "bg_drop_life"] {
+            assert!(rain.contains(&k), "rain: {k}");
+        }
+        for k in ["bg_waves", "bg_wind", "bg_julia_iter", "bg_sectors", "bg_octaves"] {
+            assert!(!rain.contains(&k), "rain: no {k}");
+        }
+        let checker = keys(Some(Pattern::Checker));
+        assert!(!checker.contains(&"bg_wave_speed"), "a still pattern has no flow");
+        assert!(keys(Some(Pattern::Radial)).contains(&"bg_sectors"));
+        assert!(keys(Some(Pattern::Ocean)).contains(&"bg_chop"));
+        // every pattern's setting is shown for some pattern, and all with a random look
+        let all = keys(None);
+        assert_eq!(all.len(), panel_choices(Panel::Background).len() + panel_tunables(Panel::Background).len());
+        for k in &all {
+            assert!(Pattern::ALL.iter().any(|&p| screensaver::bg_applies(k, Some(p))), "{k}");
+        }
+        UI.with(|u| u.borrow_mut().bg_pattern = None);
     }
 
     #[test]

@@ -12,7 +12,7 @@ use crate::drive::{Binding, DELTA_PERIOD_RANGE, Input, MAX_SOLIDS};
 use crate::metrics::{MetricKind, MetricSpec};
 use crate::overlay::{LEGEND_SIZE_MAX, LEGEND_SIZE_MIN, LegendParams, LegendPos, TagPlace};
 use crate::scene::camera::{CameraMode, OrbitDir};
-use crate::scene::ground::{self, GroundParams, Pattern, Spin};
+use crate::scene::ground::{self, GroundParams, Pattern, PatternShape, Spin};
 use crate::scene::sdf::SolidKind;
 
 /// Most solids shown at once.
@@ -215,6 +215,22 @@ pub struct Config {
     pub bg_wave_speed: f32,
     /// Rain pattern: raindrops rippling at once.
     pub bg_drops: u32,
+    /// Rain: distance between ripples (tiles) and a drop's life (s).
+    pub bg_ripple: f32,
+    pub bg_drop_life: f32,
+    /// Ocean: wind direction (degrees) and crest sharpness.
+    pub bg_wind: f32,
+    pub bg_chop: f32,
+    /// Julia set: iterations, and the radius its constant drifts round.
+    pub bg_julia_iter: u32,
+    pub bg_julia_shape: f32,
+    /// Sierpinski carpet: scales holes are cut at.
+    pub bg_carpet_levels: u32,
+    /// Clouds: octaves, and each finer octave's strength.
+    pub bg_octaves: u32,
+    pub bg_roughness: f32,
+    /// Radial: sectors round the focal point.
+    pub bg_sectors: u32,
 
     // --- animation ---
     pub min_scale: f32,
@@ -312,6 +328,16 @@ impl Default for Config {
             bg_waves: crate::scene::ground::WAVES_DEFAULT,
             bg_wave_speed: crate::scene::ground::WAVE_SPEED_DEFAULT,
             bg_drops: crate::scene::ground::DROPS_DEFAULT,
+            bg_ripple: PatternShape::default().ripple,
+            bg_drop_life: PatternShape::default().drop_life,
+            bg_wind: PatternShape::default().wind,
+            bg_chop: PatternShape::default().chop,
+            bg_julia_iter: PatternShape::default().julia_iter,
+            bg_julia_shape: PatternShape::default().julia_shape,
+            bg_carpet_levels: PatternShape::default().carpet_levels,
+            bg_octaves: PatternShape::default().octaves,
+            bg_roughness: PatternShape::default().roughness,
+            bg_sectors: PatternShape::default().sectors,
             min_scale: 0.45,
             max_scale: 1.0,
             max_spin: 3.0,
@@ -441,6 +467,10 @@ impl Config {
         self.bg_waves = self.bg_waves.clamp(crate::scene::ground::WAVES_MIN, crate::scene::ground::WAVES_MAX);
         self.bg_wave_speed = finite_or(self.bg_wave_speed, d.bg_wave_speed).clamp(-20.0, 20.0);
         self.bg_drops = self.bg_drops.clamp(crate::scene::ground::DROPS_MIN, crate::scene::ground::DROPS_MAX);
+        let s = self.pattern_shape().sanitized();
+        (self.bg_ripple, self.bg_drop_life, self.bg_wind, self.bg_chop) = (s.ripple, s.drop_life, s.wind, s.chop);
+        (self.bg_julia_iter, self.bg_julia_shape, self.bg_carpet_levels) = (s.julia_iter, s.julia_shape, s.carpet_levels);
+        (self.bg_octaves, self.bg_roughness, self.bg_sectors) = (s.octaves, s.roughness, s.sectors);
         for v in [&mut self.orbit_radius, &mut self.orbit_height] {
             *v = v.filter(|x| x.is_finite()).map(|x| x.clamp(0.5, 500.0));
         }
@@ -500,6 +530,22 @@ impl Config {
         }
     }
 
+    /// The background patterns' own settings.
+    pub fn pattern_shape(&self) -> PatternShape {
+        PatternShape {
+            ripple: self.bg_ripple,
+            drop_life: self.bg_drop_life,
+            wind: self.bg_wind,
+            chop: self.bg_chop,
+            julia_iter: self.bg_julia_iter,
+            julia_shape: self.bg_julia_shape,
+            carpet_levels: self.bg_carpet_levels,
+            octaves: self.bg_octaves,
+            roughness: self.bg_roughness,
+            sectors: self.bg_sectors,
+        }
+    }
+
     pub fn ground_params(&self) -> GroundParams {
         GroundParams {
             lum: self.bg_lum,
@@ -515,6 +561,7 @@ impl Config {
             wave_speed: self.bg_wave_speed,
             drops: self.bg_drops,
             seed: self.seed.unwrap_or(0),
+            shape: self.pattern_shape(),
         }
     }
 

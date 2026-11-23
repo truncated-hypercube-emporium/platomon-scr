@@ -121,6 +121,8 @@ pub fn randomize(rng: &mut fastrand::Rng, d: &Display) -> Config {
     c.bg_waves = rng.u32(5..=12);
     c.bg_wave_speed = (range(rng, 0.2, 1.2) * 10.0).round() / 10.0;
     c.bg_drops = rng.u32(6..=24);
+    c.bg_wind = (range(rng, 0.0, 360.0) / 5.0).floor() * 5.0;
+    c.bg_julia_shape = (range(rng, 0.72, 0.82) * 200.0).round() / 200.0;
 
     // colour
     if rng.u8(0..10) >= 3 {
@@ -717,7 +719,7 @@ macro_rules! tunable {
 /// Every numeric setting set with a slider, in the Tuning, Layout and
 /// Rendering dialogs ([`Tunable::panel`]). A set value applies every run
 /// (random look or not); unset ones keep the random or default value.
-pub const TUNABLES: [Tunable; 25] = [
+pub const TUNABLES: [Tunable; 37] = [
     tunable!(Tuning, "orbit_period", "Orbit period (s)", 15.0, 180.0, 5.0, "Seconds per camera orbit (orbit, tilt and resonance cameras). Tilt also takes one period per rise or fall."),
     tunable!(Tuning, "orbit_bob", "Orbit bob", 0.0, 1.0, 0.05, "How far the orbiting camera rises and falls twice per turn, in world units."),
     tunable!(Tuning, "focus_zoom", "Focus zoom", 0.0, 1.0, 0.05, "Focus camera: 0 only turns toward the busiest solid, 1 comes in to a close-up."),
@@ -727,7 +729,19 @@ pub const TUNABLES: [Tunable; 25] = [
     tunable!(Background, "bg_sway", "Floor sway", 0.0, 2.0, 0.05, "How far the floor pattern sways in a slow circle; 0 holds it still."),
     tunable!(Background, "bg_sway_period", "Sway period (s)", 3.0, 30.0, 1.0, "Seconds per floor sway cycle."),
     tunable!(Background, "bg_rotate_period", "Floor turn period (s)", 10.0, 180.0, 5.0, "Seconds per turn when the floor pattern rotates."),
+    tunable!(Background, "bg_scroll_x", "Floor scroll X", -1.0, 1.0, 0.05, "How fast the floor pattern slides sideways (x), world units per second; 0 holds it."),
+    tunable!(Background, "bg_scroll_z", "Floor scroll Z", -1.0, 1.0, 0.05, "How fast the floor pattern slides forward or back (z), world units per second; 0 holds it."),
+    tunable!(Background, "bg_sectors", "Radial sectors", 4.0, 32.0, 2.0, "Radial floor: how many sectors the rings are cut into round the focal point."),
+    tunable!(Background, "bg_ripple", "Ripple spacing", 0.3, 2.0, 0.05, "Rain floor: the distance between a drop's ripples, in tiles."),
+    tunable!(Background, "bg_drop_life", "Drop life (s)", 1.0, 12.0, 0.5, "Rain floor: how long a drop's rings spread before they fade and a new drop lands (each drop varies by up to 30%)."),
     tunable!(Background, "bg_drops", "Raindrops", 1.0, 48.0, 1.0, "Rain floor: how many raindrops ripple at once. Each lands at a random place, sends out a ring of ripples that spreads and fades, and is followed by a new one."),
+    tunable!(Background, "bg_wind", "Wind direction", 0.0, 355.0, 5.0, "Ocean floor: the direction the wind drives the waves, in degrees."),
+    tunable!(Background, "bg_chop", "Wave choppiness", 0.0, 1.5, 0.05, "Ocean floor: 0 = smooth rolling waves, higher = sharper crests and flatter troughs."),
+    tunable!(Background, "bg_julia_shape", "Julia shape", 0.6, 0.9, 0.005, "Julia floor: the radius of the circle its constant drifts round, which sets the family of shapes it passes through (0.79 = the classic dendrites and spirals)."),
+    tunable!(Background, "bg_julia_iter", "Julia detail", 8.0, 64.0, 4.0, "Julia floor: iterations per point; more shows finer detail at the set's edge and costs more."),
+    tunable!(Background, "bg_carpet_levels", "Carpet levels", 1.0, 6.0, 1.0, "Carpet floor: how many sizes of square are cut out, each 3 times the last."),
+    tunable!(Background, "bg_octaves", "Cloud octaves", 1.0, 8.0, 1.0, "Clouds floor: layers of noise, each twice as fine; more is more detailed."),
+    tunable!(Background, "bg_roughness", "Cloud roughness", 0.3, 0.8, 0.05, "Clouds floor: how strong each finer layer is; higher is rougher and grainier, lower is softer."),
     tunable!(Tuning, "min_scale", "Smallest solid size", 0.2, 1.0, 0.05, "Size of a solid whose metric is idle, as a share of full size."),
     tunable!(Tuning, "max_scale", "Largest solid size", 0.5, 1.5, 0.05, "Size of a solid whose metric is at full load."),
     tunable!(Tuning, "idle_spin", "Idle spin (rad/s)", 0.0, 1.0, 0.05, "How fast a solid spins when its metric is idle."),
@@ -745,6 +759,26 @@ pub const TUNABLES: [Tunable; 25] = [
     tunable!(Rendering, "max_dist", "Render distance", 20.0, 200.0, 10.0, "How far rays travel before they count as sky, in world units; the extended floor multiplies it."),
 ];
 
+/// Whether Background options setting `key` does anything with floor
+/// pattern `p` (the dialog shows only those; `None` = a random look, any
+/// pattern: all of them).
+pub fn bg_applies(key: &str, p: Option<Pattern>) -> bool {
+    let Some(p) = p else { return true };
+    match key {
+        "bg_color" | "bg_lum" => true,
+        "bg_wave_speed" => p.animated(),
+        "bg_waves" => p == Pattern::Quasicrystal,
+        "bg_drops" | "bg_ripple" | "bg_drop_life" => p == Pattern::Rain,
+        "bg_wind" | "bg_chop" => p == Pattern::Ocean,
+        "bg_julia_shape" | "bg_julia_iter" => p == Pattern::Julia,
+        "bg_carpet_levels" => p == Pattern::Carpet,
+        "bg_octaves" | "bg_roughness" => p == Pattern::Clouds,
+        "bg_sectors" => p == Pattern::Radial,
+        // contrast, tile size, scroll, sway, turning: any pattern but plain
+        _ => p != Pattern::Solid,
+    }
+}
+
 /// Set config field `key` (a [`TUNABLES`] key) to `v`.
 pub fn set_tunable(c: &mut Config, key: &str, v: f32) {
     match key {
@@ -758,6 +792,18 @@ pub fn set_tunable(c: &mut Config, key: &str, v: f32) {
         "bg_sway_period" => c.bg_sway_period = v,
         "bg_rotate_period" => c.bg_rotate_period = v,
         "bg_drops" => c.bg_drops = v.round().max(1.0) as u32,
+        "bg_scroll_x" => c.bg_scroll[0] = v,
+        "bg_scroll_z" => c.bg_scroll[1] = v,
+        "bg_sectors" => c.bg_sectors = v.round().max(2.0) as u32,
+        "bg_ripple" => c.bg_ripple = v,
+        "bg_drop_life" => c.bg_drop_life = v,
+        "bg_wind" => c.bg_wind = v,
+        "bg_chop" => c.bg_chop = v,
+        "bg_julia_shape" => c.bg_julia_shape = v,
+        "bg_julia_iter" => c.bg_julia_iter = v.round().max(1.0) as u32,
+        "bg_carpet_levels" => c.bg_carpet_levels = v.round().max(1.0) as u32,
+        "bg_octaves" => c.bg_octaves = v.round().max(1.0) as u32,
+        "bg_roughness" => c.bg_roughness = v,
         "min_scale" => c.min_scale = v,
         "max_scale" => c.max_scale = v,
         "idle_spin" => c.idle_spin = v,
@@ -802,6 +848,18 @@ pub fn get_tunable(c: &Config, key: &str) -> f32 {
         "bg_sway_period" => c.bg_sway_period,
         "bg_rotate_period" => c.bg_rotate_period,
         "bg_drops" => c.bg_drops as f32,
+        "bg_scroll_x" => c.bg_scroll[0],
+        "bg_scroll_z" => c.bg_scroll[1],
+        "bg_sectors" => c.bg_sectors as f32,
+        "bg_ripple" => c.bg_ripple,
+        "bg_drop_life" => c.bg_drop_life,
+        "bg_wind" => c.bg_wind,
+        "bg_chop" => c.bg_chop,
+        "bg_julia_shape" => c.bg_julia_shape,
+        "bg_julia_iter" => c.bg_julia_iter as f32,
+        "bg_carpet_levels" => c.bg_carpet_levels as f32,
+        "bg_octaves" => c.bg_octaves as f32,
+        "bg_roughness" => c.bg_roughness,
         "min_scale" => c.min_scale,
         "max_scale" => c.max_scale,
         "idle_spin" => c.idle_spin,
