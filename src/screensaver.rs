@@ -326,6 +326,9 @@ pub fn plan_config(d: &Display, seed: u64, s: &ScrSettings) -> Config {
         Levels::L16 => config.ramp = crate::ascii::DEFAULT_RAMP.to_string(),
         Levels::L32 => config.ramp = crate::ascii::RAMP_32.to_string(),
     }
+    if s.custom_ramp && ramp_problem(&s.ramp).is_none() {
+        config.ramp = s.ramp.clone();
+    }
     config
 }
 
@@ -412,6 +415,33 @@ fn levels_id(l: Levels) -> &'static str {
     }
 }
 
+/// Most glyphs a custom character ramp may have.
+pub const RAMP_MAX: usize = 96;
+
+/// A custom ramp as stored: one pair of surrounding quotes is dropped (the
+/// INI reader drops them itself), and it must be 2..=[`RAMP_MAX`]
+/// printable characters.
+pub fn parse_ramp(v: &str) -> Option<String> {
+    let v = v.trim_end_matches(['\r', '\n']);
+    let t = v.trim();
+    let inner = if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') { &t[1..t.len() - 1] } else { v };
+    ramp_problem(inner).is_none().then(|| inner.to_string())
+}
+
+/// Why `r` can't be a character ramp, if it can't.
+pub fn ramp_problem(r: &str) -> Option<String> {
+    let n = r.chars().count();
+    if n < 2 {
+        Some("A ramp needs at least 2 characters, darkest first.".into())
+    } else if n > RAMP_MAX {
+        Some(format!("A ramp can have at most {RAMP_MAX} characters."))
+    } else if r.chars().any(char::is_control) {
+        Some("A ramp can't contain tabs or other control characters.".into())
+    } else {
+        None
+    }
+}
+
 fn parse_levels(v: &str) -> Option<Levels> {
     match v {
         // the former 10-level setting maps to the nearest, 8 (`auto`, the
@@ -463,6 +493,10 @@ pub struct ScrSettings {
     /// about 4x the budget.
     pub density: u8,
     pub levels: Levels,
+    /// Draw with [`ScrSettings::ramp`] instead of the luminosity levels' ramp.
+    pub custom_ramp: bool,
+    /// The custom character ramp, darkest glyph first (kept when off).
+    pub ramp: String,
     /// Palette size: 16, 32, 64 or 128 colours per gradient.
     pub colors: usize,
     /// Sound halo: a wireframe 1.2x the size of each solid that grows and
@@ -529,6 +563,8 @@ impl Default for ScrSettings {
             overdrive: false,
             density: 2,
             levels: Levels::L16,
+            custom_ramp: false,
+            ramp: crate::ascii::DEFAULT_RAMP.into(),
             colors: color::DEFAULT_COLORS,
             sound: true,
             halo_swing: 10,
@@ -649,7 +685,7 @@ pub const TUNABLES: [Tunable; 24] = [
     tunable!(Tuning, "idle_spin", "Idle spin (rad/s)", 0.0, 1.0, 0.05, "How fast a solid spins when its metric is idle."),
     tunable!(Tuning, "max_spin", "Fastest spin (rad/s)", 0.5, 8.0, 0.25, "How fast a solid spins at full load."),
     tunable!(Tuning, "exposure", "Exposure", 0.3, 3.0, 0.1, "Overall picture brightness before it is turned into glyphs."),
-    tunable!(Layout, "spacing", "Spacing", 0.8, 2.5, 0.05, "Distance between neighbouring solids (and between rings, shells or orbits), as a multiple of the standard spacing."),
+    tunable!(Layout, "spacing_exp", "Spacing", -2.0, 2.0, 0.1, "Distance between neighbouring solids (and between rings and shells) on a doubling scale: 0 = standard, +1 = twice as far, -1 = half, -2..+2 = a quarter to four times. Orbits are 10% of their radius apart at 0, stretched the same way (2.5% to 40%)."),
     tunable!(Layout, "distance_scale", "Distance scaling", -2.0, 2.0, 0.1, "Scales each solid's size by how far away its nearest neighbour is: size x (1 + this x (distance / standard spacing - 1)). Positive grows solids with room around them and shrinks crowded ones; negative does the reverse; 0 is off. Moving solids (Orbit layout) resize smoothly as they pass each other."),
     tunable!(Layout, "orbit_velocity", "Orbit velocity", 0.05, 2.0, 0.05, "Orbit layout: how fast the innermost orbit goes round, in radians per second (0.35 is about 18 s per turn). Outer orbits take longer."),
     tunable!(Layout, "orbit_inclination", "Orbital inclination", 0.0, 90.0, 5.0, "Orbit layout: how far the orbits tilt from the floor, in degrees (0 = flat, 90 = upright)."),
@@ -678,7 +714,8 @@ pub fn set_tunable(c: &mut Config, key: &str, v: f32) {
         "idle_spin" => c.idle_spin = v,
         "max_spin" => c.max_spin = v,
         "exposure" => c.exposure = v,
-        "spacing" => c.spacing = v,
+        // the slider is the spacing's power of two
+        "spacing_exp" => c.spacing = 2f32.powf(v),
         "distance_scale" => c.distance_scale = v,
         "orbit_velocity" => c.orbit_velocity = v,
         "orbit_inclination" => c.orbit_inclination = v,
@@ -720,7 +757,7 @@ pub fn get_tunable(c: &Config, key: &str) -> f32 {
         "idle_spin" => c.idle_spin,
         "max_spin" => c.max_spin,
         "exposure" => c.exposure,
-        "spacing" => c.spacing,
+        "spacing_exp" => c.spacing.max(1e-6).log2(),
         "distance_scale" => c.distance_scale,
         "orbit_velocity" => c.orbit_velocity,
         "orbit_inclination" => c.orbit_inclination,
@@ -760,7 +797,9 @@ pub fn help(key: &str) -> &'static str {
         "budget" => "Share of CPU time the rendering may use; the text size is chosen so it fits.",
         "overdrive" => "Ignore the CPU budget: rendering takes all the CPU time it wants (the text is sized for the whole CPU at the full frame rate, and frames render back to back). Expect full CPU load, heat and fan noise.",
         "density" => "Space heating value",
-        "levels" => "How many glyphs from dark to bright: 8, 16 or 32.",
+        "levels" => "How many glyphs from dark to bright: 8, 16 or 32 (a custom character ramp, in the Rendering dialog, takes their place).",
+        "custom_ramp" => "Draw with a character ramp of your own instead of the luminosity levels' 8, 16 or 32 glyphs. It is saved with the other settings, on or off.",
+        "ramp" => "The glyphs from darkest to brightest, 2 or more; start with a space for black. Each cell takes the glyph whose place in this string matches its brightness.",
         "colors" => "Colours per gradient: 16, 32, 64 or 128. More gives smoother colour; brightness colouring then redraws more cells each frame.",
         "sound" => "A second wireframe around each solid that swells and shrinks with the sound of the default output device.",
         "halo_swing" => "How far the sound halo grows and shrinks around 1.2x the solid's size: +-10%, +-30% or +-60% of its radius.",
@@ -1044,6 +1083,10 @@ impl ScrSettings {
             ("overdrive", on_off(self.overdrive)),
             ("density", self.density.to_string()),
             ("levels", levels_id(self.levels).into()),
+            ("custom_ramp", on_off(self.custom_ramp)),
+            // quoted, so a leading space (the usual darkest glyph) survives
+            // the INI file and the log
+            ("ramp", format!("\"{}\"", self.ramp)),
             ("colors", self.colors.to_string()),
             ("sound", on_off(self.sound)),
             ("halo_swing", self.halo_swing.to_string()),
@@ -1109,6 +1152,8 @@ impl ScrSettings {
             overdrive: flag("overdrive", d.overdrive),
             density: num("density").filter(|v| (1..=DENSITY_MAX as u32).contains(v)).map_or(d.density, |v| v as u8),
             levels: val("levels").and_then(|v| parse_levels(&v)).unwrap_or(d.levels),
+            custom_ramp: flag("custom_ramp", d.custom_ramp),
+            ramp: get("ramp").and_then(|v| parse_ramp(&v)).unwrap_or(d.ramp.clone()),
             colors: num("colors").map(|n| n as usize).filter(|n| color::PALETTE_SIZES.contains(n)).unwrap_or(d.colors),
             sound: flag("sound", d.sound),
             halo_swing: num("halo_swing")
@@ -1430,6 +1475,9 @@ mod tests {
             overdrive: true,
             density: 1,
             levels: Levels::L32,
+            custom_ramp: true,
+            // a leading space and a quote inside: both must survive
+            ramp: " .:\"=x@".into(),
             colors: 64,
             sound: false,
             halo_swing: 60,
@@ -1453,6 +1501,18 @@ mod tests {
         let pairs = s.to_pairs();
         let back = ScrSettings::from_lookup(|k| pairs.iter().find(|(pk, _)| *pk == k).map(|(_, v)| v.clone()));
         assert_eq!(back, s);
+        // the custom ramp: through the preview/log text (values trimmed), as
+        // the INI reader hands it back (quotes already dropped), and junk
+        assert_eq!(preview_settings(&preview_text(&s)).ramp, s.ramp);
+        let unquoted = ScrSettings::from_lookup(lookup(&[("ramp", " .oO@")]));
+        assert_eq!(unquoted.ramp, " .oO@");
+        for junk in ["x", "\"\"", "a\tb"] {
+            assert_eq!(ScrSettings::from_lookup(lookup(&[("ramp", junk)])).ramp, d.ramp, "{junk:?}");
+        }
+        let display = Display { width: 1920, height: 1080, refresh: 60 };
+        assert_eq!(plan_config(&display, 1, &s).ramp, s.ramp, "on: the custom ramp is drawn");
+        let off = ScrSettings { custom_ramp: false, ..s.clone() };
+        assert_eq!(plan_config(&display, 1, &off).ramp, crate::ascii::RAMP_32, "off: the levels' ramp");
         // junk falls back per key (old per-setting "random" values included);
         // max < min is raised to min
         let j = ScrSettings::from_lookup(lookup(&[

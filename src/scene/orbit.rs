@@ -158,8 +158,9 @@ impl Orbit {
     }
 }
 
-/// Gap between neighbouring orbits, as a share of the solid spacing.
-const ORBIT_STEP: f32 = 0.55;
+/// How much larger each orbit is than the one inside it at the standard
+/// spacing: 10% of its radius.
+pub const ORBIT_STEP: f32 = 0.1;
 
 /// A solid must lead the reference by this much...
 const CENTER_MARGIN: f32 = 0.08;
@@ -194,10 +195,22 @@ fn signed(rng: &mut fastrand::Rng) -> f32 {
 
 impl Orbits {
     /// Orbits for `order` (slots in placement order: the first is the
-    /// reference unless `center_slot` names one), `gap` apart and the
-    /// innermost at least `min_r` out. The centre is raised so the lowest
-    /// any solid can go stays `clearance` above the ground.
-    pub fn new(order: &[usize], p: &OrbitParams, center_slot: Option<usize>, gap: f32, min_r: f32, clearance: f32, seed: u64) -> Self {
+    /// reference unless `center_slot` names one), the innermost at least
+    /// `min_r` out and every periapsis `gap` clear of the centre; each orbit
+    /// is `step` (a share of its radius, 0.1 = 10%) larger than the one
+    /// inside it. The centre is raised so the lowest any solid can go stays
+    /// `clearance` above the ground.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        order: &[usize],
+        p: &OrbitParams,
+        center_slot: Option<usize>,
+        gap: f32,
+        min_r: f32,
+        step: f32,
+        clearance: f32,
+        seed: u64,
+    ) -> Self {
         let p = p.sanitized();
         let n = order.len();
         let reference = if p.center.dynamic() { order.first().copied().unwrap_or(0) } else { center_slot.or(order.first().copied()).unwrap_or(0) };
@@ -213,14 +226,13 @@ impl Orbits {
             let tilt = (p.inclination + 30.0 * var * signed(&mut rng)).clamp(0.0, INCLINATION_MAX).to_radians();
             let node = PI * var * signed(&mut rng);
             let peri = PI * var * signed(&mut rng);
-            // Orbits sit about half a solid spacing apart (neighbours are
-            // at different points of their orbits, so they rarely meet),
-            // which keeps the layout about as wide as two rings.
-            let step = ORBIT_STEP * gap * (1.0 + 0.75 * var * signed(&mut rng)).max(0.5);
+            // Each orbit is `step` of its radius beyond the last (10% at the
+            // standard spacing), varied per orbit.
+            let grow = 1.0 + step.max(0.0) * (1.0 + 0.75 * var * signed(&mut rng)).max(0.5);
             let speed = (1.0 + 0.6 * var * signed(&mut rng)).max(0.2);
             let start = signed(&mut rng);
             // the periapsis stays a full gap clear of the centre solid
-            let a = prev.map_or(min_r, |r| r + step).max(gap / (1.0 - e));
+            let a = prev.map_or(min_r, |r| r * grow).max(gap / (1.0 - e));
             if k == 0 {
                 a0 = a;
             }
@@ -331,7 +343,7 @@ mod tests {
     fn kepler_orbits_stay_on_their_ellipse_and_move_smoothly() {
         let p = OrbitParams { eccentricity: 0.6, inclination: 40.0, variation: 0.8, ..OrbitParams::default() };
         let order: Vec<usize> = (0..6).collect();
-        let mut o = Orbits::new(&order, &p, Some(0), 2.6, 2.7, 2.0, 5);
+        let mut o = Orbits::new(&order, &p, Some(0), 2.6, 2.7, ORBIT_STEP, 2.0, 5);
         let mut last: Vec<Vec3A> = (0..6).map(|i| o.position(i)).collect();
         for _ in 0..2000 {
             o.advance(&ch(&[0.5; 6]), 1.0 / 60.0);
@@ -357,20 +369,28 @@ mod tests {
         let order: Vec<usize> = (0..5).collect();
         let tilts = |var: f32| {
             let p = OrbitParams { inclination: 30.0, variation: var, ..OrbitParams::default() };
-            let o = Orbits::new(&order, &p, Some(0), 2.6, 2.7, 0.0, 9);
+            let o = Orbits::new(&order, &p, Some(0), 2.6, 2.7, ORBIT_STEP, 0.0, 9);
             o.orbits.iter().flatten().map(|o| o.q.y.asin().to_degrees()).collect::<Vec<f32>>()
         };
         let same = tilts(0.0);
         assert!(same.iter().all(|t| (t - 30.0).abs() < 1e-3), "{same:?}");
         let spread = tilts(1.0);
         assert!(spread.iter().any(|t| (t - 30.0).abs() > 3.0), "{spread:?}");
+        // without variation each orbit is the step (10%) larger than the last
+        let flat = OrbitParams { eccentricity: 0.0, variation: 0.0, ..OrbitParams::default() };
+        for step in [ORBIT_STEP, 0.4] {
+            let o = Orbits::new(&order, &flat, Some(0), 2.6, 2.7, step, 0.0, 9);
+            let a: Vec<f32> = order[1..].iter().map(|&i| o.orbits[i].unwrap().a).collect();
+            assert!((a[0] - 2.7).abs() < 1e-4, "{a:?}");
+            assert!(a.windows(2).all(|w| (w[1] / w[0] - (1.0 + step)).abs() < 1e-4), "step {step}: {a:?}");
+        }
     }
 
     #[test]
     fn a_moving_reference_glides_to_the_busiest_solid() {
         let p = OrbitParams { center: OrbitCenter::Size, ..OrbitParams::default() };
         let order: Vec<usize> = (0..4).collect();
-        let mut o = Orbits::new(&order, &p, None, 2.6, 2.7, 1.0, 1);
+        let mut o = Orbits::new(&order, &p, None, 2.6, 2.7, ORBIT_STEP, 1.0, 1);
         assert_eq!(o.reference(), 0);
         let busy = ch(&[0.1, 0.2, 0.9, 0.3]);
         let mut prev = o.position(2);

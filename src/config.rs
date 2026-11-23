@@ -131,7 +131,8 @@ pub struct Config {
     /// Which solid goes where: `listed` (metric order), `simple` (simplest
     /// first), `complex` (most complex first) or `random`.
     pub ordering: Ordering,
-    /// Neighbour spacing as a multiple of the standard, 0.8..=2.5.
+    /// Neighbour spacing as a multiple of the standard, 0.25..=4 (orbits:
+    /// each 10% × this of its radius beyond the last).
     pub spacing: f32,
     /// Distance scaling, -2..=2: each solid's size times 1 + k × (its
     /// nearest neighbour's distance / the standard spacing − 1); 0 = off.

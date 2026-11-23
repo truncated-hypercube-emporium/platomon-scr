@@ -394,8 +394,12 @@ impl Default for Arrangement {
     }
 }
 
-/// Spacing range for [`Arrangement::spacing`].
-pub const SPACING_RANGE: (f32, f32) = (0.8, 2.5);
+/// Spacing range for [`Arrangement::spacing`] (a quarter to four times the
+/// standard: the dialog's slider is its power of two, -2..=2).
+pub const SPACING_RANGE: (f32, f32) = (0.25, 4.0);
+/// Orbits keep at least this share of the standard spacing between a
+/// periapsis and the centre solid, however tight the spacing.
+const ORBIT_MIN_CLEARANCE: f32 = 0.8;
 /// Range of [`Arrangement::distance_scale`] (0 = off).
 pub const DISTANCE_SCALE_RANGE: (f32, f32) = (-2.0, 2.0);
 /// Smallest and largest size multiplier distance scaling gives.
@@ -509,8 +513,13 @@ impl Scene {
         let k_dist = clamp_distance_scale(arr.distance_scale);
         // Orbits: the centre is raised so the lowest point of any orbit
         // keeps the largest halo clear of the ground.
+        // (each orbit 10% of its radius beyond the last at the standard
+        // spacing, stretched by it; periapses stay clear of the centre solid
+        // however tight the spacing)
         let mut orbits = (layout == Layout::Orbit).then(|| {
-            Orbits::new(&order, &arr.orbit, arr.center_slot, SPACING * spacing, MIN_RING_RADIUS * spacing, float_y, arr.seed)
+            let clear = SPACING * spacing.max(ORBIT_MIN_CLEARANCE);
+            let step = orbit::ORBIT_STEP * spacing;
+            Orbits::new(&order, &arr.orbit, arr.center_slot, clear, MIN_RING_RADIUS * spacing, step, float_y, arr.seed)
         });
         // Orbiting solids' neighbours come and go: allow for the largest
         // size distance scaling can give them (a negative factor grows

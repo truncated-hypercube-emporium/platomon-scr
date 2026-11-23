@@ -28,7 +28,7 @@ platomon [OPTIONS]
 | `--ring` | `METRIC=N`, repeatable (0 = innermost ring or shell) | automatic |
 | `--layout` | `rings` (on the ground), `sphere` (concentric spherical shells), `line` (one evenly spaced row), `stack` (one above another in the centre) or `orbit` (one solid in the centre, the others orbiting it) | `rings` |
 | `--ordering` | which solid takes which place: `listed` (metric order), `simple` (simplest first), `complex` (most complex first) or `random` | `listed` |
-| `--spacing` | neighbour spacing as a multiple of the standard, 0.8–2.5 | `1` |
+| `--spacing` | neighbour spacing as a multiple of the standard, 0.25–4 (orbits: 10% × this of their radius apart) | `1` |
 | `--distance-scale` | each solid's size times 1 + N × (nearest neighbour's distance ÷ standard spacing − 1), −2–2; 0 = off | `0` |
 | `--orbit-center` | orbit layout: the solid in the centre, `cpu`, `ram`, `net`, `disk`, `size` (largest now) or `spin` (fastest now) | `cpu` |
 | `--orbit-velocity` | orbit layout: angular speed of the innermost orbit, radians/s, 0.05–2 | `0.35` |
@@ -154,7 +154,8 @@ heights and camera framing allow for the largest size it can give.
 ### Orbit layout
 
 `--layout orbit` puts one solid, the reference, in the centre and the others on orbits around it,
-each orbit a different size, about half a solid spacing out from the last. `--orbit-center` picks
+each orbit 10% of its radius larger than the one inside it (`--spacing` stretches that: 2 = 20%,
+0.5 = 5%). `--orbit-center` picks
 the reference: `cpu`, `ram`, `net` or `disk` (that metric's solid; a network adapter or disk device
 when the main one isn't shown) holds the centre for the whole run; `size` gives it to whichever
 solid is largest at the moment and `spin` to whichever spins fastest. A solid that has led by a
@@ -564,13 +565,21 @@ dialog's are the CPU budget, luminosity levels, palette size and burn-in range; 
 
 **Layout and Rendering.** *Layout…* (beside *Tuning…*) opens the layout settings that apply every
 run: *Ordering* (as listed, simple to complex, complex to simple, or random; see *Line and stack
-layouts* above), *Orbit centre* (CPU, RAM, Network, Disk, Size or Spin) and the sliders *Spacing*,
+layouts* above), *Orbit centre* (CPU, RAM, Network, Disk, Size or Spin) and the sliders *Spacing* (−2 to 2 on a doubling scale, centred on 0 = standard: each step of 1
+doubles or halves the gaps, from a quarter to four times; orbits are 10% of their radius apart at 0,
+2.5% to 40% across the range),
 *Distance scaling* (−2 to 2, centred on 0 = off; see *Line and stack layouts* above), *Orbit velocity*, *Orbital inclination*, *Orbital eccentricity* and *Orbital variation* (see *Orbit
 layout* above; the orbit settings only matter with the Orbit layout, and a random look rolls its own
 orbit sliders unless they are set). *Rendering…* (in the frame-rate cap's row) opens the rendering
 settings: samples per cell, light bounces, march steps and render distance (auto: the screensaver's
-own 1 sample and 1 bounce) and adaptive quality. Their sliders work like *Tuning*'s and are saved the
-same way (`tune_spacing`, `tune_distance_scale`, `tune_orbit_velocity`, `tune_spp`, ...); `ordering`, `orbit_center` and
+own 1 sample and 1 bounce), adaptive quality and the **character ramp**: its *Custom ramp…* button
+opens the *Character ramp* dialog, where *Use this custom ramp* swaps the luminosity levels' 8, 16 or
+32 glyphs for a string of your own, darkest first (2 to 96 characters, no tabs; start with a space
+for black). *Start from* fills in the 8, 16 or 32-level ramp to edit, and the line under the string
+counts its glyphs or says what is wrong with it. The Rendering dialog shows whether it is on, and
+the ramp is saved, on or off, with the other settings (`custom_ramp=on|off`, `ramp="..."`, quoted so
+a leading space survives) and in log entries. Their sliders work like *Tuning*'s and are saved the
+same way (`tune_spacing_exp`, `tune_distance_scale`, `tune_orbit_velocity`, `tune_spp`, ...); `ordering`, `orbit_center` and
 `adaptive` are plain keys.
 
 **Tuning.** *Tuning…* opens a dialog of sliders: background luminosity, quasicrystal waves and
@@ -711,6 +720,8 @@ budget=15              ; percent
 overdrive=off          ; on = ignore the budget and use all the CPU time rendering wants
 density=2              ; 1 = standard | 2 = double
 levels=16              ; 8 | 16 | 32 (older auto -> 16, 10 -> 8)
+custom_ramp=off        ; on = draw with the ramp below instead of the levels' ramp
+ramp=" .,:;-~=+*ox#%&@" ; custom character ramp, darkest first (quoted: keeps a leading space)
 sound=on               ; sound halo from the default output device
 halo_swing=10          ; halo size swing, percent of the radius: 10 | 30 | 60 (older halo_wide on -> 30)
 halo_bands=on          ; on = each solid's halo follows its frequency band; off = overall level

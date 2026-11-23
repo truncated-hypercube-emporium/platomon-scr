@@ -360,6 +360,21 @@ const ID_PANEL_CHOICE: i32 = 2500;
 const ID_PANEL_LABEL: i32 = 2550;
 /// A secondary dialog's slider choice `k`: its value text.
 const ID_PANEL_VALUE: i32 = 2600;
+// Rendering dialog: the custom character ramp row
+const ID_RAMP_LABEL: i32 = 2700;
+const ID_RAMP_SUMMARY: i32 = 2701;
+const ID_RAMP_BUTTON: i32 = 2702;
+// the Character ramp dialog
+const ID_RAMP_ON: i32 = 2710;
+const ID_RAMP_EDIT: i32 = 2711;
+const ID_RAMP_INFO: i32 = 2712;
+const ID_RAMP_PRESET: i32 = 2713; // ..2715: the 8, 16 and 32-level ramps
+/// The ramps the Character ramp dialog can start from: (button, ramp).
+const RAMP_PRESETS: [(&str, &str); 3] =
+    [("&8 levels", crate::ascii::RAMP_8), ("1&6 levels", crate::ascii::DEFAULT_RAMP), ("&32 levels", crate::ascii::RAMP_32)];
+const SS_ENDELLIPSIS: u32 = 0x4000;
+const EM_SETLIMITTEXT: u32 = 0x00C5;
+const EN_CHANGE: usize = 0x0300;
 const ID_STATIC: u16 = 0xFFFF;
 
 /// Log rows shown at most (pinned and unpinned, newest first).
@@ -509,6 +524,11 @@ fn panel_tips(p: Panel) -> Vec<(i32, String)> {
         v.push((ID_TUNE_RESET + k as i32, "Back to auto: the random look's or the default value.".to_string()));
     }
     v.push((ID_TUNE_RESET_ALL, "Set everything in this dialog back to auto or its default.".to_string()));
+    if p == Panel::Rendering {
+        for id in [ID_RAMP_LABEL, ID_RAMP_SUMMARY, ID_RAMP_BUTTON] {
+            v.push((id, help("custom_ramp").to_string()));
+        }
+    }
     v.push((IDOK, "Keep these values (saved with OK in the main dialog).".to_string()));
     v.push((IDCANCEL, "Discard changes to these values.".to_string()));
     v
@@ -658,8 +678,14 @@ const PANELS: [Panel; 3] = [Panel::Tuning, Panel::Layout, Panel::Rendering];
 
 /// Every secondary dialog's choice keys (kept in [`Ui::panel_values`]).
 fn panel_keys() -> Vec<&'static str> {
-    screensaver::choices().into_iter().filter(|c| c.panel.is_some()).map(|c| c.key).collect()
+    let mut keys: Vec<&'static str> = screensaver::choices().into_iter().filter(|c| c.panel.is_some()).map(|c| c.key).collect();
+    // the Rendering dialog's custom character ramp (its own small dialog)
+    keys.extend(RAMP_KEYS);
+    keys
 }
+
+/// Settings the Character ramp dialog edits.
+const RAMP_KEYS: [&str; 2] = ["custom_ramp", "ramp"];
 
 fn radius_choice() -> Choice {
     screensaver::choices().into_iter().find(|c| c.key == "shift_radius").expect("shift_radius choice")
@@ -856,7 +882,9 @@ const REROLL_TEXT: &str = "Randomi&ze";
 /// Secondary dialog `p`: its drop-downs and check boxes, then its sliders.
 fn panel_template(p: Panel) -> (Vec<u32>, usize) {
     let (choices, tunables) = (panel_choices(p), panel_tunables(p));
-    let rows = (choices.len() + tunables.len()) as i16;
+    // Rendering has one more row: the custom character ramp's button
+    let ramp_row = p == Panel::Rendering;
+    let rows = (choices.len() + tunables.len() + ramp_row as usize) as i16;
     let cy = 30 + rows * 15 + 26;
     let mut t = Template::new(panel_title(p), 300, cy);
     let intro = match p {
@@ -887,6 +915,12 @@ fn panel_template(p: Panel) -> (Vec<u32>, usize) {
         t.slider(TBS_NOTICKS, (102, y, 128, 13), ID_TUNE + k as i32);
         t.item(SS_RIGHT | SS_NOTIFY, (232, y + 2, 38, 10), (ID_TUNE_VALUE + k as i32) as u16, STATIC, "");
         t.item(BS_PUSHBUTTON | WS_TABSTOP, (274, y, 16, 12), (ID_TUNE_RESET + k as i32) as u16, BUTTON, "\u{d7}");
+    }
+    if ramp_row {
+        let y = 30 + (choices.len() + tunables.len()) as i16 * 15;
+        t.item(SS_NOTIFY, (10, y + 2, 92, 10), ID_RAMP_LABEL as u16, STATIC, "Character ramp");
+        t.item(SS_NOTIFY | SS_ENDELLIPSIS, (102, y + 2, 120, 10), ID_RAMP_SUMMARY as u16, STATIC, "");
+        t.item(BS_PUSHBUTTON | WS_TABSTOP, (226, y, 64, 13), ID_RAMP_BUTTON as u16, BUTTON, "C&ustom ramp...");
     }
     let by = cy - 20;
     t.item(BS_PUSHBUTTON | WS_TABSTOP, (10, by, 60, 14), ID_TUNE_RESET_ALL as u16, BUTTON, "&Reset all");
@@ -1133,7 +1167,8 @@ fn tuning_label(h: HWND) {
                 .iter()
                 .filter(|c| u.panel_values.iter().find(|(k, _)| *k == c.key).map(|(_, v)| v) != defaults.iter().find(|(k, _)| *k == c.key).map(|(_, v)| v))
                 .count();
-            sliders + choices
+            let ramp = p == Panel::Rendering && u.panel_values.iter().any(|(k, v)| *k == "custom_ramp" && v == "on");
+            sliders + choices + ramp as usize
         });
         let (id, base) = panel_button(p);
         let text = match (n, p) {
@@ -1688,6 +1723,137 @@ unsafe fn panel_take(h: HWND, p: Panel) {
     }
 }
 
+/// The custom ramp in the open dialog's working copy: (on, ramp).
+fn ramp_edit() -> (bool, String) {
+    UI.with(|u| {
+        let u = u.borrow();
+        let get = |k: &str| u.panel_edit.iter().find(|(key, _)| *key == k).map(|(_, v)| v.clone());
+        let on = get("custom_ramp").is_some_and(|v| v == "on");
+        let ramp = get("ramp").and_then(|v| screensaver::parse_ramp(&v)).unwrap_or_else(|| ScrSettings::default().ramp);
+        (on, ramp)
+    })
+}
+
+fn set_ramp_edit(on: bool, ramp: &str) {
+    UI.with(|u| {
+        let mut u = u.borrow_mut();
+        u.panel_edit.retain(|(k, _)| !RAMP_KEYS.contains(k));
+        u.panel_edit.push(("custom_ramp", if on { "on" } else { "off" }.into()));
+        // stored as the settings write it (quoted)
+        u.panel_edit.push(("ramp", format!("\"{ramp}\"")));
+    });
+}
+
+/// The Rendering dialog's line about the custom ramp.
+fn ramp_summary(h: HWND) {
+    let (on, ramp) = ramp_edit();
+    let text = if on { format!("Custom, {} glyphs", ramp.chars().count()) } else { "Off (luminosity levels)".to_string() };
+    // SAFETY: control id from the panel template.
+    unsafe { SetDlgItemTextW(h, ID_RAMP_SUMMARY, wide(&text).as_ptr()) };
+}
+
+/// The Character ramp dialog: an on/off box, the ramp, and the built-in
+/// ramps to start from.
+fn ramp_template() -> Vec<u32> {
+    let mut t = Template::new("Character ramp", 260, 118);
+    t.item(
+        0,
+        (10, 6, 240, 18),
+        ID_STATIC,
+        STATIC,
+        "The glyphs drawn from darkest to brightest, instead of the luminosity levels' ramp. Start with a space for black.",
+    );
+    t.item(BS_AUTOCHECKBOX | WS_TABSTOP, (10, 28, 240, 10), ID_RAMP_ON as u16, BUTTON, "&Use this custom ramp");
+    t.item(ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP, (10, 42, 240, 13), ID_RAMP_EDIT as u16, EDIT, "");
+    t.item(0, (10, 58, 240, 10), ID_RAMP_INFO as u16, STATIC, "");
+    t.item(0, (10, 76, 44, 10), ID_STATIC, STATIC, "Start from:");
+    for (k, (label, _)) in RAMP_PRESETS.iter().enumerate() {
+        t.item(BS_PUSHBUTTON | WS_TABSTOP, (56 + k as i16 * 48, 74, 44, 13), (ID_RAMP_PRESET + k as i32) as u16, BUTTON, label);
+    }
+    t.item(BS_DEFPUSHBUTTON | WS_TABSTOP, (140, 98, 55, 14), IDOK as u16, BUTTON, "OK");
+    t.item(BS_PUSHBUTTON | WS_TABSTOP, (200, 98, 55, 14), IDCANCEL as u16, BUTTON, "Cancel");
+    t.finish()
+}
+
+/// The line under the ramp: its length, or what is wrong with it.
+fn ramp_info(ramp: &str) -> String {
+    match screensaver::ramp_problem(ramp) {
+        Some(why) => why,
+        None => {
+            let n = ramp.chars().count();
+            let dark = if ramp.starts_with(' ') { "darkest: a space" } else { "darkest first" };
+            format!("{n} glyphs ({dark}).")
+        }
+    }
+}
+
+/// # Safety
+/// Called by the dialog manager with a valid dialog window handle.
+unsafe extern "system" fn ramp_dialog(h: HWND, msg: u32, w: usize, _l: isize) -> isize {
+    // SAFETY (whole fn): `h` is our dialog; control ids come from our template.
+    unsafe {
+        match msg {
+            WM_INITDIALOG => {
+                let (on, ramp) = ramp_edit();
+                CheckDlgButton(h, ID_RAMP_ON, on as u32);
+                SendDlgItemMessageW(h, ID_RAMP_EDIT, EM_SETLIMITTEXT, screensaver::RAMP_MAX, 0);
+                SetDlgItemTextW(h, ID_RAMP_EDIT, wide(&ramp).as_ptr());
+                SetDlgItemTextW(h, ID_RAMP_INFO, wide(&ramp_info(&ramp)).as_ptr());
+                add_tips(
+                    h,
+                    &[
+                        (ID_RAMP_ON, help("custom_ramp").to_string()),
+                        (ID_RAMP_EDIT, help("ramp").to_string()),
+                        (ID_RAMP_PRESET, "Start from the 8-level ramp.".to_string()),
+                        (ID_RAMP_PRESET + 1, "Start from the 16-level ramp.".to_string()),
+                        (ID_RAMP_PRESET + 2, "Start from the 32-level ramp.".to_string()),
+                    ],
+                );
+                1
+            }
+            WM_COMMAND => {
+                let id = (w & 0xFFFF) as i32;
+                match id {
+                    ID_RAMP_EDIT if (w >> 16) == EN_CHANGE => {
+                        SetDlgItemTextW(h, ID_RAMP_INFO, wide(&ramp_info(&dlg_text(h, ID_RAMP_EDIT))).as_ptr());
+                        1
+                    }
+                    _ if (ID_RAMP_PRESET..ID_RAMP_PRESET + RAMP_PRESETS.len() as i32).contains(&id) => {
+                        let ramp = RAMP_PRESETS[(id - ID_RAMP_PRESET) as usize].1;
+                        SetDlgItemTextW(h, ID_RAMP_EDIT, wide(ramp).as_ptr());
+                        1
+                    }
+                    IDOK => {
+                        let on = IsDlgButtonChecked(h, ID_RAMP_ON) == 1;
+                        let ramp = dlg_text(h, ID_RAMP_EDIT);
+                        match screensaver::ramp_problem(&ramp) {
+                            Some(why) if on => {
+                                MessageBoxW(h, wide(&why).as_ptr(), wide("platomon").as_ptr(), MB_ICONWARNING);
+                            }
+                            // off with an unusable ramp: keep the last good one
+                            Some(_) => {
+                                set_ramp_edit(false, &ramp_edit().1);
+                                EndDialog(h, 1);
+                            }
+                            None => {
+                                set_ramp_edit(on, &ramp);
+                                EndDialog(h, 1);
+                            }
+                        }
+                        1
+                    }
+                    IDCANCEL => {
+                        EndDialog(h, 0);
+                        1
+                    }
+                    _ => 0,
+                }
+            }
+            _ => 0,
+        }
+    }
+}
+
 /// The secondary dialogs' procedure (Tuning, Layout, Rendering): drop-downs
 /// and check boxes, then sliders over the dialog's [`TUNABLES`].
 ///
@@ -1724,6 +1890,9 @@ unsafe extern "system" fn tuning_dialog(h: HWND, msg: u32, w: usize, l: isize) -
                 for (k, t) in panel_tunables(p).iter().enumerate() {
                     SendDlgItemMessageW(h, ID_TUNE + k as i32, TBM_SETRANGE, 1, (t.steps() as isize) << 16);
                     tune_row(h, k, t);
+                }
+                if p == Panel::Rendering {
+                    ramp_summary(h);
                 }
                 add_tips(h, &panel_tips(p));
                 1
@@ -1765,6 +1934,13 @@ unsafe extern "system" fn tuning_dialog(h: HWND, msg: u32, w: usize, l: isize) -
                         EndDialog(h, 0);
                         1
                     }
+                    ID_RAMP_BUTTON => {
+                        let tpl = ramp_template();
+                        // SAFETY: a valid DWORD-aligned template; the procedure matches DLGPROC.
+                        DialogBoxIndirectParamW(GetModuleHandleW(std::ptr::null()), tpl.as_ptr() as *const u16, h, Some(ramp_dialog), 0);
+                        ramp_summary(h);
+                        1
+                    }
                     ID_TUNE_RESET_ALL => {
                         let defaults = ScrSettings::default().to_pairs();
                         UI.with(|u| {
@@ -1777,6 +1953,11 @@ unsafe extern "system" fn tuning_dialog(h: HWND, msg: u32, w: usize, l: isize) -
                                 }
                             }
                         });
+                        if p == Panel::Rendering {
+                            // the custom ramp goes off; its text is kept for next time
+                            set_ramp_edit(false, &ramp_edit().1);
+                            ramp_summary(h);
+                        }
                         panel_fill(h, p);
                         for (k, t) in list.iter().enumerate() {
                             tune_row(h, k, t);
@@ -1847,8 +2028,15 @@ mod tests {
                     Kind::Slider => 3,
                 })
                 .sum();
-            assert_eq!(n, 1 + choices + panel_tunables(p).len() * 4 + 3, "{p:?}");
+            // Rendering: the custom ramp's label, summary and button
+            let ramp_row = if p == Panel::Rendering { 3 } else { 0 };
+            assert_eq!(n, 1 + choices + panel_tunables(p).len() * 4 + 3 + ramp_row, "{p:?}");
         }
+        // the Character ramp dialog: intro, box, edit, info, label, 3 presets, OK, Cancel
+        let ramp = ramp_template();
+        let (_, items, cy) = header(&ramp);
+        assert_eq!(items, 10);
+        assert!(cy > 80, "height {cy}");
         // every slider is in exactly one dialog, every dialog has something
         assert_eq!(PANELS.iter().map(|&p| panel_tunables(p).len()).sum::<usize>(), TUNABLES.len());
         assert!(PANELS.iter().all(|&p| !panel_tunables(p).is_empty()));
@@ -1921,7 +2109,8 @@ mod tests {
         assert!(TUNABLES.iter().all(|t| t.help.len() > 20));
         for p in PANELS {
             let tips = panel_tips(p);
-            assert_eq!(tips.len(), panel_choices(p).len() * 2 + panel_tunables(p).len() * 4 + 3);
+            let ramp_row = if p == Panel::Rendering { 3 } else { 0 };
+            assert_eq!(tips.len(), panel_choices(p).len() * 2 + panel_tunables(p).len() * 4 + 3 + ramp_row);
             assert!(tips.iter().all(|(_, t)| !t.is_empty()), "{p:?}");
         }
         assert!(main_tips().iter().all(|(_, t)| !t.is_empty()));
