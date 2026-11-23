@@ -472,7 +472,7 @@ fn main_tips() -> Vec<(i32, String)> {
         (ID_FULLSCREEN, "Preview full screen at full resolution instead; the mouse is ignored, press any key to close it."),
         (ID_APPLY, "Save the settings and log them without closing the dialog."),
         (ID_TUNING, "Sliders for numeric values (orbit period, floor tile size, spin speeds...) that apply every run."),
-        (ID_LAYOUT, "Layout settings that apply every run: the order the solids take their places in (by complexity, either way, or random) and their spacing."),
+        (ID_LAYOUT, "Layout settings that apply every run: the order the solids take their places in (by complexity, either way, or random), their spacing, and the Orbit layout's centre solid, velocity, inclination, eccentricity and variation."),
         (ID_RENDERING, "Rendering settings: samples per cell, light bounces, march steps, render distance and adaptive quality."),
         (ID_LOAD, "Put the settings in the box above (the picked log entry's, as you may have edited them) into the dialog. Nothing is saved until OK."),
         (ID_DETAILS, "The picked log entry: its time, the arguments the dialog was launched with, and its settings. Edit the key=value lines, then Load config to use them."),
@@ -861,7 +861,7 @@ fn panel_template(p: Panel) -> (Vec<u32>, usize) {
     let mut t = Template::new(panel_title(p), 300, cy);
     let intro = match p {
         Panel::Tuning => "Move a slider to set that value for every run; auto keeps the random look's or the default value.",
-        Panel::Layout => "How the solids are placed, every run (the layout itself is in the Appearance group); auto keeps the default spacing.",
+        Panel::Layout => "How the solids are placed, every run (the layout itself is in the Appearance group); the orbit settings apply to the Orbit layout. Auto keeps the default.",
         Panel::Rendering => "How the picture is traced, every run; auto keeps the screensaver's own cheap settings (1 sample, 1 bounce).",
     };
     t.item(0, (10, 6, 280, 20), ID_STATIC, STATIC, intro);
@@ -1146,7 +1146,7 @@ fn tuning_label(h: HWND) {
     }
 }
 
-/// Roll a random look into the Appearance group and random values into
+/// Roll random values into every setting of the Appearance group and into
 /// the Tuning dialog's sliders (and turn Random start off so the rolled
 /// look is what runs).
 unsafe fn reroll(h: HWND) {
@@ -1154,18 +1154,19 @@ unsafe fn reroll(h: HWND) {
     // SAFETY: control ids from our template.
     unsafe {
         for (i, c) in general_choices().iter().enumerate() {
-            if c.look && !c.options.is_empty() {
+            if c.appearance && !c.options.is_empty() {
                 let (v, _) = &c.options[rng.usize(0..c.options.len())];
                 set_choice(h, ID_COMBO + i as i32, ID_VALUE + i as i32, c, v);
             }
         }
         CheckDlgButton(h, ID_RANDOM, 0);
         enable_look(h);
+        enable_inline(h);
     }
     // and every slider of the Tuning dialog (its look settings too)
     UI.with(|u| {
         let mut u = u.borrow_mut();
-        for c in panel_choices(Panel::Tuning).iter().filter(|c| c.look && !c.options.is_empty()) {
+        for c in panel_choices(Panel::Tuning).iter().filter(|c| !c.options.is_empty()) {
             let (v, _) = &c.options[rng.usize(0..c.options.len())];
             u.panel_values.retain(|(k, _)| *k != c.key);
             u.panel_values.push((c.key, v.clone()));
@@ -1177,7 +1178,7 @@ unsafe fn reroll(h: HWND) {
         }
     });
     tuning_label(h);
-    status(h, "Rolled a random look and tuning (not saved until OK or Apply).");
+    status(h, "Rolled random Appearance and Tuning settings (not saved until OK or Apply).");
 }
 
 /// Open secondary dialog `p` over the main dialog `h`; OK keeps its edits.

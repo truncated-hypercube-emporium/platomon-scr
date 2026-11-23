@@ -11,7 +11,7 @@ use crate::render::{RenderSettings, Renderer, TraceSettings};
 use crate::scene::camera::{CameraMode, CameraParams, OrbitDir};
 use crate::scene::ground::{Pattern, Spin};
 use crate::scene::sdf::SolidKind;
-use crate::scene::{AnimParams, Layout, Ordering, Scene, SlotLayout};
+use crate::scene::{AnimParams, Layout, OrbitCenter, Ordering, Scene, SlotLayout};
 use crate::color::{self, ColorBy};
 
 /// The primary display as Windows reports it.
@@ -77,11 +77,17 @@ pub fn randomize(rng: &mut fastrand::Rng, d: &Display) -> Config {
     }
     c.show = show;
     c.layout = match rng.u8(0..20) {
-        0..=6 => Layout::Rings,
-        7..=13 => Layout::Sphere,
-        14..=16 => Layout::Line,
-        _ => Layout::Stack,
+        0..=5 => Layout::Rings,
+        6..=11 => Layout::Sphere,
+        12..=14 => Layout::Line,
+        15..=16 => Layout::Stack,
+        _ => Layout::Orbit,
     };
+    // orbits of their own each run (the Layout dialog's sliders override)
+    c.orbit_velocity = round2(range(rng, 0.2, 0.6));
+    c.orbit_inclination = range(rng, 0.0, 45.0).round();
+    c.orbit_eccentricity = round2(range(rng, 0.0, 0.4));
+    c.orbit_variation = round2(range(rng, 0.1, 0.7));
 
     // camera
     c.camera = match rng.u8(0..20) {
@@ -165,7 +171,7 @@ pub fn camera_params(cfg: &Config) -> CameraParams {
 /// The scene for `cfg`'s resolved slots, with its layout and background.
 pub fn build_scene(cfg: &Config, slots: &[SlotSpec]) -> Scene {
     let layouts: Vec<SlotLayout> = slots.iter().map(|s| SlotLayout { solid: s.solid, ring: s.ring }).collect();
-    Scene::arranged(&layouts, &anim_params(cfg), &camera_params(cfg), &cfg.arrangement()).with_ground(&cfg.ground_params())
+    Scene::arranged(&layouts, &anim_params(cfg), &camera_params(cfg), &cfg.arrangement(slots)).with_ground(&cfg.ground_params())
 }
 
 /// Render settings for `cfg` (no picture-ratio framing: the screen is filled).
@@ -305,6 +311,7 @@ pub fn plan_config(d: &Display, seed: u64, s: &ScrSettings) -> Config {
     config.tag_fixed_len = s.tag_fixed;
     config.halo_color = s.halo_color;
     config.ordering = s.ordering;
+    config.orbit_center = s.orbit_center;
     config.adaptive_quality = s.adaptive;
     for &(k, v) in &s.tuning {
         set_tunable(&mut config, k, v);
@@ -472,6 +479,8 @@ pub struct ScrSettings {
     pub halo_color: color::HaloColor,
     /// Which solid takes which place in the layout.
     pub ordering: Ordering,
+    /// Orbit layout: the solid the others orbit.
+    pub orbit_center: OrbitCenter,
     /// Adaptive quality: drop samples, then bounces, when frames run late.
     pub adaptive: bool,
     /// Dynamic camera distance: move in and out to keep every solid in frame.
@@ -526,6 +535,7 @@ impl Default for ScrSettings {
             halo_bands: true,
             halo_color: color::HaloColor::Under,
             ordering: Ordering::Listed,
+            orbit_center: OrbitCenter::Cpu,
             adaptive: true,
             auto_distance: false,
             far_ground: false,
@@ -624,7 +634,7 @@ macro_rules! tunable {
 /// Every numeric setting set with a slider, in the Tuning, Layout and
 /// Rendering dialogs ([`Tunable::panel`]). A set value applies every run
 /// (random look or not); unset ones keep the random or default value.
-pub const TUNABLES: [Tunable; 19] = [
+pub const TUNABLES: [Tunable; 23] = [
     tunable!(Tuning, "orbit_period", "Orbit period (s)", 15.0, 180.0, 5.0, "Seconds per camera orbit (orbit, tilt and resonance cameras). Tilt also takes one period per rise or fall."),
     tunable!(Tuning, "orbit_bob", "Orbit bob", 0.0, 1.0, 0.05, "How far the orbiting camera rises and falls twice per turn, in world units."),
     tunable!(Tuning, "focus_zoom", "Focus zoom", 0.0, 1.0, 0.05, "Focus camera: 0 only turns toward the busiest solid, 1 comes in to a close-up."),
@@ -639,7 +649,11 @@ pub const TUNABLES: [Tunable; 19] = [
     tunable!(Tuning, "idle_spin", "Idle spin (rad/s)", 0.0, 1.0, 0.05, "How fast a solid spins when its metric is idle."),
     tunable!(Tuning, "max_spin", "Fastest spin (rad/s)", 0.5, 8.0, 0.25, "How fast a solid spins at full load."),
     tunable!(Tuning, "exposure", "Exposure", 0.3, 3.0, 0.1, "Overall picture brightness before it is turned into glyphs."),
-    tunable!(Layout, "spacing", "Spacing", 0.8, 2.5, 0.05, "Distance between neighbouring solids (and between rings or shells), as a multiple of the standard spacing."),
+    tunable!(Layout, "spacing", "Spacing", 0.8, 2.5, 0.05, "Distance between neighbouring solids (and between rings, shells or orbits), as a multiple of the standard spacing."),
+    tunable!(Layout, "orbit_velocity", "Orbit velocity", 0.05, 2.0, 0.05, "Orbit layout: how fast the innermost orbit goes round, in radians per second (0.35 is about 18 s per turn). Outer orbits take longer."),
+    tunable!(Layout, "orbit_inclination", "Orbital inclination", 0.0, 90.0, 5.0, "Orbit layout: how far the orbits tilt from the floor, in degrees (0 = flat, 90 = upright)."),
+    tunable!(Layout, "orbit_eccentricity", "Orbital eccentricity", 0.0, 0.8, 0.05, "Orbit layout: 0 = circular orbits, higher = longer ellipses, the solids speeding up as they swing close to the centre."),
+    tunable!(Layout, "orbit_variation", "Orbital variation", 0.0, 1.0, 0.05, "Orbit layout: 0 = every orbit alike, higher = each orbit gets its own spacing, speed, tilt, shape and direction."),
     tunable!(Rendering, "spp", "Samples per cell", 1.0, 4.0, 1.0, "Light paths traced per character cell: more is smoother and less noisy, and costs that many times the work."),
     tunable!(Rendering, "bounces", "Light bounces", 0.0, 4.0, 1.0, "Indirect bounces after the first hit: 0 gives hard direct light only, more fills shadows with reflected light at more cost."),
     tunable!(Rendering, "max_steps", "March steps", 16.0, 256.0, 8.0, "Most sphere-tracing steps per ray: fewer is faster but can miss thin edges and grazing surfaces."),
@@ -664,6 +678,10 @@ pub fn set_tunable(c: &mut Config, key: &str, v: f32) {
         "max_spin" => c.max_spin = v,
         "exposure" => c.exposure = v,
         "spacing" => c.spacing = v,
+        "orbit_velocity" => c.orbit_velocity = v,
+        "orbit_inclination" => c.orbit_inclination = v,
+        "orbit_eccentricity" => c.orbit_eccentricity = v,
+        "orbit_variation" => c.orbit_variation = v,
         "spp" => c.spp = v.round().max(1.0) as u32,
         "bounces" => c.bounces = v.round().max(0.0) as u32,
         "max_steps" => c.max_steps = v.round().max(1.0) as u32,
@@ -701,6 +719,10 @@ pub fn get_tunable(c: &Config, key: &str) -> f32 {
         "max_spin" => c.max_spin,
         "exposure" => c.exposure,
         "spacing" => c.spacing,
+        "orbit_velocity" => c.orbit_velocity,
+        "orbit_inclination" => c.orbit_inclination,
+        "orbit_eccentricity" => c.orbit_eccentricity,
+        "orbit_variation" => c.orbit_variation,
         "spp" => c.spp as f32,
         "bounces" => c.bounces as f32,
         "max_steps" => c.max_steps as f32,
@@ -714,8 +736,9 @@ pub fn get_tunable(c: &Config, key: &str) -> f32 {
 pub fn help(key: &str) -> &'static str {
     match key {
         "random" => "Random start. On: every run starts with a new random look (layout, camera, colours, background...). Off: the look chosen in this group is used every time.",
-        "reroll" => "Roll a random look into the settings of this group and random values into the Tuning dialog's sliders now (and turn Random start off so they are kept). Nothing is saved until OK or Apply.",
-        "layout" => "Rings: the solids stand in rings on the floor. Sphere: they float on concentric spherical shells. Line: one evenly spaced row. Stack: one above another in the centre. Ordering and spacing are in the Layout dialog.",
+        "reroll" => "Roll random values into every setting of this group and into the Tuning dialog's sliders now (and turn Random start off so they are kept). Nothing is saved until OK or Apply.",
+        "layout" => "Rings: the solids stand in rings on the floor. Sphere: they float on concentric spherical shells. Line: one evenly spaced row. Stack: one above another in the centre. Orbit: one solid in the centre and the others orbiting it. Ordering, spacing and the orbits are in the Layout dialog.",
+        "orbit_center" => "Orbit layout: the solid the others orbit. CPU, RAM, Network or Disk: that metric's solid. Size: whichever solid is largest at the moment. Spin: whichever spins fastest. A new centre glides in smoothly.",
         "ordering" => "Which solid takes which place: in metric order, from the simplest solid (fewest edges) to the most complex, the reverse, or shuffled. The first place is the inner ring's front, the inner shell, the line's left end or the stack's bottom.",
         "adaptive" => "When frames run late, render with fewer samples, then fewer bounces, and step back up when there is time again.",
         "camera" => "Static: a fixed overview. Orbit: circles the solids. Focus: glides toward the busiest solid. Tilt: orbits while rising from 20 to 80 degrees and back, pausing half an orbit at each end. Resonance: orbits with three 20-degree rises and falls per turn.",
@@ -873,6 +896,7 @@ pub fn choices() -> Vec<Choice> {
                 opt("random", "Random"),
             ],
         ),
+        in_panel(Panel::Layout, "orbit_center", "Orbit centre", OrbitCenter::ALL.iter().map(|c| opt(c.id(), c.label())).collect()),
         in_panel(Panel::Rendering, "adaptive", "Adaptive quality", on_off()),
         look(
             "camera",
@@ -1023,6 +1047,7 @@ impl ScrSettings {
             ("halo_bands", on_off(self.halo_bands)),
             ("halo_color", self.halo_color.id().into()),
             ("ordering", self.ordering.id().into()),
+            ("orbit_center", self.orbit_center.id().into()),
             ("adaptive", on_off(self.adaptive)),
             ("auto_distance", on_off(self.auto_distance)),
             ("far_ground", on_off(self.far_ground)),
@@ -1097,6 +1122,7 @@ impl ScrSettings {
             halo_bands: flag("halo_bands", d.halo_bands),
             halo_color: val("halo_color").and_then(|v| color::HaloColor::parse(&v)).unwrap_or(d.halo_color),
             ordering: val("ordering").and_then(|v| v.parse().ok()).unwrap_or(d.ordering),
+            orbit_center: val("orbit_center").and_then(|v| v.parse().ok()).unwrap_or(d.orbit_center),
             adaptive: flag("adaptive", d.adaptive),
             auto_distance: flag("auto_distance", d.auto_distance),
             far_ground: flag("far_ground", d.far_ground),
@@ -1408,6 +1434,7 @@ mod tests {
             halo_bands: false,
             halo_color: crate::color::HaloColor::Size,
             ordering: Ordering::Complex,
+            orbit_center: OrbitCenter::Spin,
             adaptive: false,
             auto_distance: true,
             far_ground: true,

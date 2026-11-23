@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use crate::aspect::AspectMode;
 use crate::clock::FpsCurve;
 use crate::color::{self, ColorBy, ColorMap, Gradient, HaloColor};
-use crate::scene::{Arrangement, Layout, Ordering, SPACING_RANGE};
+use crate::scene::{Arrangement, Layout, OrbitCenter, OrbitParams, Ordering, SPACING_RANGE};
 use crate::metrics::{MetricKind, MetricSpec};
 use crate::overlay::{LEGEND_SIZE_MAX, LEGEND_SIZE_MIN, LegendParams, LegendPos};
 use crate::scene::camera::{CameraMode, OrbitDir};
@@ -133,6 +133,17 @@ pub struct Config {
     pub ordering: Ordering,
     /// Neighbour spacing as a multiple of the standard, 0.8..=2.5.
     pub spacing: f32,
+    /// Orbit layout: the solid in the centre, `cpu`, `ram`, `net`, `disk`,
+    /// `size` (the largest at the moment) or `spin` (the fastest).
+    pub orbit_center: OrbitCenter,
+    /// Orbit layout: angular speed of the innermost orbit, radians/s.
+    pub orbit_velocity: f32,
+    /// Orbit layout: tilt of the orbits, degrees (0..=90).
+    pub orbit_inclination: f32,
+    /// Orbit layout: 0 = circles, up to 0.8 = long ellipses.
+    pub orbit_eccentricity: f32,
+    /// Orbit layout: spread of the other orbit settings between orbits, 0..=1.
+    pub orbit_variation: f32,
 
     // --- camera ---
     pub camera: CameraMode,
@@ -251,6 +262,11 @@ impl Default for Config {
             layout: Layout::Rings,
             ordering: Ordering::Listed,
             spacing: 1.0,
+            orbit_center: OrbitParams::default().center,
+            orbit_velocity: OrbitParams::default().velocity,
+            orbit_inclination: OrbitParams::default().inclination,
+            orbit_eccentricity: OrbitParams::default().eccentricity,
+            orbit_variation: OrbitParams::default().variation,
             focus_zoom: 0.6,
             focus_tau: 1.5,
             auto_distance: false,
@@ -358,6 +374,9 @@ impl Config {
         self.max_steps = self.max_steps.clamp(8, 1024);
         self.max_dist = finite_or(self.max_dist, d.max_dist).clamp(5.0, 1000.0);
         self.spacing = finite_or(self.spacing, d.spacing).clamp(SPACING_RANGE.0, SPACING_RANGE.1);
+        let o = self.orbit_params().sanitized();
+        (self.orbit_velocity, self.orbit_inclination, self.orbit_eccentricity, self.orbit_variation) =
+            (o.velocity, o.inclination, o.eccentricity, o.variation);
 
         if self.ramp.chars().count() < 2 {
             self.ramp = d.ramp.clone();
@@ -413,9 +432,37 @@ impl Config {
         }
     }
 
-    /// How the solids are placed (the random ordering follows the seed).
-    pub fn arrangement(&self) -> Arrangement {
-        Arrangement { layout: self.layout, ordering: self.ordering, spacing: self.spacing, seed: self.seed.unwrap_or(0) }
+    /// The orbit layout's settings.
+    pub fn orbit_params(&self) -> OrbitParams {
+        OrbitParams {
+            center: self.orbit_center,
+            velocity: self.orbit_velocity,
+            inclination: self.orbit_inclination,
+            eccentricity: self.orbit_eccentricity,
+            variation: self.orbit_variation,
+        }
+    }
+
+    /// How `slots` are placed (the random ordering and the orbits'
+    /// variation follow the seed).
+    pub fn arrangement(&self, slots: &[SlotSpec]) -> Arrangement {
+        // A metric centre: that metric's solid, or its per-device kind's.
+        let kinds: &[MetricKind] = match self.orbit_center {
+            OrbitCenter::Cpu => &[MetricKind::Cpu],
+            OrbitCenter::Ram => &[MetricKind::Ram],
+            OrbitCenter::Net => &[MetricKind::Net, MetricKind::Nic],
+            OrbitCenter::Disk => &[MetricKind::Disk, MetricKind::DiskDev],
+            OrbitCenter::Size | OrbitCenter::Spin => &[],
+        };
+        let center_slot = kinds.iter().find_map(|k| slots.iter().position(|s| s.metric.kind == *k));
+        Arrangement {
+            layout: self.layout,
+            ordering: self.ordering,
+            spacing: self.spacing,
+            seed: self.seed.unwrap_or(0),
+            orbit: self.orbit_params(),
+            center_slot,
+        }
     }
 
     pub fn ground_params(&self) -> GroundParams {

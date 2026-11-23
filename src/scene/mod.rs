@@ -3,6 +3,7 @@
 
 pub mod camera;
 pub mod ground;
+pub mod orbit;
 pub mod sdf;
 
 use glam::{Mat3A, Vec2, Vec3A};
@@ -12,6 +13,7 @@ use std::f32::consts::{PI, TAU};
 use crate::metrics::Channel;
 pub use camera::{Camera, CameraParams, CameraRig};
 pub use ground::{Ground, GroundParams};
+pub use orbit::{OrbitCenter, OrbitParams, Orbits};
 use sdf::{Polyhedron, SolidKind, inverse_rotation};
 
 /// Circumradius of every solid at scale 1.
@@ -289,10 +291,13 @@ pub enum Layout {
     Line,
     /// One above another in the centre, the lowest clear of the ground.
     Stack,
+    /// One solid in the centre, the others on orbits of different sizes
+    /// around it ([`orbit`]).
+    Orbit,
 }
 
 impl Layout {
-    pub const ALL: [Layout; 4] = [Layout::Rings, Layout::Sphere, Layout::Line, Layout::Stack];
+    pub const ALL: [Layout; 5] = [Layout::Rings, Layout::Sphere, Layout::Line, Layout::Stack, Layout::Orbit];
 
     pub fn id(self) -> &'static str {
         match self {
@@ -300,6 +305,7 @@ impl Layout {
             Layout::Sphere => "sphere",
             Layout::Line => "line",
             Layout::Stack => "stack",
+            Layout::Orbit => "orbit",
         }
     }
 }
@@ -312,7 +318,8 @@ impl std::str::FromStr for Layout {
             "sphere" | "shells" => Ok(Self::Sphere),
             "line" | "row" => Ok(Self::Line),
             "stack" | "column" | "tower" => Ok(Self::Stack),
-            _ => Err(format!("unknown layout '{s}' (rings|sphere|line|stack)")),
+            "orbit" | "orbits" => Ok(Self::Orbit),
+            _ => Err(format!("unknown layout '{s}' (rings|sphere|line|stack|orbit)")),
         }
     }
 }
@@ -361,13 +368,25 @@ pub struct Arrangement {
     pub ordering: Ordering,
     /// Neighbour spacing as a multiple of the standard (1 = as tuned).
     pub spacing: f32,
-    /// Seed for [`Ordering::Random`].
+    /// Seed for [`Ordering::Random`] (and the orbits' variation).
     pub seed: u64,
+    /// The orbit layout's settings.
+    pub orbit: OrbitParams,
+    /// The orbit layout's reference slot for a metric centre (CPU, RAM...);
+    /// `None` = the first place.
+    pub center_slot: Option<usize>,
 }
 
 impl Default for Arrangement {
     fn default() -> Self {
-        Self { layout: Layout::Rings, ordering: Ordering::Listed, spacing: 1.0, seed: 0 }
+        Self {
+            layout: Layout::Rings,
+            ordering: Ordering::Listed,
+            spacing: 1.0,
+            seed: 0,
+            orbit: OrbitParams::default(),
+            center_slot: None,
+        }
     }
 }
 
@@ -379,6 +398,9 @@ const SPHERE_FRAMING: f32 = 1.45;
 /// Camera distance multiplier for the stack: the camera frames layouts by
 /// their width, and a stack is all height.
 const STACK_FRAMING: f32 = 1.6;
+/// Orbits: flat ones frame like rings; steeply tilted ones need the
+/// sphere's distance (blended by the steepest orbit's tilt).
+const ORBIT_FRAMING_TILTED: f32 = SPHERE_FRAMING;
 
 /// Focus mode: a solid must lead the current focus by this much activity...
 const FOCUS_MARGIN: f32 = 0.05;
@@ -418,6 +440,8 @@ pub struct Scene {
     /// Slot the focus camera is on, and a challenger waiting out `FOCUS_HOLD`.
     focus: Option<usize>,
     challenger: Option<(usize, f32)>,
+    /// Orbit layout: the orbits (`ring_pos` follows them every frame).
+    pub orbits: Option<Orbits>,
 }
 
 impl Scene {
@@ -439,7 +463,18 @@ impl Scene {
         let kinds: Vec<SolidKind> = slots.iter().map(|s| s.solid).collect();
         let order = placement_order(&kinds, arr.ordering, arr.seed);
         let rings: Vec<Option<u32>> = order.iter().map(|&i| slots[i].ring).collect();
+        let max_r = BASE_RADIUS * anim.max_scale.max(anim.min_scale);
+        let float_y = max_r * HALO_REACH_MAX + FLOAT_GAP;
+        // Orbits: the centre is raised so the lowest point of any orbit
+        // keeps the largest halo clear of the ground.
+        let orbits = (layout == Layout::Orbit).then(|| {
+            Orbits::new(&order, &arr.orbit, arr.center_slot, SPACING * spacing, MIN_RING_RADIUS * spacing, float_y, arr.seed)
+        });
         let (placed, placed_index, centroid) = match layout {
+            Layout::Orbit => {
+                let o = orbits.as_ref().expect("orbit layout has orbits");
+                (order.iter().map(|&i| o.position(i)).collect(), order.iter().map(|&i| o.index[i]).collect(), o.centre)
+            }
             Layout::Rings => {
                 let (p, idx) = ring_layout_spaced(&rings, spacing);
                 let c = mean(&p);
@@ -457,17 +492,17 @@ impl Scene {
             ring_pos[i] = placed[k];
             ring_index[i] = placed_index[k];
         }
-        let extent = ring_pos.iter().map(|p| (*p - centroid).length()).fold(0.0, f32::max)
-            + BASE_RADIUS * anim.max_scale;
+        // (orbiting solids reach their apoapsis, wherever they start)
+        let reach = orbits.as_ref().map_or(0.0, |o| o.reach);
+        let extent = ring_pos.iter().map(|p| (*p - centroid).length()).fold(reach, f32::max) + BASE_RADIUS * anim.max_scale;
         // Float the solids so their largest halo clears the ground: rings
         // and lines hover at a fixed height (the camera's aim rises with
         // them); a sphere of shells or a stack is lifted if its lowest halo
-        // would dip below.
-        let max_r = BASE_RADIUS * anim.max_scale.max(anim.min_scale);
-        let float_y = max_r * HALO_REACH_MAX + FLOAT_GAP;
+        // would dip below; orbits were raised when they were made.
         let grounded = matches!(layout, Layout::Rings | Layout::Line);
         let (mut ring_pos, mut centroid) = (ring_pos, centroid);
         match layout {
+            Layout::Orbit => {}
             Layout::Rings | Layout::Line => centroid.y += float_y - (max_r + HOVER),
             Layout::Sphere | Layout::Stack => {
                 let low = ring_pos.iter().map(|p| p.y).fold(f32::INFINITY, f32::min) - max_r * HALO_REACH_MAX;
@@ -499,6 +534,10 @@ impl Scene {
         let frame_extent = match layout {
             Layout::Sphere => extent * SPHERE_FRAMING,
             Layout::Stack => extent * STACK_FRAMING,
+            Layout::Orbit => {
+                let tilt = orbits.as_ref().map_or(0.0, |o| o.max_tilt.sin());
+                extent * (1.0 + (ORBIT_FRAMING_TILTED - 1.0) * tilt)
+            }
             Layout::Rings | Layout::Line => extent,
         };
         let rig = CameraRig::new(cam, centroid, frame_extent);
@@ -526,6 +565,7 @@ impl Scene {
             grounded,
             focus: None,
             challenger: None,
+            orbits,
         };
         for i in 0..s.solids.len() {
             s.set_scale(i, anim.min_scale);
@@ -647,6 +687,12 @@ impl Scene {
     /// everything uses wall-clock `dt`.
     pub fn update(&mut self, channels: &[Channel], anim: &AnimParams, dt: f32) {
         let span = (anim.max_spin - anim.idle_spin).max(0.0);
+        if let Some(o) = &mut self.orbits {
+            o.advance(channels, dt);
+            for (i, p) in self.ring_pos.iter_mut().enumerate() {
+                *p = o.position(i);
+            }
+        }
         for i in 0..self.solids.len() {
             let c = channels.get(i).copied().unwrap_or_default();
             let (level, sy, sx) = if c.available { (c.level, c.spin_y, c.spin_x) } else { (0.0, 0.0, 0.0) };
@@ -849,7 +895,7 @@ mod tests {
         let kinds = [SolidKind::Dodecahedron, SolidKind::Tetrahedron, SolidKind::Cube, SolidKind::Icosahedron, SolidKind::Octahedron];
         let slots: Vec<SlotLayout> = kinds.iter().map(|&solid| SlotLayout { solid, ring: None }).collect();
         let build = |layout, ordering, spacing| {
-            let arr = Arrangement { layout, ordering, spacing, seed: 7 };
+            let arr = Arrangement { layout, ordering, spacing, seed: 7, ..Arrangement::default() };
             let mut s = Scene::arranged(&slots, &anim, &CameraParams::default(), &arr);
             s.update(&[Channel { available: true, level: 1.0, spin_y: 0.0, spin_x: 0.0, activity: 1.0 }; 5], &anim, 0.1);
             s
@@ -906,6 +952,27 @@ mod tests {
     }
 
     #[test]
+    fn orbit_scene_moves_solids_around_the_reference_above_the_floor() {
+        let anim = AnimParams::default();
+        let slots: Vec<SlotLayout> = (0..6).map(|i| SlotLayout { solid: SolidKind::ALL[i], ring: None }).collect();
+        let orbit = OrbitParams { inclination: 60.0, eccentricity: 0.5, variation: 1.0, ..OrbitParams::default() };
+        let arr = Arrangement { layout: Layout::Orbit, orbit, center_slot: Some(2), seed: 4, ..Arrangement::default() };
+        let mut s = Scene::arranged(&slots, &anim, &CameraParams::default(), &arr);
+        let start: Vec<Vec3A> = s.solids.iter().map(|i| i.center).collect();
+        for _ in 0..600 {
+            s.update(&full(6), &anim, 1.0 / 30.0);
+            for inst in &s.solids {
+                assert!(inst.center.y - inst.scale * HALO_REACH_MAX >= FLOAT_GAP - 1e-3, "halo clear of the floor");
+                assert!(inst.center.y + inst.scale <= s.slab_top);
+                assert!((inst.center - s.centroid).length() <= s.extent, "inside the framed extent");
+            }
+        }
+        assert!((s.solids[2].center - s.centroid).length() < 1e-4, "CPU's solid holds the centre");
+        assert!(s.solids.iter().zip(&start).enumerate().all(|(i, (a, b))| i == 2 || (a.center - *b).length() > 0.1), "the rest moved");
+        assert_eq!("orbit".parse::<Layout>().unwrap(), Layout::Orbit);
+    }
+
+    #[test]
     fn camera_and_light_scale_with_layout() {
         let anim = AnimParams::default();
         let small = Scene::demo(&anim);
@@ -925,7 +992,7 @@ mod tests {
         let anim = AnimParams::default();
         let tuned = (LIGHT_RADIUS / LIGHT_OFFSET.length()).asin();
         for (n, layout) in
-            [(5usize, Layout::Rings), (16, Layout::Rings), (16, Layout::Sphere), (5, Layout::Line), (16, Layout::Line), (8, Layout::Stack)]
+            [(5usize, Layout::Rings), (16, Layout::Rings), (16, Layout::Sphere), (5, Layout::Line), (16, Layout::Line), (8, Layout::Stack), (7, Layout::Orbit)]
         {
             let slots: Vec<SlotLayout> =
                 (0..n).map(|i| SlotLayout { solid: SolidKind::ALL[i % SolidKind::ALL.len()], ring: None }).collect();

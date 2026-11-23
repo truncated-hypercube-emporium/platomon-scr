@@ -26,9 +26,14 @@ platomon [OPTIONS]
 | `--show` | `METRIC[,METRIC…]`, max 16 | `cpu,ram,disk,net,gpu` |
 | `--solid` | `METRIC=SOLID`, repeatable | built-in mapping |
 | `--ring` | `METRIC=N`, repeatable (0 = innermost ring or shell) | automatic |
-| `--layout` | `rings` (on the ground), `sphere` (concentric spherical shells), `line` (one evenly spaced row) or `stack` (one above another in the centre) | `rings` |
+| `--layout` | `rings` (on the ground), `sphere` (concentric spherical shells), `line` (one evenly spaced row), `stack` (one above another in the centre) or `orbit` (one solid in the centre, the others orbiting it) | `rings` |
 | `--ordering` | which solid takes which place: `listed` (metric order), `simple` (simplest first), `complex` (most complex first) or `random` | `listed` |
 | `--spacing` | neighbour spacing as a multiple of the standard, 0.8–2.5 | `1` |
+| `--orbit-center` | orbit layout: the solid in the centre, `cpu`, `ram`, `net`, `disk`, `size` (largest now) or `spin` (fastest now) | `cpu` |
+| `--orbit-velocity` | orbit layout: angular speed of the innermost orbit, radians/s, 0.05–2 | `0.35` |
+| `--orbit-inclination` | orbit layout: tilt of the orbits, degrees, 0–90 | `15` |
+| `--orbit-eccentricity` | orbit layout: 0 = circles, up to 0.8 = long ellipses | `0.15` |
+| `--orbit-variation` | orbit layout: how much each orbit's spacing, speed, tilt, shape and direction differ, 0–1 | `0.3` |
 | **Rendering** | | |
 | `--spp` | `N` (1–64) | 2 |
 | `--bounces` | `N` (0–8) | 2 |
@@ -136,6 +141,29 @@ solid (fewest edges, faces breaking ties) first and the most complex last, `comp
 and `random` shuffles them (the same for a given seed). The first place is the inner ring's front,
 the inner shell, the line's left end or the stack's bottom. `--spacing` scales the distance between
 neighbours (and between rings and shells).
+
+### Orbit layout
+
+`--layout orbit` puts one solid, the reference, in the centre and the others on orbits around it,
+each orbit a different size, about half a solid spacing out from the last. `--orbit-center` picks
+the reference: `cpu`, `ram`, `net` or `disk` (that metric's solid; a network adapter or disk device
+when the main one isn't shown) holds the centre for the whole run; `size` gives it to whichever
+solid is largest at the moment and `spin` to whichever spins fastest. A solid that has led by a
+clear margin for 1.5 s takes over: it glides in to the centre and the old reference glides back out
+onto its orbit on a critically damped spring (about two seconds, no overshoot), so nothing jumps.
+
+The orbits are Kepler ellipses, and solids move along them by Kepler's equation: they speed up as
+they swing in close to the centre and slow down far out, smoothly. `--orbit-velocity` is the
+innermost orbit's angular speed in radians per second (default 0.35, about 18 s per turn); outer
+orbits are slower, as the square root of their size. `--orbit-inclination` tilts the orbits from
+the floor (degrees, 0 = flat, 90 = upright), and `--orbit-eccentricity` stretches them from circles
+(0) to long ellipses (0.8); every orbit's closest point stays a full solid spacing clear of the
+centre. `--orbit-variation` (0..1) spreads the other settings: at 0 every orbit lies in one plane
+with one shape, and toward 1 each orbit gets its own size step, speed (±60%), tilt (±30°),
+eccentricity (±0.3), orientation and starting point (the same for a given seed). The centre is
+raised so the lowest point of any orbit keeps the largest halo clear of the floor, and the camera
+backs off further the steeper the orbits tilt. Orbits may cross, so two solids can briefly pass
+through each other.
 
 ### Sphere layout
 
@@ -512,10 +540,10 @@ screensaver interface. **Random start**, the last check box of the *Appearance* 
 default), picks the look anew every run; turn it off to use the look chosen in the group instead:
 layout, camera, colour gradient and source, background colour and pattern, wireframe, stats bar,
 inverted frame rate and extra metrics, plus the background luminosity and quasicrystal sliders in
-*Tuning* (all greyed out while Random start is on). The **Randomize** button beside it rolls a
-random look into those settings and random values into every *Tuning* slider now, and turns Random
+*Tuning* (all greyed out while Random start is on). The **Randomize** button beside it rolls
+random values into every *Appearance* setting and every *Tuning* slider now, and turns Random
 start off so they are kept (saved with OK or *Apply*). The rest of *Appearance* always applies,
-Random start or not: halo colour, tag colour, *Tag style*, sound halo, halo bounce by frequency,
+Random start or not (Randomize still rolls it): halo colour, tag colour, *Tag style*, sound halo, halo bounce by frequency,
 extended floor distance and *Tags*. The *Performance & Features* group always applies too: the frame-rate cap (the
 display's refresh rate by default), the CPU budget used to size the text, the *Rendering resolution*, the
 number of luminosity levels, the palette size, dynamic camera distance and fixed tag length, with
@@ -527,10 +555,14 @@ dialog's are the CPU budget, luminosity levels, palette size and burn-in range; 
 
 **Layout and Rendering.** *Layout…* (beside *Tuning…*) opens the layout settings that apply every
 run: *Ordering* (as listed, simple to complex, complex to simple, or random; see *Line and stack
-layouts* above) and *Spacing*. *Rendering…* (in the frame-rate cap's row) opens the rendering
+layouts* above), *Orbit centre* (CPU, RAM, Network, Disk, Size or Spin) and the sliders *Spacing*,
+*Orbit velocity*, *Orbital inclination*, *Orbital eccentricity* and *Orbital variation* (see *Orbit
+layout* above; the orbit settings only matter with the Orbit layout, and a random look rolls its own
+orbit sliders unless they are set). *Rendering…* (in the frame-rate cap's row) opens the rendering
 settings: samples per cell, light bounces, march steps and render distance (auto: the screensaver's
 own 1 sample and 1 bounce) and adaptive quality. Their sliders work like *Tuning*'s and are saved the
-same way (`tune_spacing`, `tune_spp`, ...); `ordering` and `adaptive` are plain keys.
+same way (`tune_spacing`, `tune_orbit_velocity`, `tune_spp`, ...); `ordering`, `orbit_center` and
+`adaptive` are plain keys.
 
 **Tuning.** *Tuning…* opens a dialog of sliders: background luminosity, quasicrystal waves and
 flow and halo size swing (stepped like the main dialog's sliders, saved as plain keys), then numeric
@@ -650,8 +682,9 @@ INI file through `WritePrivateProfileString`: `%APPDATA%\platomon\screensaver.in
 ```ini
 [platomon]
 random=on              ; on = random look each run; off = use the look below
-layout=rings           ; rings | sphere | line | stack
+layout=rings           ; rings | sphere | line | stack | orbit
 ordering=listed        ; listed | simple | complex | random
+orbit_center=cpu       ; orbit layout's centre: cpu | ram | net | disk | size | spin
 adaptive=on            ; adaptive quality
 camera=orbit           ; static | orbit | focus | tilt | resonance
 color=inferno          ; off | inferno | viridis | ... (see --list gradients)

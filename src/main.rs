@@ -17,7 +17,7 @@ use platomon::render::{QualityGovernor, RenderSettings, Renderer, TraceSettings}
 use platomon::scene::camera::{CameraMode, CameraParams, OrbitDir};
 use platomon::scene::ground::{Pattern, Spin, parse_vec2};
 use platomon::scene::sdf::{Polyhedron, SolidKind};
-use platomon::scene::{AnimParams, Layout, Ordering, Scene, SlotLayout};
+use platomon::scene::{AnimParams, Layout, OrbitCenter, Ordering, Scene, SlotLayout};
 use platomon::ui::{self, Action};
 
 /// Longest sleep between input polls while waiting for a frame deadline.
@@ -159,9 +159,27 @@ struct Cli {
 
     // ---- layout
     /// rings (on the ground), sphere (concentric spherical shells; --ring picks the shell),
-    /// line (one evenly spaced row) or stack (one above another in the centre).
-    #[arg(long, value_name = "rings|sphere|line|stack")]
+    /// line (one evenly spaced row), stack (one above another in the centre) or orbit
+    /// (one solid in the centre, the others on orbits around it).
+    #[arg(long, value_name = "rings|sphere|line|stack|orbit")]
     layout: Option<Layout>,
+    /// Orbit layout: the solid in the centre, cpu, ram, net, disk, size (the largest at the
+    /// moment) or spin (the fastest).
+    #[arg(long, value_name = "cpu|ram|net|disk|size|spin")]
+    orbit_center: Option<OrbitCenter>,
+    /// Orbit layout: angular speed of the innermost orbit, radians/s, 0.05..2 (default 0.35).
+    #[arg(long, value_name = "RAD/S")]
+    orbit_velocity: Option<f32>,
+    /// Orbit layout: tilt of the orbits, degrees, 0..90 (default 15).
+    #[arg(long, value_name = "DEG")]
+    orbit_inclination: Option<f32>,
+    /// Orbit layout: 0 = circles, up to 0.8 = long ellipses (default 0.15).
+    #[arg(long, value_name = "0..0.8")]
+    orbit_eccentricity: Option<f32>,
+    /// Orbit layout: how much each orbit's size step, speed, tilt, shape and direction
+    /// differ from the others, 0..1 (default 0.3).
+    #[arg(long, value_name = "0..1")]
+    orbit_variation: Option<f32>,
     /// Which solid takes which place: listed (metric order), simple (simplest first),
     /// complex (most complex first) or random.
     #[arg(long, value_name = "listed|simple|complex|random")]
@@ -259,6 +277,7 @@ fn apply_cli(cfg: &mut Config, cli: &Cli) -> Result<(), String> {
     set!(bg_lum, bg_pattern, bg_contrast, bg_scale, bg_sway, bg_sway_period, bg_rotate, bg_rotate_period, bg_waves, bg_wave_speed);
     set!(legend_size, legend_opacity, legend_pos);
     set!(color, color_by, bg_color, layout, ordering, spacing, focus_zoom, focus_tau);
+    set!(orbit_center, orbit_velocity, orbit_inclination, orbit_eccentricity, orbit_variation);
     if let Some(n) = &cli.colors {
         cfg.colors = n.parse().unwrap_or(color::DEFAULT_COLORS);
     }
@@ -516,7 +535,7 @@ fn camera_params(cfg: &Config) -> CameraParams {
 }
 
 fn build_scene(cfg: &Config, slots: &[SlotSpec]) -> Scene {
-    Scene::arranged(&layouts(slots), &anim_params(cfg), &camera_params(cfg), &cfg.arrangement())
+    Scene::arranged(&layouts(slots), &anim_params(cfg), &camera_params(cfg), &cfg.arrangement(slots))
         .with_ground(&cfg.ground_params())
 }
 
