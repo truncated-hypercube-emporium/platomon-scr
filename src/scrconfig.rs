@@ -342,6 +342,8 @@ const HIDE_TEXT: &str = "x";
 const ID_DETAILS: i32 = 1700;
 const ID_LOAD: i32 = 1701;
 const ID_EMPTY: i32 = 1702;
+/// Save the details box's settings as a new log entry.
+const ID_SAVE_CONF: i32 = 1703;
 const ID_APPLY: i32 = 1204;
 const ID_PREVIEW: i32 = 1205;
 const ID_FULLSCREEN: i32 = 1206;
@@ -457,7 +459,11 @@ fn main_tips() -> Vec<(i32, String)> {
     for (id, key) in [(ID_SHIFT, "shift"), (ID_SHIFT_MIN, "shift_min_frames"), (ID_SHIFT_MAX, "shift_max_frames"), (ID_RADIUS, "shift_radius"), (ID_RADIUS_VALUE, "shift_radius")] {
         v.push((id, help(key).into()));
     }
-    let buttons: [(i32, &str); 10] = [
+    let buttons: [(i32, &str); 11] = [
+        (
+            ID_SAVE_CONF,
+            "Save the settings in the box above (as you may have edited them) to the log as a new entry. The dialog's own settings are not changed.",
+        ),
         (
             ID_PREVIEW,
             "Show these settings in a window at half the screen's size (half the render resolution); edits show live. Click inside it to close it. \
@@ -821,8 +827,9 @@ fn build_template_counted() -> (Vec<u32>, usize) {
     let right_bottom = log_bottom;
 
     let bottom = left_bottom.max(right_bottom) + 6;
-    // Load sits under the details box, right above Apply.
-    t.item(BS_PUSHBUTTON | WS_TABSTOP, (DLG_W - 182, bottom - 2, 115, 13), ID_LOAD as u16, BUTTON, "&Load config");
+    // Save and Load sit under the details box, right above Apply and OK.
+    t.item(BS_PUSHBUTTON | WS_TABSTOP, (DLG_W - 182, bottom - 2, 55, 13), ID_SAVE_CONF as u16, BUTTON, "Sa&ve conf");
+    t.item(BS_PUSHBUTTON | WS_TABSTOP, (DLG_W - 122, bottom - 2, 55, 13), ID_LOAD as u16, BUTTON, "&Load config");
     t.item(0, (10, bottom, DLG_W - 200, 10), ID_STATUS as u16, STATIC, "Saved to %APPDATA%\\platomon\\screensaver.ini.");
     let by = bottom + 15;
     t.item(BS_PUSHBUTTON | WS_TABSTOP, (10, by, 66, 14), ID_TUNING as u16, BUTTON, "&Tuning...");
@@ -1523,6 +1530,20 @@ pub unsafe extern "system" fn ScreenSaverConfigureDialog(h: HWND, msg: u32, w: u
                     }
                     ID_TUNING if code == BN_CLICKED => {
                         open_panel(h, Panel::Tuning);
+                        1
+                    }
+                    ID_SAVE_CONF if code == BN_CLICKED => {
+                        let pairs = details_settings(&dlg_text(h, ID_DETAILS));
+                        if pairs.is_empty() {
+                            status(h, "Nothing to save: pick a log entry or type key=value lines in the box.");
+                        } else {
+                            match log_save(&settings_from(&pairs)) {
+                                Ok(Logged::Added(t)) => status(h, &format!("Saved the box's settings to the log as \"{t}\".")),
+                                Ok(Logged::Duplicate(t)) => status(h, &format!("These settings are already logged as \"{t}\".")),
+                                Err(e) => status(h, &e),
+                            }
+                            refresh_log(h);
+                        }
                         1
                     }
                     ID_LOAD => {

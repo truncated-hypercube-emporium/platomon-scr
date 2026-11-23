@@ -555,7 +555,9 @@ the right, titled with a random English word and the time, holding the settings 
 the dialog was launched with. Entries always hold the look with *Random start* off, so
 loading one brings back that look; a save whose settings are already logged adds no new entry. Pick an entry to see them in the box below the
 list; the box can be edited, and *Load config* puts the settings it holds (its `key=value` lines
-after `[platomon]`, as edited) back in the controls (saved only with OK). The newest 10 entries are kept; the `+` beside an entry keeps it
+after `[platomon]`, as edited) back in the controls (saved only with OK). *Save conf*, beside it,
+saves the box's settings to the log as a new entry instead (settings it leaves out take their
+defaults), without touching the dialog's own settings. The newest 10 entries are kept; the `+` beside an entry keeps it
 (the button turns to `−`, which lets it go again) and saves it to `configuration.log` beside the
 settings file, and kept entries are never dropped. The `x` at an entry's right takes it off the list
 without deleting it: it stays in the log file (marked `hidden=1`, and never dropped), and a kept
