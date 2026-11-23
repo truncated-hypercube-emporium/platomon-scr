@@ -39,7 +39,8 @@ mod win {
     use platomon::aspect;
     use platomon::ascii::Ramp;
     use platomon::audio::{Envelope, OutputMeter, SolidLevels, bass_weighted, frequency_gradient};
-    use platomon::config::Config;
+    use platomon::config::{Config, SlotSpec};
+    use platomon::drive::Drives;
     use platomon::clock::FrameClock;
     use platomon::collector::Collector;
     use platomon::color::{self, ColorBy, ColorMap};
@@ -810,15 +811,16 @@ mod win {
         cfg.char_aspect = screen.char_aspect();
         let cmap: Option<ColorMap> = cfg.color_map()?;
         let slots = cfg.resolve_slots()?;
-        let specs: Vec<_> = slots.iter().map(|s| s.metric.clone()).collect();
+        // each solid's inputs, over the distinct metrics they read
+        let mut drives = Drives::new(&SlotSpec::drives(&slots), cfg.delta_period);
         let anim = screensaver::anim_params(&cfg);
         let base = screensaver::render_settings(&cfg, cfg.char_aspect);
         let ramp = Ramp::new(&cfg.ramp);
 
         let collector = Collector::spawn(cfg.poll_hz);
         let mut scene = screensaver::build_scene(&cfg, &slots);
-        let mut metrics = MetricsState::new(&cfg, &specs);
-        let weights = metrics.weights(&cfg.weights);
+        let mut metrics = MetricsState::new(&cfg, drives.sources());
+        let weights = drives.weights(&cfg.weights);
         let mut fps = FrameClock::new(cfg.fps_min, cfg.fps_max, cfg.fps_curve, cfg.fps_slew).inverted(cfg.fps_invert);
         let mut renderer = Renderer::new();
         let mut governor = QualityGovernor::default();
@@ -964,13 +966,17 @@ mod win {
                 metrics.ingest(&raw);
             }
             metrics.tick(dt);
-            let channels = metrics.channels();
-            fps.update_target(activity_score(&channels, &weights), dt);
-            scene.update(&channels, &anim, dt);
-            scene.color_values(cfg.color_by, &channels, &mut levels);
+            drives.tick(&metrics, dt);
+            let channels = drives.channels();
+            fps.update_target(activity_score(channels, &weights), dt);
+            for (i, k) in drives.shapes().enumerate() {
+                scene.set_kind(i, k);
+            }
+            scene.update(channels, &anim, dt);
+            scene.color_values(cfg.color_by, drives.color_channels(), &mut levels);
             if tags_on {
                 tag_labels.clear();
-                tag_labels.extend(metrics.readings().iter().map(|r| ui::short_label(r)));
+                tag_labels.extend(drives.readings(&metrics).iter().map(|r| r.map_or_else(String::new, ui::short_label)));
             }
             let halo = sound.as_mut().map(SoundHalo::next).filter(|_| halo_on);
             if color_sound && let Some(sh) = &sound {

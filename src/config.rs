@@ -8,6 +8,7 @@ use crate::aspect::AspectMode;
 use crate::clock::FpsCurve;
 use crate::color::{self, ColorBy, ColorMap, Gradient, HaloColor};
 use crate::scene::{Arrangement, DISTANCE_SCALE_RANGE, Layout, OrbitCenter, OrbitParams, Ordering, SPACING_RANGE};
+use crate::drive::{Binding, DELTA_PERIOD_RANGE, Input, MAX_SOLIDS};
 use crate::metrics::{MetricKind, MetricSpec};
 use crate::overlay::{LEGEND_SIZE_MAX, LEGEND_SIZE_MIN, LegendParams, LegendPos, TagPlace};
 use crate::scene::camera::{CameraMode, OrbitDir};
@@ -57,6 +58,11 @@ pub struct Config {
     // --- what to show ---
     /// Metrics, one solid each: `cpu`, `ram`, `disk`, `net`, `gpu`, `nic[:NAME]`, `disk-dev[:NAME]`.
     pub show: Vec<String>,
+    /// Per-solid inputs, one solid each, instead of `show`:
+    /// `SHAPE|SIZE|SPIN|COLOUR|COMPLEXITY` (see [`crate::drive::Binding`]).
+    pub bindings: Vec<String>,
+    /// Delta inputs measure the change over this many seconds.
+    pub delta_period: f32,
 
     // --- frame rate ---
     pub fps_min: f32,
@@ -204,8 +210,11 @@ pub struct Config {
     pub bg_rotate_period: f32,
     /// Quasicrystal pattern: number of plane waves (3..=24; its symmetry).
     pub bg_waves: u32,
-    /// Quasicrystal pattern: wave phase speed, radians/s (0 = still).
+    /// Animated patterns' flow: the quasicrystal's wave phase speed,
+    /// radians/s (0 = still); the others move in proportion.
     pub bg_wave_speed: f32,
+    /// Rain pattern: raindrops rippling at once.
+    pub bg_drops: u32,
 
     // --- animation ---
     pub min_scale: f32,
@@ -236,6 +245,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             show: ["cpu", "ram", "disk", "net", "gpu"].map(String::from).to_vec(),
+            bindings: Vec::new(),
+            delta_period: crate::drive::DELTA_PERIOD_DEFAULT,
             fps_min: 5.0,
             fps_max: 150.0,
             fps_curve: FpsCurve::Sqrt,
@@ -300,6 +311,7 @@ impl Default for Config {
             bg_rotate_period: 60.0,
             bg_waves: crate::scene::ground::WAVES_DEFAULT,
             bg_wave_speed: crate::scene::ground::WAVE_SPEED_DEFAULT,
+            bg_drops: crate::scene::ground::DROPS_DEFAULT,
             min_scale: 0.45,
             max_scale: 1.0,
             max_spin: 3.0,
@@ -318,10 +330,20 @@ impl Default for Config {
 /// One displayed solid.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SlotSpec {
+    /// The metric it is known by (its tag, the orbit centre, its weight).
     pub metric: MetricSpec,
     pub solid: SolidKind,
     /// Requested ring; `None` = automatic.
     pub ring: Option<u32>,
+    /// What drives its size, spin, colour and complexity.
+    pub inputs: [Input; 4],
+}
+
+impl SlotSpec {
+    /// The (shape, inputs) pairs a [`crate::drive::Drives`] takes.
+    pub fn drives(slots: &[SlotSpec]) -> Vec<(SolidKind, [Input; 4])> {
+        slots.iter().map(|s| (s.solid, s.inputs.clone())).collect()
+    }
 }
 
 fn finite_or(v: f32, d: f32) -> f32 {
@@ -384,6 +406,7 @@ impl Config {
         self.max_dist = finite_or(self.max_dist, d.max_dist).clamp(5.0, 1000.0);
         self.spacing = finite_or(self.spacing, d.spacing).clamp(SPACING_RANGE.0, SPACING_RANGE.1);
         self.distance_scale = finite_or(self.distance_scale, 0.0).clamp(DISTANCE_SCALE_RANGE.0, DISTANCE_SCALE_RANGE.1);
+        self.delta_period = finite_or(self.delta_period, d.delta_period).clamp(DELTA_PERIOD_RANGE.0, DELTA_PERIOD_RANGE.1);
         let o = self.orbit_params().sanitized();
         (self.orbit_velocity, self.orbit_inclination, self.orbit_eccentricity, self.orbit_variation) =
             (o.velocity, o.inclination, o.eccentricity, o.variation);
@@ -417,6 +440,7 @@ impl Config {
         self.bg_rotate_period = finite_or(self.bg_rotate_period, d.bg_rotate_period).clamp(0.5, 86_400.0);
         self.bg_waves = self.bg_waves.clamp(crate::scene::ground::WAVES_MIN, crate::scene::ground::WAVES_MAX);
         self.bg_wave_speed = finite_or(self.bg_wave_speed, d.bg_wave_speed).clamp(-20.0, 20.0);
+        self.bg_drops = self.bg_drops.clamp(crate::scene::ground::DROPS_MIN, crate::scene::ground::DROPS_MAX);
         for v in [&mut self.orbit_radius, &mut self.orbit_height] {
             *v = v.filter(|x| x.is_finite()).map(|x| x.clamp(0.5, 500.0));
         }
@@ -489,6 +513,8 @@ impl Config {
             rotate_period: self.bg_rotate_period,
             waves: self.bg_waves,
             wave_speed: self.bg_wave_speed,
+            drops: self.bg_drops,
+            seed: self.seed.unwrap_or(0),
         }
     }
 
@@ -515,8 +541,12 @@ impl Config {
         LegendParams { size: self.legend_size, opacity: self.legend_opacity, pos: self.legend_pos }
     }
 
-    /// Resolve `show`, `solids` and `rings` into slots. Errors are meant for the user.
+    /// Resolve `show`, `solids` and `rings` (or `bindings`) into slots.
+    /// Errors are meant for the user.
     pub fn resolve_slots(&self) -> Result<Vec<SlotSpec>, String> {
+        if !self.bindings.is_empty() {
+            return self.resolve_bindings();
+        }
         let mut specs: Vec<MetricSpec> = Vec::new();
         for s in &self.show {
             let spec = MetricSpec::parse(s)?;
@@ -556,9 +586,51 @@ impl Config {
             .map(|m| SlotSpec {
                 solid: lookup(&solids, &m).copied().unwrap_or(m.kind.default_solid()),
                 ring: lookup(&rings, &m).copied(),
+                inputs: Binding::of(m.clone()).inputs,
                 metric: m,
             })
             .collect())
+    }
+
+    /// Slots from `bindings`. An automatic shape is the primary metric's
+    /// own solid (or, with `solids` naming one for it, that), else the
+    /// first not yet taken; one driven by complexity starts at the simplest.
+    fn resolve_bindings(&self) -> Result<Vec<SlotSpec>, String> {
+        if self.bindings.len() > MAX_SOLIDS {
+            return Err(format!("at most {MAX_SOLIDS} solids can be bound (got {})", self.bindings.len()));
+        }
+        let bound: Vec<Binding> = self
+            .bindings
+            .iter()
+            .enumerate()
+            .map(|(i, b)| Binding::parse(b).map_err(|e| format!("binding {}: {e}", i + 1)))
+            .collect::<Result<_, _>>()?;
+        let mut used: Vec<SolidKind> = bound.iter().filter_map(|b| b.solid).collect();
+        let mut slots = Vec::new();
+        for b in bound {
+            let metric = b.primary().cloned().expect("a parsed binding has an input");
+            let solid = match b.solid {
+                Some(k) => k,
+                None if b.inputs[3].metric.is_some() => SolidKind::Tetrahedron,
+                None => {
+                    let wanted = self
+                        .solids
+                        .get(&metric.key())
+                        .or_else(|| self.solids.get(metric.kind.id()))
+                        .and_then(|id| SolidKind::from_id(id))
+                        .unwrap_or(metric.kind.default_solid());
+                    let k = if used.contains(&wanted) {
+                        SolidKind::ALL.into_iter().find(|k| !used.contains(k)).unwrap_or(wanted)
+                    } else {
+                        wanted
+                    };
+                    used.push(k);
+                    k
+                }
+            };
+            slots.push(SlotSpec { metric, solid, ring: None, inputs: b.inputs });
+        }
+        Ok(slots)
     }
 }
 

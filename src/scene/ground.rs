@@ -42,10 +42,22 @@ pub enum Pattern {
     /// into bands; a quasiperiodic (never repeating) tiling that flows as the
     /// waves' phase advances.
     Quasicrystal,
+    /// Raindrops: drops landing at random, each sending out a ring of
+    /// ripples that spreads, fades and overlaps the others.
+    Rain,
+    /// Ocean: a sum of wind-driven waves, long ones faster and taller
+    /// (deep-water dispersion), with sharpened crests.
+    Ocean,
+    /// Julia set (fractal) whose constant drifts round a circle.
+    Julia,
+    /// Sierpinski carpet (fractal): squares cut out at five scales.
+    Carpet,
+    /// Clouds (fractal noise): five octaves of value noise, drifting.
+    Clouds,
 }
 
 impl Pattern {
-    pub const ALL: [Pattern; 8] = [
+    pub const ALL: [Pattern; 13] = [
         Pattern::Solid,
         Pattern::Checker,
         Pattern::Diamond,
@@ -54,7 +66,17 @@ impl Pattern {
         Pattern::Hex,
         Pattern::Radial,
         Pattern::Quasicrystal,
+        Pattern::Rain,
+        Pattern::Ocean,
+        Pattern::Julia,
+        Pattern::Carpet,
+        Pattern::Clouds,
     ];
+
+    /// Moves by itself (its speed is the flow, `wave_speed`).
+    pub fn animated(self) -> bool {
+        matches!(self, Pattern::Quasicrystal | Pattern::Rain | Pattern::Ocean | Pattern::Julia | Pattern::Clouds)
+    }
 
     pub fn id(self) -> &'static str {
         match self {
@@ -66,6 +88,11 @@ impl Pattern {
             Pattern::Hex => "hex",
             Pattern::Radial => "radial",
             Pattern::Quasicrystal => "quasicrystal",
+            Pattern::Rain => "rain",
+            Pattern::Ocean => "ocean",
+            Pattern::Julia => "julia",
+            Pattern::Carpet => "carpet",
+            Pattern::Clouds => "clouds",
         }
     }
 
@@ -79,6 +106,11 @@ impl Pattern {
             Pattern::Hex => "hexagonal tiles, three tones",
             Pattern::Radial => "polar checkerboard: rings x 12 sectors around the focal point",
             Pattern::Quasicrystal => "quasicrystal: interfering plane waves, animated (--bg-waves, --bg-wave-speed)",
+            Pattern::Rain => "raindrops: random drops sending out spreading rings of ripples (--bg-drops, --bg-wave-speed)",
+            Pattern::Ocean => "ocean: wind-driven waves, long ones faster, sharpened crests (--bg-wave-speed)",
+            Pattern::Julia => "Julia set fractal, its constant drifting round a circle (--bg-wave-speed)",
+            Pattern::Carpet => "Sierpinski carpet fractal: squares cut out at five scales",
+            Pattern::Clouds => "fractal noise: five octaves of value noise, drifting (--bg-wave-speed)",
         }
     }
 }
@@ -145,8 +177,14 @@ pub struct GroundParams {
     /// Quasicrystal: number of plane waves (the pattern's rotational
     /// symmetry; 5 or 7 look classic), [`WAVES_MIN`]..=[`WAVES_MAX`].
     pub waves: u32,
-    /// Quasicrystal: phase speed, radians per second (0 = still).
+    /// Flow of the animated patterns: the quasicrystal's phase speed,
+    /// radians per second (0 = still); the others move in proportion to it
+    /// ([`WAVE_SPEED_DEFAULT`] = their natural pace).
     pub wave_speed: f32,
+    /// Raindrops: drops rippling at once, [`DROPS_MIN`]..=[`DROPS_MAX`].
+    pub drops: u32,
+    /// Seeds the raindrops' places and the ocean's waves.
+    pub seed: u64,
 }
 
 /// Quasicrystal wave count range and defaults.
@@ -154,6 +192,38 @@ pub const WAVES_MIN: u32 = 3;
 pub const WAVES_MAX: u32 = 24;
 pub const WAVES_DEFAULT: u32 = 7;
 pub const WAVE_SPEED_DEFAULT: f32 = 0.6;
+/// Raindrops rippling at once.
+pub const DROPS_MIN: u32 = 1;
+pub const DROPS_MAX: u32 = 48;
+pub const DROPS_DEFAULT: u32 = 12;
+
+/// Raindrops land in a square this many tiles across, repeated over the
+/// floor; rings spread at `RAIN_SPEED` tiles a second with ripples
+/// `RAIN_WAVELENGTH` apart and last `RAIN_LIFE` seconds (at the natural pace).
+const RAIN_CELL: f32 = 12.0;
+const RAIN_SPEED: f32 = 1.4;
+const RAIN_WAVELENGTH: f32 = 0.9;
+const RAIN_LIFE: f32 = 4.5;
+/// How many wavelengths deep a ring of ripples is.
+const RAIN_TRAIN: f32 = 3.0;
+/// Ocean: wave components, the longest wavelength (tiles) and the ratio
+/// between neighbouring ones, gravity in tile units, and the wind's spread.
+const OCEAN_WAVES: usize = 12;
+const OCEAN_LONGEST: f32 = 4.0;
+const OCEAN_RATIO: f32 = 0.76;
+const OCEAN_G: f32 = 1.6;
+const OCEAN_SPREAD: f32 = 1.1;
+/// Julia set: tiles per unit of the complex plane, iterations, and the
+/// constant's circle (radius, turns per second at the natural pace).
+const JULIA_SCALE: f32 = 4.0;
+const JULIA_ITER: u32 = 28;
+const JULIA_RADIUS: f32 = 0.7885;
+const JULIA_TURN: f32 = 0.006;
+/// Sierpinski carpet: holes at this many scales, the smallest a third of a tile.
+const CARPET_LEVELS: u32 = 5;
+/// Clouds: octaves, and the drift in tiles per second at the natural pace.
+const CLOUD_OCTAVES: u32 = 5;
+const CLOUD_DRIFT: f32 = 0.25;
 
 impl Default for GroundParams {
     fn default() -> Self {
@@ -169,8 +239,29 @@ impl Default for GroundParams {
             rotate_period: 60.0,
             waves: WAVES_DEFAULT,
             wave_speed: WAVE_SPEED_DEFAULT,
+            drops: DROPS_DEFAULT,
+            seed: 0,
         }
     }
+}
+
+/// One raindrop: where it landed (tile units, inside the rain cell), how
+/// long ago, and how long its rings last.
+#[derive(Debug, Clone, Copy)]
+struct Drop {
+    pos: Vec2,
+    age: f32,
+    life: f32,
+}
+
+/// One ocean wave: direction × wavenumber (cycles per tile), height, its
+/// angular frequency (turns per second) and starting phase (turns).
+#[derive(Debug, Clone, Copy, Default)]
+struct OceanWave {
+    k: Vec2,
+    amp: f32,
+    omega: f32,
+    phase: f32,
 }
 
 /// Rotate (x, z) about the y axis, same convention as the camera orbit:
@@ -211,6 +302,20 @@ pub struct Ground {
     n_waves: usize,
     wave_speed: f32,
     frame_phase: f32,
+    /// Animated patterns other than the quasicrystal: seconds of their own
+    /// time (the flow relative to its natural pace).
+    flow_time: f32,
+    /// Raindrops, and per frame each one's (place, ring radius, strength).
+    drops: Vec<Drop>,
+    rain_rng: fastrand::Rng,
+    frame_drops: Vec<(Vec2, f32, f32)>,
+    /// Ocean waves, and per frame each one's phase (turns).
+    ocean: [OceanWave; OCEAN_WAVES],
+    ocean_sum: f32,
+    frame_ocean: [f32; OCEAN_WAVES],
+    /// This frame's Julia constant and cloud drift.
+    frame_julia: Vec2,
+    frame_drift: Vec2,
 }
 
 impl Ground {
@@ -241,16 +346,78 @@ impl Ground {
             n_waves: 0,
             wave_speed: if p.wave_speed.is_finite() { p.wave_speed } else { WAVE_SPEED_DEFAULT },
             frame_phase: 0.0,
+            flow_time: 0.0,
+            drops: Vec::new(),
+            rain_rng: fastrand::Rng::with_seed(p.seed ^ 0x7261_696e),
+            frame_drops: Vec::new(),
+            ocean: [OceanWave::default(); OCEAN_WAVES],
+            ocean_sum: 1.0,
+            frame_ocean: [0.0; OCEAN_WAVES],
+            frame_julia: Vec2::ZERO,
+            frame_drift: Vec2::ZERO,
         };
         g.n_waves = wave_dirs(p.waves, &mut g.wave_dirs);
+        // raindrops at every stage of their lives, so it starts mid-shower
+        let n = p.drops.clamp(DROPS_MIN, DROPS_MAX) as usize;
+        for k in 0..n {
+            let mut d = g.new_drop();
+            d.age = d.life * (k as f32 + g.rain_rng.f32()) / n as f32;
+            g.drops.push(d);
+        }
+        // the ocean: wavelengths from the longest down by a fixed ratio,
+        // round a seeded wind, taller the longer (an ocean-like spectrum)
+        let mut rng = fastrand::Rng::with_seed(p.seed ^ 0x006f_6365_616e);
+        let wind = rng.f32() * TAU;
+        let mut sum = 0.0;
+        for (i, w) in g.ocean.iter_mut().enumerate() {
+            let lambda = OCEAN_LONGEST * OCEAN_RATIO.powi(i as i32);
+            let dir = wind + OCEAN_SPREAD * (rng.f32() - 0.5) * (1.0 + i as f32 / OCEAN_WAVES as f32);
+            let k = 1.0 / lambda;
+            *w = OceanWave {
+                k: Vec2::new(dir.cos(), dir.sin()) * k,
+                amp: lambda.powf(0.8),
+                // deep water: ω = √(g·2πk), here in turns per second
+                omega: (OCEAN_G * TAU * k).sqrt() / TAU,
+                phase: rng.f32(),
+            };
+            sum += w.amp;
+        }
+        g.ocean_sum = sum.max(1e-3);
         g.refresh_frame();
         g
+    }
+
+    fn new_drop(&mut self) -> Drop {
+        let r = &mut self.rain_rng;
+        Drop { pos: Vec2::new(r.f32(), r.f32()) * RAIN_CELL, age: 0.0, life: RAIN_LIFE * (0.7 + 0.6 * r.f32()) }
     }
 
     fn refresh_frame(&mut self) {
         (self.frame_sin, self.frame_cos) = (-self.angle).sin_cos();
         self.frame_offset = self.offset();
         self.frame_phase = (self.wave_speed * self.time).rem_euclid(TAU);
+        let t = self.flow_time;
+        match self.pattern {
+            Pattern::Rain => {
+                self.frame_drops.clear();
+                self.frame_drops.extend(self.drops.iter().map(|d| {
+                    // strong when fresh, gone by the end of its life
+                    let left = (1.0 - d.age / d.life).clamp(0.0, 1.0);
+                    (d.pos, RAIN_SPEED * d.age, left * left)
+                }));
+            }
+            Pattern::Ocean => {
+                for (p, w) in self.frame_ocean.iter_mut().zip(&self.ocean) {
+                    *p = (w.phase - w.omega * t).rem_euclid(1.0);
+                }
+            }
+            Pattern::Julia => {
+                let a = TAU * JULIA_TURN * t;
+                self.frame_julia = Vec2::new(a.cos(), a.sin()) * JULIA_RADIUS;
+            }
+            Pattern::Clouds => self.frame_drift = Vec2::new(0.8, 0.6) * CLOUD_DRIFT * t,
+            _ => {}
+        }
     }
 
     pub fn mean_albedo(&self) -> f32 {
@@ -266,6 +433,18 @@ impl Ground {
         self.time += dt;
         self.travelled += self.scroll * dt;
         self.angle = (self.angle + self.rot_rate * dt).rem_euclid(TAU);
+        // the animated patterns' own time runs at the flow's pace
+        let pace = self.wave_speed / WAVE_SPEED_DEFAULT;
+        self.flow_time += dt * pace;
+        if self.pattern == Pattern::Rain {
+            let step = dt * pace.abs();
+            for k in 0..self.drops.len() {
+                self.drops[k].age += step;
+                if self.drops[k].age >= self.drops[k].life {
+                    self.drops[k] = self.new_drop();
+                }
+            }
+        }
         self.refresh_frame();
     }
 
@@ -296,14 +475,127 @@ impl Ground {
         if fade <= 0.0 {
             return self.base;
         }
-        let uv = self.pattern_coords(p.x, p.z);
-        let k = if self.pattern == Pattern::Quasicrystal {
-            quasicrystal(uv, &self.wave_dirs[..self.n_waves], self.frame_phase)
-        } else {
-            tone(self.pattern, uv)
-        };
+        let k = self.tone_at(self.pattern_coords(p.x, p.z));
         (self.base * (1.0 + self.contrast * fade * k)).clamp(0.0, 0.95)
     }
+
+    /// The pattern's tone in −1..=1 at `uv` (tile units) this frame.
+    #[inline]
+    pub fn tone_at(&self, uv: Vec2) -> f32 {
+        match self.pattern {
+            Pattern::Quasicrystal => quasicrystal(uv, &self.wave_dirs[..self.n_waves], self.frame_phase),
+            Pattern::Rain => rain(uv, &self.frame_drops),
+            Pattern::Ocean => ocean(uv, &self.ocean, &self.frame_ocean, self.ocean_sum),
+            Pattern::Julia => julia(uv, self.frame_julia),
+            Pattern::Clouds => clouds(uv + self.frame_drift),
+            p => tone(p, uv),
+        }
+    }
+}
+
+/// Raindrop ripples in −1..=1: each drop's ring (`drops`: place, radius,
+/// strength) is a short train of ripples behind its front, weaker the
+/// further it has spread; the drops repeat every [`RAIN_CELL`] tiles.
+#[inline]
+fn rain(uv: Vec2, drops: &[(Vec2, f32, f32)]) -> f32 {
+    let mut h = 0.0;
+    for &(pos, radius, strength) in drops {
+        let mut d = uv - pos;
+        // nearest copy of the drop
+        d -= (d / RAIN_CELL).round() * RAIN_CELL;
+        let r = d.length();
+        // how far behind the front this point is, in wavelengths
+        let behind = (radius - r) / RAIN_WAVELENGTH;
+        if !(-0.25..RAIN_TRAIN).contains(&behind) {
+            continue;
+        }
+        let lead = (behind * 4.0 + 1.0).clamp(0.0, 1.0);
+        let tail = 1.0 - behind / RAIN_TRAIN;
+        h += strength * lead * tail * cos_turns(behind) / (1.0 + 0.15 * r);
+    }
+    (2.5 * h).clamp(-1.0, 1.0)
+}
+
+/// The ocean's height in −1..=1: the waves summed (`phase`: each one's this
+/// frame), the crests sharpened as on real water.
+#[inline]
+fn ocean(uv: Vec2, waves: &[OceanWave; OCEAN_WAVES], phase: &[f32; OCEAN_WAVES], sum: f32) -> f32 {
+    let mut h = 0.0;
+    for (w, p) in waves.iter().zip(phase) {
+        h += w.amp * cos_turns(uv.dot(w.k) + p);
+    }
+    let h = 2.2 * h / sum;
+    // peaked crests, flat troughs
+    let s = if h > 0.0 { h + 0.6 * h * h } else { 0.7 * h };
+    s.clamp(-1.0, 1.0)
+}
+
+/// The Julia set of `c` in −1..=1: inside dark, outside in bands by how
+/// fast points escape (smoothed), the set [`JULIA_SCALE`] tiles per unit.
+#[inline]
+fn julia(uv: Vec2, c: Vec2) -> f32 {
+    let (mut x, mut y) = (uv.x / JULIA_SCALE, uv.y / JULIA_SCALE);
+    for n in 0..JULIA_ITER {
+        let (xx, yy) = (x * x, y * y);
+        if xx + yy > 16.0 {
+            // smooth escape count
+            let nu = n as f32 + 1.0 - ((xx + yy).ln() * 0.5).ln() / std::f32::consts::LN_2;
+            return cos_turns(nu / 6.0);
+        }
+        (x, y) = (xx - yy + c.x, 2.0 * x * y + c.y);
+    }
+    -1.0
+}
+
+/// Sierpinski carpet: −1 in a square cut out at any of [`CARPET_LEVELS`]
+/// scales (the smallest a third of a tile), else 1.
+#[inline]
+fn carpet(uv: Vec2) -> f32 {
+    let (mut u, mut v) = ((uv.x * 3.0).floor() as i64, (uv.y * 3.0).floor() as i64);
+    for _ in 0..CARPET_LEVELS {
+        if u.rem_euclid(3) == 1 && v.rem_euclid(3) == 1 {
+            return -1.0;
+        }
+        (u, v) = (u.div_euclid(3), v.div_euclid(3));
+    }
+    1.0
+}
+
+/// A lattice point's random value in 0..=1.
+#[inline(always)]
+fn hash2(x: i32, y: i32) -> f32 {
+    let mut h = (x as u32).wrapping_mul(0x8da6_b343) ^ (y as u32).wrapping_mul(0xd816_3841);
+    h ^= h >> 13;
+    h = h.wrapping_mul(0x5bd1_e995);
+    h ^= h >> 15;
+    (h & 0xffff) as f32 / 65535.0
+}
+
+/// Smoothly interpolated value noise in 0..=1.
+#[inline]
+fn value_noise(p: Vec2) -> f32 {
+    let (fx, fy) = (p.x.floor(), p.y.floor());
+    let (ix, iy) = (fx as i32, fy as i32);
+    let (tx, ty) = (p.x - fx, p.y - fy);
+    let (sx, sy) = (tx * tx * (3.0 - 2.0 * tx), ty * ty * (3.0 - 2.0 * ty));
+    let a = hash2(ix, iy) + (hash2(ix + 1, iy) - hash2(ix, iy)) * sx;
+    let b = hash2(ix, iy + 1) + (hash2(ix + 1, iy + 1) - hash2(ix, iy + 1)) * sx;
+    a + (b - a) * sy
+}
+
+/// Fractal (Brownian) noise in −1..=1: [`CLOUD_OCTAVES`] octaves, each
+/// twice as fine and half as strong, the coarsest 3 tiles across.
+#[inline]
+fn clouds(uv: Vec2) -> f32 {
+    let (mut p, mut amp, mut sum, mut norm) = (uv / 3.0, 1.0, 0.0, 0.0);
+    for o in 0..CLOUD_OCTAVES {
+        sum += amp * value_noise(p + Vec2::splat(o as f32 * 17.3));
+        norm += amp;
+        // turn each octave a little so the lattice doesn't show
+        p = Vec2::new(p.x * 1.6 - p.y * 1.2, p.x * 1.2 + p.y * 1.6);
+        amp *= 0.5;
+    }
+    ((sum / norm - 0.5) * 3.2).clamp(-1.0, 1.0)
 }
 
 /// Fill `out` with the unit directions of `n` plane waves at angles
@@ -400,6 +692,11 @@ pub fn tone(pattern: Pattern, uv: Vec2) -> f32 {
             let mut dirs = [Vec2::ZERO; WAVES_MAX as usize];
             let n = wave_dirs(WAVES_DEFAULT, &mut dirs);
             quasicrystal(uv, &dirs[..n], 0.0)
+        }
+        Pattern::Carpet => carpet(uv),
+        // the moving patterns as they start, with the default settings
+        Pattern::Rain | Pattern::Ocean | Pattern::Julia | Pattern::Clouds => {
+            Ground::new(&GroundParams { pattern, ..GroundParams::default() }, Vec2::ZERO).tone_at(uv)
         }
     }
 }
@@ -530,6 +827,43 @@ mod tests {
         s.advance(5.0);
         assert_eq!(s.albedo(pt, 1.0), s0, "speed 0 holds still");
         assert_eq!("Quasicrystal".parse::<Pattern>().unwrap(), Pattern::Quasicrystal);
+    }
+
+    #[test]
+    fn new_patterns_are_bounded_move_with_the_flow_and_hold_at_zero() {
+        let pts: Vec<Vec2> = (0..900).map(|i| Vec2::new((i % 30) as f32 * 0.43 - 6.0, (i / 30) as f32 * 0.39 - 5.5)).collect();
+        for p in [Pattern::Rain, Pattern::Ocean, Pattern::Julia, Pattern::Clouds, Pattern::Carpet] {
+            let params = GroundParams { pattern: p, contrast: 1.0, ..Default::default() };
+            let mut g = ground(params);
+            let before: Vec<f32> = pts.iter().map(|&uv| g.tone_at(uv)).collect();
+            assert!(before.iter().all(|v| (-1.0..=1.0).contains(v)), "{p:?} bounded");
+            let spread = before.iter().copied().fold(f32::MIN, f32::max) - before.iter().copied().fold(f32::MAX, f32::min);
+            assert!(spread > 1.0, "{p:?}: tones vary ({spread})");
+            g.advance(2.0);
+            let moved = pts.iter().zip(&before).filter(|(uv, b)| (g.tone_at(**uv) - **b).abs() > 1e-3).count();
+            assert_eq!(moved > 0, p.animated(), "{p:?} moves only when animated ({moved})");
+            let mut still = ground(GroundParams { wave_speed: 0.0, ..params });
+            let s0: Vec<f32> = pts.iter().map(|&uv| still.tone_at(uv)).collect();
+            still.advance(3.0);
+            assert!(pts.iter().zip(&s0).all(|(uv, s)| still.tone_at(*uv) == *s), "{p:?}: flow 0 holds still");
+        }
+        // raindrops keep landing: after many lifetimes every drop has been
+        // replaced, and the count follows the setting
+        let mut r = ground(GroundParams { pattern: Pattern::Rain, drops: 5, ..Default::default() });
+        let first: Vec<Vec2> = r.drops.iter().map(|d| d.pos).collect();
+        assert_eq!(first.len(), 5);
+        for _ in 0..200 {
+            r.advance(0.25);
+        }
+        assert!(r.drops.iter().zip(&first).all(|(d, f)| d.pos != *f), "every drop replaced");
+        assert!(r.drops.iter().all(|d| d.age < d.life && (0.0..=RAIN_CELL).contains(&d.pos.x)));
+        // the carpet: the centre of each scale's middle square is cut out
+        assert_eq!(carpet(Vec2::new(0.5, 0.5)), -1.0, "smallest hole: a third of a tile");
+        assert_eq!(carpet(Vec2::new(0.1, 0.1)), 1.0);
+        assert_eq!(carpet(Vec2::new(4.5, 4.5)), -1.0, "the 3x larger hole");
+        // the Julia set: the origin's orbit stays bounded for a small constant
+        assert_eq!(julia(Vec2::ZERO, Vec2::new(-0.1, 0.1)), -1.0);
+        assert!(julia(Vec2::splat(40.0), Vec2::ZERO) > -1.0, "far points escape");
     }
 
     #[test]

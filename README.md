@@ -26,6 +26,8 @@ platomon [OPTIONS]
 | `--show` | `METRIC[,METRIC…]`, max 16 | `cpu,ram,disk,net,gpu` |
 | `--solid` | `METRIC=SOLID`, repeatable | built-in mapping |
 | `--ring` | `METRIC=N`, repeatable (0 = innermost ring or shell) | automatic |
+| `--bind` | `SHAPE\|SIZE\|SPIN\|COLOUR\|COMPLEXITY`, repeatable, max 12: one solid with its own inputs, replacing `--show` (see *Per-solid inputs*) | off |
+| `--delta-period` | seconds a `delta:` input measures the change over, 1–600 | `10` |
 | `--layout` | `rings` (on the ground), `sphere` (concentric spherical shells), `line` (one evenly spaced row), `stack` (one above another in the centre) or `orbit` (one solid in the centre, the others orbiting it) | `rings` |
 | `--ordering` | which solid takes which place: `listed` (metric order), `simple` (simplest first), `complex` (most complex first) or `random` | `listed` |
 | `--spacing` | neighbour spacing as a multiple of the standard, 0.25–4 (orbits: 10% × this of their radius apart) | `1` |
@@ -61,7 +63,7 @@ platomon [OPTIONS]
 | `--seed` | `U64`, makes `random` repeatable | random |
 | **Background** | | |
 | `--bg-lum` | `0..10`: 5 = original, **0 = no background surface** | 5 |
-| `--bg-pattern` | `solid\|checker\|diamond\|brick\|triangles\|hex\|radial\|quasicrystal` | `solid` |
+| `--bg-pattern` | `solid\|checker\|diamond\|brick\|triangles\|hex\|radial\|quasicrystal\|rain\|ocean\|julia\|carpet\|clouds` | `solid` |
 | `--bg-contrast` | `0..1`, tile tone spread around `--bg-lum` | 0.5 |
 | `--bg-scale` | tile size, world units (a full-size solid is 2 across) | 1.0 |
 | `--bg-scroll` | `DX:DZ` world units/s, e.g. `0.5:0` or `-0.2:0.3` | `0:0` |
@@ -70,7 +72,8 @@ platomon [OPTIONS]
 | `--bg-rotate` | `off\|cw\|ccw`, about the camera's focal point (seen from above) | `off` |
 | `--bg-rotate-period` | seconds per revolution | 60 |
 | `--bg-waves` | quasicrystal: plane waves, 3..24 (its rotational symmetry) | 7 |
-| `--bg-wave-speed` | quasicrystal: wave phase speed, radians/s (0 = still, negative = reverse) | 0.6 |
+| `--bg-wave-speed` | flow of the moving patterns: the quasicrystal's wave phase speed, radians/s (0 = still, negative = reverse); rain, ocean, julia and clouds move in proportion (0.6 = their natural pace) | 0.6 |
+| `--bg-drops` | rain: raindrops rippling at once, 1..48 | 12 |
 | **Overlays** | | |
 | `--legend` | flag: corner panel with a wireframe of each solid and its metric | off |
 | `--legend-size` | `1..5` font size: 1–2 terminal text, 3–5 block letters (1–3 cells per font pixel); icons grow with it | 2 |
@@ -276,6 +279,11 @@ each other. With `--bg-pattern solid` (the default) motion has nothing visible t
 | `hex` | hexagonal tiles, three tones |
 | `radial` | rings × 12 sectors around the focal point |
 | `quasicrystal` | `--bg-waves` plane waves at evenly spaced angles, summed and folded into bands: a never-repeating, many-fold symmetric tiling that flows (`--bg-wave-speed`) |
+| `rain` | a raindrop simulation: `--bg-drops` drops land at random places, each sending out a ring of ripples (a short wave train behind a front spreading at about 1.4 tiles/s, ripples 0.9 tiles apart) that weakens as it spreads and fades over its 3–6 s life, when a new drop lands somewhere else; overlapping rings add up |
+| `ocean` | an approximate ocean surface: 12 waves round a random wind direction, wavelengths from 4 tiles down by a factor 0.76, taller the longer, each moving at its deep-water speed (√(g/k): long swells overtake short chop), with sharpened crests and flat troughs |
+| `julia` | the Julia set fractal (4 tiles per unit), in bands by how fast points escape, its constant drifting slowly round a circle of radius 0.7885 so the set keeps changing shape |
+| `carpet` | the Sierpinski carpet fractal: squares cut out at five scales, the smallest a third of a tile |
+| `clouds` | fractal (Brownian) noise: five octaves of value noise, each twice as fine and half as strong, drifting |
 
 ### Legend and wireframe
 
@@ -311,6 +319,32 @@ Every metric here works on Linux, macOS and Windows with any GPU vendor. Metrics
 systems or vendors can't provide were left out: temperatures, CPU frequency (Windows reports a fixed
 base clock), and GPU clocks/PCIe throughput (NVIDIA only). When a metric is unavailable on a
 particular machine, its solid sits at minimum scale with idle spin and the stats bar shows `n/a`.
+
+### Per-solid inputs
+
+Normally each solid's metric drives its size, spin and colour. With `--bind` (or `bindings = [...]`
+in the config file, or the screensaver's *Metrics* dialog) each solid gets its own inputs instead,
+written `SHAPE|SIZE|SPIN|COLOUR|COMPLEXITY`:
+
+- `SHAPE`: a solid id, or `auto` (the metric's own solid while it is free, else the first free one).
+- Each input: a metric (`cpu`, `nic:Ethernet`, ...), `delta:METRIC`, or `off`. Missing spin and
+  colour inputs follow size, and a missing complexity input is off.
+- **Size** sets the solid's size (off: always the smallest). **Spin** sets its spin (off: idle
+  spin). **Colour** sets its colour when colouring by load (off: the gradient's start).
+- **Complexity** changes the solid's shape: at rest it is `SHAPE` (the tetrahedron for `auto`), and
+  more load steps it up through solids with more edges, to the most complex at full load. It only
+  steps once the input is well past the middle between two shapes, so it does not flicker.
+- **`delta:`** uses how much the metric changed over the delta period (`--delta-period`, 10 s by
+  default) instead of its value: the difference from the value that long ago, scaled to the largest
+  change lately (which fades by 2% a second, never below 5% of the range). A steady load reads as 0,
+  and a rise or fall as up to 1.
+
+Several solids can share a metric, and a metric is read once however many solids use it. The tag,
+the orbit centre and the activity weight follow a solid's size input (else its first input).
+
+```powershell
+platomon --bind "auto|cpu" --bind "cube|ram|delta:ram|ram" --bind "auto|delta:net|net|delta:net|cpu" --delta-period 30
+```
 
 ### Solids
 
@@ -391,6 +425,9 @@ platomon --bg-pattern hex --bg-scale 1.2 --bg-scroll 0.3:0.3           # three-t
 platomon --bg-pattern brick --bg-sway 0.6 --bg-sway-period 6           # floor swaying in a slow circle
 platomon --bg-pattern quasicrystal --bg-lum 7 --bg-contrast 1 --bg-scale 3   # flowing 7-fold quasicrystal floor
 platomon --bg-pattern quasicrystal --bg-waves 5 --bg-wave-speed 0 --bg-rotate ccw  # still Penrose-like 5-fold floor, turning
+platomon --bg-pattern rain --bg-lum 7 --bg-contrast 1 --bg-drops 20        # a shower of ripples
+platomon --bg-pattern ocean --bg-lum 6 --bg-contrast 0.9 --bg-scale 2      # rolling swell
+platomon --bg-pattern julia --bg-lum 7 --bg-contrast 1 --bg-wave-speed 2   # a Julia set changing shape quickly
 platomon --bg-pattern triangles --bg-scale 0.6 --bg-contrast 1 --bg-scroll -0.5:0
 platomon --bg-pattern radial --bg-rotate ccw --bg-rotate-period 20 --camera orbit --orbit-dir cw   # floor and camera turn against each other
 platomon --bg-pattern diamond --bg-rotate cw --bg-rotate-period 30 --bg-scroll 0.4:0 --bg-sway 0.5 # rotate, scroll and sway at once
@@ -529,8 +566,7 @@ later in Windows Security › Virus & threat protection › Exclusions).
 Each run:
 
 - reads the primary display's resolution and refresh rate, and caps the frame rate at the refresh rate;
-- picks a random look: metrics (the five main ones, plus `nic`/`disk-dev` at random), solids,
-  rings or sphere, static/orbit/focus/tilt/resonance camera, background luminosity, pattern and motion, colour
+- picks a random look: solids (shuffled shapes for the *Metrics* dialog's Auto rows), layout, static/orbit/focus/tilt/resonance camera, background luminosity, pattern and motion, colour
   gradient, wireframe and inverted fps (the corner legend is never shown);
 - keeps rendering cheap: 1 sample per pixel, 1 bounce, adaptive quality on. A short render test
   measures this machine's speed for the chosen scene, and the text size (Consolas) is chosen so
@@ -550,10 +586,10 @@ as the shift opens on the other side.
 the same dialog, run by a dialog procedure named `ScreenSaverConfigureDialog` as in the Win32
 screensaver interface. **Random start**, the last check box of the *Appearance* group (on by
 default), picks the look anew every run; turn it off to use the look chosen in the group instead:
-layout, camera, colour gradient and source, background colour and pattern, wireframe, stats bar,
-inverted frame rate and extra metrics, plus the background luminosity and quasicrystal sliders in
-*Tuning* (all greyed out while Random start is on). The **Randomize** button beside it rolls
-random values into every *Appearance* setting and every *Tuning* slider now, and turns Random
+layout, camera, colour gradient and source, background colour and pattern, wireframe, stats bar
+and inverted frame rate, plus *Background options*'s background colour, luminosity, quasicrystal waves
+and pattern flow (all greyed out while Random start is on). The **Randomize** button beside it rolls
+random values into every *Appearance* setting, every *Background options* setting and every *Tuning* slider now, and turns Random
 start off so they are kept (saved with OK or *Apply*). The rest of *Appearance* always applies,
 Random start or not (Randomize still rolls it): halo colour, tag colour, *Tag positions*, *Tag size*, sound halo, halo bounce by frequency,
 extended floor distance, *Tags*, *Fixed tag length* and *Random font*. The *Performance & Features* group always applies too: the frame-rate cap (the
@@ -584,11 +620,32 @@ a leading space survives) and in log entries. Their sliders work like *Tuning*'s
 same way (`tune_spacing_exp`, `tune_distance_scale`, `tune_orbit_velocity`, `tune_spp`, ...); `ordering`, `orbit_center` and
 `adaptive` are plain keys.
 
-**Tuning.** *Tuning…* opens a dialog of sliders: background luminosity, quasicrystal waves and
-flow and halo size swing (stepped like the main dialog's sliders, saved as plain keys), then numeric
-values: orbit period and bob,
-focus zoom and glide, floor contrast, tile size, sway and its period, floor turn period, smallest
-and largest solid size, idle and fastest spin, and exposure. Moving a slider sets that value for
+**Metrics.** *Metrics…* (between *Layout…* and *Preview*; it shows how many solids there are)
+replaces the former *Extra metrics* drop-down. Its dialog has a row for each of up to 12 solids:
+a check box to use the row, the *Shape* (Auto or one of the 15 solids), and drop-downs for what
+drives its *Size*, *Spin*, *Colour* and *Complexity*: Off, CPU, RAM, Disk, Network, GPU, Adapter
+(the busiest network adapter) or Disk dev (the busiest disk), plus any named adapter or disk the
+settings already use. The **Δ** box beside each input uses the metric's change over the *Δ period*
+(seconds, 1–600, below the rows) instead of its value; see *Per-solid inputs* above. *Defaults*
+brings back the five standard solids (CPU, RAM, disk, network and GPU, each driving its own size,
+spin and colour). The solids apply every run, Random start or not; an *Auto* shape takes the random
+look's solid for its metric while that is free. They are saved as `solid1`..`solid12`
+(`SHAPE|SIZE|SPIN|COLOUR|COMPLEXITY`, unused ones unset) and `delta_period`; settings from before the
+dialog turn `extras=nic|disk|both` into the five standard solids plus an adapter and/or a disk.
+
+**Background options.** The *Background options…* button, in the *Appearance* group under its
+drop-downs and above its check boxes, opens the background's settings (the pattern itself stays in
+*Appearance*): *Background colour* (moved here from *Appearance*), *Background luminosity*,
+*Quasicrystal waves* and *Pattern flow* (the speed of every moving pattern: quasicrystal, rain,
+ocean, julia and clouds; Still holds them all; these four are part of the look, greyed out while
+Random start is on), then the sliders moved here from *Tuning*: floor contrast, tile size, sway and
+its period and floor turn period, and the new *Raindrops* (how many drops ripple at once in the
+rain pattern, 1–48). The sliders work like *Tuning*'s (`tune_bg_contrast`, ..., `tune_bg_drops`);
+the button shows how many of its settings are set.
+
+**Tuning.** *Tuning…* opens a dialog of sliders: halo size swing (stepped like the main dialog's
+sliders, saved as a plain key), then numeric values: orbit period and bob, focus zoom and glide,
+smallest and largest solid size, idle and fastest spin, and exposure. Moving a slider sets that value for
 every run (random look or not); *×* or *Reset all* returns it to auto (the random look's or the
 default value). Set values are saved as `tune_<name>` keys; the button shows how many are set.
 
@@ -741,12 +798,17 @@ color=inferno          ; off | inferno | viridis | ... (see --list gradients)
 color_by=lum           ; lum | load | spin | sound
 bg_color=auto          ; auto | off | match | a gradient preset (background, by brightness)
 colors=16              ; 16 | 32 | 64 | 128 (palette size; always applies)
-bg_pattern=checker     ; solid | checker | diamond | brick | triangles | hex | radial
-bg_lum=2               ; 0..10
+bg_pattern=checker     ; solid | checker | diamond | brick | triangles | hex | radial | quasicrystal | rain | ocean | julia | carpet | clouds
+bg_lum=2               ; 0..10 (Background options)
+bg_waves=7             ; quasicrystal waves (Background options)
+bg_wave_speed=0.6      ; pattern flow, 0 = still (Background options)
+tune_bg_drops=12       ; rain: raindrops at once (Background options, only when set)
 wireframe=off          ; on | off
 stats=off              ; on | off
 fps_invert=off         ; on | off
-extras=none            ; none | nic | disk | both
+solid1=auto|cpu|cpu|cpu|off ; Metrics dialog: SHAPE|SIZE|SPIN|COLOUR|COMPLEXITY, up to solid12
+solid2=cube|ram|delta:ram|ram|off ; delta:METRIC = its change over delta_period
+delta_period=10        ; seconds, 1..600
 fps_cap=display        ; or 30..240
 budget=15              ; percent
 overdrive=off          ; on = ignore the budget and use all the CPU time rendering wants

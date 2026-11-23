@@ -672,6 +672,14 @@ impl Scene {
         };
     }
 
+    /// Give solid `i` another shape (a solid driven by complexity); its
+    /// place, size and spin carry on.
+    pub fn set_kind(&mut self, i: usize, kind: SolidKind) {
+        if let Some(s) = self.solids.get_mut(i).filter(|s| s.poly.kind() != kind) {
+            s.poly = Polyhedron::new(kind);
+        }
+    }
+
     /// Rings: the height every solid's centre floats at.
     pub fn float_y(&self) -> f32 {
         self.max_radius * HALO_REACH_MAX + FLOAT_GAP

@@ -5,6 +5,11 @@ show = [
     "net",
     "gpu",
 ]
+# Per-solid inputs instead of `show` (max 12): "SHAPE|SIZE|SPIN|COLOUR|COMPLEXITY",
+# each input a metric, "delta:METRIC" (its change over delta_period seconds) or "off".
+# bindings = ["auto|cpu", "cube|ram|delta:ram|ram|off", "auto|delta:net|net|net|cpu"]
+bindings = []
+delta_period = 10.0
 fps_min = 5.0
 fps_max = 150.0
 fps_curve = "sqrt"
@@ -51,7 +56,8 @@ bg_sway_period = 10.0
 bg_rotate = "off"
 bg_rotate_period = 60.0
 bg_waves = 7              # quasicrystal: plane waves, 3..24
-bg_wave_speed = 0.6       # quasicrystal: radians/s, 0 = still
+bg_wave_speed = 0.6       # flow of the animated patterns (quasicrystal, radians/s, 0 = still; rain, ocean, julia, clouds in proportion)
+bg_drops = 12             # rain: raindrops rippling at once, 1..48
 min_scale = 0.45
 max_scale = 1.0
 max_spin = 3.0

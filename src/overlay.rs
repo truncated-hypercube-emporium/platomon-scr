@@ -150,6 +150,7 @@ impl TagFont {
 /// Unit-circumradius edge model of one solid.
 #[derive(Debug, Clone)]
 struct Wire {
+    kind: SolidKind,
     verts: Vec<Vec3A>,
     /// Face normals and offsets.
     faces: Vec<(Vec3A, f32)>,
@@ -159,7 +160,7 @@ struct Wire {
 impl Wire {
     fn new(kind: SolidKind) -> Self {
         let p = crate::scene::sdf::Polyhedron::new(kind);
-        Self { verts: p.vertices(), faces: p.face_planes(), edges: p.edges() }
+        Self { kind, verts: p.vertices(), faces: p.face_planes(), edges: p.edges() }
     }
 }
 
@@ -1815,6 +1816,13 @@ impl Overlays {
         scene: &Scene,
         opt: &OverlayOptions<'_>,
     ) -> Cells<'_> {
+        // (a solid driven by complexity changes its shape)
+        self.wires.resize_with(scene.solids.len(), || Wire::new(SolidKind::Tetrahedron));
+        for (wire, s) in self.wires.iter_mut().zip(&scene.solids) {
+            if wire.kind != s.poly.kind() {
+                *wire = Wire::new(s.poly.kind());
+            }
+        }
         let ramp = opt.ramp;
         ascii::tone_buffer(frame.radiance, opt.exposure, &mut self.lum);
         self.lum.resize(w * h, 0.0);

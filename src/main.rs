@@ -11,6 +11,7 @@ use platomon::clock::{self, FrameClock, SPIN_MARGIN};
 use platomon::color::{self, ColorBy, ColorMap, Gradient};
 use platomon::collector::{Collector, gpu::GpuSampler, system::SystemSampler};
 use platomon::config::{Config, SlotSpec, split_assignment};
+use platomon::drive::Drives;
 use platomon::metrics::{Channel, MetricKind, MetricsState, Reading, activity_score};
 use platomon::overlay::{LegendPos, OverlayOptions, Overlays, TagPlace};
 use platomon::render::{QualityGovernor, RenderSettings, Renderer, TraceSettings};
@@ -84,6 +85,15 @@ struct Cli {
     /// Ring for a metric, 0 = innermost (repeatable).
     #[arg(long, value_name = "METRIC=N")]
     ring: Vec<String>,
+    /// One solid with its own inputs (repeatable, max 12; replaces --show):
+    /// SHAPE|SIZE|SPIN|COLOUR|COMPLEXITY, e.g. "auto|cpu|delta:ram|cpu|off".
+    /// SHAPE is a solid or auto; each input a metric, delta:METRIC (its change
+    /// over --delta-period) or off.
+    #[arg(long, value_name = "SHAPE|SIZE|SPIN|COLOUR|COMPLEXITY")]
+    bind: Vec<String>,
+    /// Seconds a delta input measures the change over (1..600).
+    #[arg(long, value_name = "SECS")]
+    delta_period: Option<f32>,
 
     // ---- rendering
     /// Samples per pixel.
@@ -270,9 +280,13 @@ struct Cli {
     /// Quasicrystal background: number of plane waves, 3..24 (its rotational symmetry; default 7).
     #[arg(long, value_name = "N")]
     bg_waves: Option<u32>,
-    /// Quasicrystal background: wave phase speed in radians/s; 0 = still, negative = reverse (default 0.6).
+    /// Animated backgrounds' flow: the quasicrystal's wave phase speed in radians/s (0 = still,
+    /// negative = reverse; default 0.6); rain, ocean, julia and clouds move in proportion.
     #[arg(long, value_name = "RAD/S", allow_hyphen_values = true)]
     bg_wave_speed: Option<f32>,
+    /// Rain background: raindrops rippling at once, 1..48 (default 12).
+    #[arg(long, value_name = "N")]
+    bg_drops: Option<u32>,
 }
 
 fn fail(msg: impl std::fmt::Display) -> ! {
@@ -285,7 +299,7 @@ fn apply_cli(cfg: &mut Config, cli: &Cli) -> Result<(), String> {
         ($($f:ident),*) => { $( if let Some(v) = cli.$f.clone() { cfg.$f = v; } )* };
     }
     set!(spp, bounces, fps_min, fps_max, ramp, char_aspect, aspect, aspect_mode, camera, orbit_period, orbit_dir, orbit_bob);
-    set!(bg_lum, bg_pattern, bg_contrast, bg_scale, bg_sway, bg_sway_period, bg_rotate, bg_rotate_period, bg_waves, bg_wave_speed);
+    set!(bg_lum, bg_pattern, bg_contrast, bg_scale, bg_sway, bg_sway_period, bg_rotate, bg_rotate_period, bg_waves, bg_wave_speed, bg_drops);
     set!(legend_size, legend_opacity, legend_pos, tag_place);
     set!(color, color_by, bg_color, layout, ordering, spacing, focus_zoom, focus_tau);
     set!(distance_scale, orbit_center, orbit_velocity, orbit_inclination, orbit_eccentricity, orbit_variation);
@@ -356,6 +370,12 @@ fn apply_cli(cfg: &mut Config, cli: &Cli) -> Result<(), String> {
             return Err(format!("--ring {a}: ring must be 0..=15"));
         }
         cfg.rings.insert(k, n);
+    }
+    if !cli.bind.is_empty() {
+        cfg.bindings = cli.bind.iter().map(|s| s.trim().to_string()).collect();
+    }
+    if let Some(p) = cli.delta_period {
+        cfg.delta_period = p;
     }
     if cli.stats {
         cfg.show_stats = true;
@@ -816,12 +836,13 @@ fn run(
     let anim = anim_params(cfg);
     let base = render_settings(cfg, ratio);
     let ramp = Ramp::new(&cfg.ramp);
-    let specs: Vec<_> = slots.iter().map(|s| s.metric.clone()).collect();
+    // each solid's inputs, over the distinct metrics they read
+    let mut drives = Drives::new(&SlotSpec::drives(slots), cfg.delta_period);
 
     let mut scene = build_scene(cfg, slots);
-    let mut metrics = MetricsState::new(cfg, &specs);
+    let mut metrics = MetricsState::new(cfg, drives.sources());
     let mut levels: Vec<f32> = Vec::new();
-    let weights = metrics.weights(&cfg.weights);
+    let weights = drives.weights(&cfg.weights);
     let mut fps = FrameClock::new(cfg.fps_min, cfg.fps_max, cfg.fps_curve, cfg.fps_slew).inverted(cfg.fps_invert);
     let mut renderer = Renderer::new();
     let mut governor = QualityGovernor::default();
@@ -910,10 +931,14 @@ fn run(
             metrics.ingest(&raw);
         }
         metrics.tick(dt);
-        let channels = metrics.channels();
-        fps.update_target(activity_score(&channels, &weights), dt);
-        scene.update(&channels, &anim, dt);
-        scene.color_values(cfg.color_by, &channels, &mut levels);
+        drives.tick(&metrics, dt);
+        let channels = drives.channels();
+        fps.update_target(activity_score(channels, &weights), dt);
+        for (i, k) in drives.shapes().enumerate() {
+            scene.set_kind(i, k);
+        }
+        scene.update(channels, &anim, dt);
+        scene.color_values(cfg.color_by, drives.color_channels(), &mut levels);
 
         let area_h = (rows as usize).saturating_sub(show_stats as usize);
         let vp = aspect::viewport(cols as usize, area_h, ratio, cfg.aspect_mode, cfg.char_aspect);
@@ -921,12 +946,13 @@ fn run(
 
         let t0 = Instant::now();
         renderer.render(&scene, vp.w, vp.h, &settings);
-        let readings = metrics.readings();
         let stats_text = show_stats.then(|| {
             let extra = if governor.level() > 0 { format!(" | q-{}", governor.level()) } else { String::new() };
-            ui::stats_line_fit(&readings, fps.achieved_fps(), fps.target_fps(), &extra, cols as usize)
+            ui::stats_line_fit(&metrics.readings(), fps.achieved_fps(), fps.target_fps(), &extra, cols as usize)
         });
         let stats = stats_text.as_deref().map(|text| StatsLine { text, row: area_h, width: cols as usize });
+        // per solid (every solid has at least one input)
+        let readings: Vec<&Reading> = drives.readings(&metrics).into_iter().flatten().collect();
         if show_legend {
             legend_labels(&readings, legend.size, &mut labels);
         }

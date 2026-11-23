@@ -21,7 +21,10 @@
 use std::cell::RefCell;
 use std::path::PathBuf;
 
-use crate::screensaver::{self, Choice, INI_SECTION, Panel, SHIFT_FRAMES_MAX, ScrSettings, TUNABLES, Tunable, help, short_label};
+use crate::screensaver::{
+    self, Binding, Choice, Drive, INI_SECTION, Input, Panel, SHIFT_FRAMES_MAX, ScrSettings, TUNABLES, Tunable, help, short_label,
+};
+use crate::scene::sdf::SolidKind;
 use crate::scrlog::{self, LogEntry, Prefs};
 
 type HWND = isize;
@@ -372,6 +375,19 @@ const ID_RAMP_PRESET: i32 = 2713; // ..2715: the 8, 16 and 32-level ramps
 /// The ramps the Character ramp dialog can start from: (button, ramp).
 const RAMP_PRESETS: [(&str, &str); 3] =
     [("&8 levels", crate::ascii::RAMP_8), ("1&6 levels", crate::ascii::DEFAULT_RAMP), ("&32 levels", crate::ascii::RAMP_32)];
+/// The Metrics button and dialog: row `k`'s check box and shape, input
+/// `k * 4 + d`'s drop-down and delta box, the delta period, Defaults.
+const ID_METRICS: i32 = 1210;
+/// The Background options button (in the Appearance group).
+const ID_BG_OPTIONS: i32 = 1211;
+const ID_MET_ON: i32 = 2800;
+const ID_MET_SHAPE: i32 = 2820;
+const ID_MET_IN: i32 = 2840;
+const ID_MET_DELTA: i32 = 2900;
+const ID_MET_PERIOD: i32 = 2960;
+const ID_MET_DEFAULTS: i32 = 2961;
+const CBN_SELCHANGE: usize = 1;
+const CB_SETDROPPEDWIDTH: u32 = 0x0160;
 const SS_ENDELLIPSIS: u32 = 0x4000;
 const EM_SETLIMITTEXT: u32 = 0x00C5;
 const EN_CHANGE: usize = 0x0300;
@@ -495,6 +511,8 @@ fn main_tips() -> Vec<(i32, String)> {
         (IDCANCEL, "Close without saving."),
     ];
     v.extend(buttons.iter().map(|&(id, t)| (id, t.to_string())));
+    v.push((ID_METRICS, help("metrics").to_string()));
+    v.push((ID_BG_OPTIONS, help("bg_options").to_string()));
     for k in 0..LOG_ROWS_MAX as i32 {
         v.push((ID_ROW + k, "A logged configuration: click to show its settings and launch arguments below.".into()));
         v.push((
@@ -662,6 +680,7 @@ fn panel_title(p: Panel) -> &'static str {
         Panel::Tuning => "Tuning",
         Panel::Layout => "Layout",
         Panel::Rendering => "Rendering",
+        Panel::Background => "Background options",
     }
 }
 
@@ -671,16 +690,20 @@ fn panel_button(p: Panel) -> (i32, &'static str) {
         Panel::Tuning => (ID_TUNING, "&Tuning..."),
         Panel::Layout => (ID_LAYOUT, "&Layout..."),
         Panel::Rendering => (ID_RENDERING, "&Rendering..."),
+        Panel::Background => (ID_BG_OPTIONS, "&Background options..."),
     }
 }
 
-const PANELS: [Panel; 3] = [Panel::Tuning, Panel::Layout, Panel::Rendering];
+const PANELS: [Panel; 4] = [Panel::Tuning, Panel::Layout, Panel::Rendering, Panel::Background];
 
 /// Every secondary dialog's choice keys (kept in [`Ui::panel_values`]).
 fn panel_keys() -> Vec<&'static str> {
     let mut keys: Vec<&'static str> = screensaver::choices().into_iter().filter(|c| c.panel.is_some()).map(|c| c.key).collect();
     // the Rendering dialog's custom character ramp (its own small dialog)
     keys.extend(RAMP_KEYS);
+    // the Metrics dialog's solids and delta period
+    keys.extend(screensaver::SOLID_KEYS);
+    keys.push(screensaver::DELTA_PERIOD_KEY);
     keys
 }
 
@@ -735,13 +758,14 @@ fn group(
     y: i16,
     items: &[(usize, &Choice)],
     extra: &[ExtraToggle],
+    button: Option<(i32, &str)>,
     tail: i16,
 ) -> (i16, i16) {
     let inline = |c: &Choice| INLINE_TOGGLES.iter().any(|&(_, k, _)| k == c.key);
     let toggles: Vec<&(usize, &Choice)> = items.iter().filter(|(_, c)| kind(c) == Kind::Toggle && !inline(c)).collect();
     let rest: Vec<&(usize, &Choice)> = items.iter().filter(|(_, c)| kind(c) != Kind::Toggle).collect();
     let cells = toggles.len() + extra.len();
-    let body = 14 + rest.len() as i16 * ROW + cells.div_ceil(2) as i16 * 12 + 4;
+    let body = 14 + (rest.len() + button.is_some() as usize) as i16 * ROW + cells.div_ceil(2) as i16 * 12 + 4;
     let h = body + tail;
     t.item(BS_GROUPBOX, (6, y, LEFT_W - 6, h), ID_STATIC, BUTTON, title);
     let mut yy = y + 12;
@@ -777,6 +801,11 @@ fn group(
                 None => t.item(CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, (120, yy, 170, 160), id as u16, COMBOBOX, ""),
             },
         }
+        yy += ROW;
+    }
+    // a button to a secondary dialog, under the drop-downs
+    if let Some((bid, text)) = button {
+        t.item(BS_PUSHBUTTON | WS_TABSTOP, (120, yy - 1, 170, 13), bid as u16, BUTTON, text);
         yy += ROW;
     }
     for k in 0..cells {
@@ -815,9 +844,9 @@ fn build_template_counted() -> (Vec<u32>, usize) {
     let mut t = Template::new("platomon screensaver settings", DLG_W, 100);
     // Randomize, and a button that rolls a look now, close the Appearance group's check boxes.
     let randomize: ExtraToggle = (ID_RANDOM, "Rando&m start", 58, Some((ID_REROLL, REROLL_TEXT)));
-    let (_, y) = group(&mut t, "Appearance", LOG_TOP, &looks, &[randomize], 0);
+    let (_, y) = group(&mut t, "Appearance", LOG_TOP, &looks, &[randomize], Some(panel_button(Panel::Background)), 0);
     // the burn-in shift is nested at the bottom of Performance & Features
-    let (gy, left_bottom) = group(&mut t, "Performance && Features", y + 4, &always, &[], BURN_IN_TAIL);
+    let (gy, left_bottom) = group(&mut t, "Performance && Features", y + 4, &always, &[], None, BURN_IN_TAIL);
     let gh = BURN_IN_H;
     t.item(BS_GROUPBOX, (12, gy, LEFT_W - 18, gh), ID_STATIC, BUTTON, "OLED burn-in protection");
     t.item(
@@ -866,8 +895,9 @@ fn build_template_counted() -> (Vec<u32>, usize) {
     let by = bottom + 15;
     t.item(BS_PUSHBUTTON | WS_TABSTOP, (10, by, 66, 14), ID_TUNING as u16, BUTTON, "&Tuning...");
     t.item(BS_PUSHBUTTON | WS_TABSTOP, (80, by, 62, 14), ID_LAYOUT as u16, BUTTON, "&Layout...");
-    t.item(BS_PUSHBUTTON | WS_TABSTOP, (146, by, 44, 14), ID_PREVIEW as u16, BUTTON, "&Preview");
-    t.item(BS_AUTOCHECKBOX | WS_TABSTOP, (194, by + 2, 54, 10), ID_FULLSCREEN as u16, BUTTON, "&Fullscreen");
+    t.item(BS_PUSHBUTTON | WS_TABSTOP, (146, by, 54, 14), ID_METRICS as u16, BUTTON, METRICS_TEXT);
+    t.item(BS_PUSHBUTTON | WS_TABSTOP, (204, by, 44, 14), ID_PREVIEW as u16, BUTTON, "&Preview");
+    t.item(BS_AUTOCHECKBOX | WS_TABSTOP, (252, by + 2, 54, 10), ID_FULLSCREEN as u16, BUTTON, "&Fullscreen");
     t.item(BS_PUSHBUTTON | WS_TABSTOP, (DLG_W - 182, by, 55, 14), ID_APPLY as u16, BUTTON, "&Apply");
     t.item(BS_DEFPUSHBUTTON | WS_TABSTOP, (DLG_W - 122, by, 55, 14), IDOK as u16, BUTTON, "OK");
     t.item(BS_PUSHBUTTON | WS_TABSTOP, (DLG_W - 62, by, 55, 14), IDCANCEL as u16, BUTTON, "Cancel");
@@ -897,6 +927,7 @@ fn panel_template(p: Panel) -> (Vec<u32>, usize) {
         Panel::Tuning => "Move a slider to set that value for every run; auto keeps the random look's or the default value.",
         Panel::Layout => "How the solids are placed, every run (the layout itself is in the Appearance group); the orbit settings apply to the Orbit layout. Auto keeps the default.",
         Panel::Rendering => "How the picture is traced, every run; auto keeps the screensaver's own cheap settings (1 sample, 1 bounce).",
+        Panel::Background => "The floor (its pattern is in Appearance): colour, brightness, tiles, motion and the moving patterns. Auto keeps the random look's or the default value.",
     };
     t.item(0, (10, 6, 280, 20), ID_STATIC, STATIC, intro);
     for (k, c) in choices.iter().enumerate() {
@@ -961,6 +992,8 @@ struct Ui {
     /// settings are greyed out).
     random_look: bool,
     preview: Option<Preview>,
+    /// The Metrics dialog's metric drop-downs: each option's metric key.
+    metric_opts: Vec<String>,
 }
 
 /// A running preview.
@@ -1185,6 +1218,10 @@ fn tuning_label(h: HWND) {
         // SAFETY: control id from our template.
         unsafe { SetDlgItemTextW(h, id, wide(&text).as_ptr()) };
     }
+    // the Metrics button: how many solids
+    let n = metrics_edit_from(&UI.with(|u| u.borrow().panel_values.clone())).0.len();
+    // SAFETY: control id from our template.
+    unsafe { SetDlgItemTextW(h, ID_METRICS, wide(&format!("M&etrics ({n})")).as_ptr()) };
 }
 
 /// Roll random values into every setting of the Appearance group and into
@@ -1207,19 +1244,21 @@ unsafe fn reroll(h: HWND) {
     // and every slider of the Tuning dialog (its look settings too)
     UI.with(|u| {
         let mut u = u.borrow_mut();
-        for c in panel_choices(Panel::Tuning).iter().filter(|c| !c.options.is_empty()) {
-            let (v, _) = &c.options[rng.usize(0..c.options.len())];
-            u.panel_values.retain(|(k, _)| *k != c.key);
-            u.panel_values.push((c.key, v.clone()));
-        }
-        for t in panel_tunables(Panel::Tuning) {
-            let v = t.value_at(rng.u32(0..=t.steps()));
-            u.tuning.retain(|(k, _)| *k != t.key);
-            u.tuning.push((t.key, v));
+        for p in [Panel::Tuning, Panel::Background] {
+            for c in panel_choices(p).iter().filter(|c| !c.options.is_empty()) {
+                let (v, _) = &c.options[rng.usize(0..c.options.len())];
+                u.panel_values.retain(|(k, _)| *k != c.key);
+                u.panel_values.push((c.key, v.clone()));
+            }
+            for t in panel_tunables(p) {
+                let v = t.value_at(rng.u32(0..=t.steps()));
+                u.tuning.retain(|(k, _)| *k != t.key);
+                u.tuning.push((t.key, v));
+            }
         }
     });
     tuning_label(h);
-    status(h, "Rolled random Appearance and Tuning settings (not saved until OK or Apply).");
+    status(h, "Rolled random Appearance, Background options and Tuning settings (not saved until OK or Apply).");
 }
 
 /// Open secondary dialog `p` over the main dialog `h`; OK keeps its edits.
@@ -1568,6 +1607,14 @@ pub unsafe extern "system" fn ScreenSaverConfigureDialog(h: HWND, msg: u32, w: u
                     }
                     ID_RENDERING if code == BN_CLICKED => {
                         open_panel(h, Panel::Rendering);
+                        1
+                    }
+                    ID_BG_OPTIONS if code == BN_CLICKED => {
+                        open_panel(h, Panel::Background);
+                        1
+                    }
+                    ID_METRICS if code == BN_CLICKED => {
+                        open_metrics(h);
                         1
                     }
                     ID_TUNING if code == BN_CLICKED => {
@@ -1984,6 +2031,308 @@ unsafe extern "system" fn tuning_dialog(h: HWND, msg: u32, w: usize, l: isize) -
     }
 }
 
+// ------------------------------------------------------------------ metrics dialog
+
+/// The Metrics button's text with nothing counted yet.
+const METRICS_TEXT: &str = "M&etrics...";
+
+/// The metrics every input drop-down offers: (key, shown text); `off` first.
+const METRIC_CHOICES: [(&str, &str); 8] = [
+    ("off", "Off"),
+    ("cpu", "CPU"),
+    ("ram", "RAM"),
+    ("disk", "Disk"),
+    ("net", "Network"),
+    ("gpu", "GPU"),
+    ("nic", "Adapter"),
+    ("disk-dev", "Disk dev"),
+];
+
+/// Metrics dialog layout, dialog units: the rows' top and pitch, each
+/// input column's left edge and pitch, the dialog's size.
+const MET_TOP: i16 = 44;
+const MET_ROW: i16 = 15;
+const MET_IN_X: i16 = 136;
+const MET_IN_W: i16 = 78;
+const MET_W: i16 = MET_IN_X + 4 * MET_IN_W + 6;
+
+/// The solids and delta period in the settings `values` (as the main
+/// dialog keeps them): its solid keys in order, unparsable ones skipped.
+fn metrics_edit_from(values: &[(&'static str, String)]) -> (Vec<Binding>, u32) {
+    let s = settings_from(&values.iter().map(|(k, v)| (k.to_string(), v.clone())).collect::<Vec<_>>());
+    (s.solids, s.delta_period)
+}
+
+/// The Metrics dialog: per row a check box, the shape, and four inputs
+/// each with its Δ box; the delta period and Defaults below.
+fn metrics_template() -> (Vec<u32>, usize) {
+    let rows = screensaver::MAX_SOLIDS as i16;
+    let cy = MET_TOP + rows * MET_ROW + 46;
+    let mut t = Template::new("Metrics", MET_W, cy);
+    t.item(
+        0,
+        (8, 6, MET_W - 16, 20),
+        ID_STATIC,
+        STATIC,
+        "Up to 12 solids, each with the metrics that drive its size, spin, colour (with Colour by set to Load) and complexity (its shape). \
+         Tick \u{394} to use a metric's change over the delta period instead of its value.",
+    );
+    let hy = MET_TOP - 12;
+    t.item(0, (8, hy, 26, 10), ID_STATIC, STATIC, "Solid");
+    t.item(0, (36, hy, 96, 10), ID_STATIC, STATIC, "Shape");
+    for (d, drive) in Drive::ALL.iter().enumerate() {
+        t.item(0, (MET_IN_X + d as i16 * MET_IN_W, hy, 58, 10), ID_STATIC, STATIC, drive.label());
+        t.item(0, (MET_IN_X + d as i16 * MET_IN_W + 60, hy, 14, 10), ID_STATIC, STATIC, "\u{394}");
+    }
+    for k in 0..rows {
+        let y = MET_TOP + k * MET_ROW;
+        let k32 = k as i32;
+        t.item(BS_AUTOCHECKBOX | WS_TABSTOP | WS_GROUP, (8, y + 1, 26, 10), (ID_MET_ON + k32) as u16, BUTTON, &(k + 1).to_string());
+        t.item(CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, (36, y, 96, 200), (ID_MET_SHAPE + k32) as u16, COMBOBOX, "");
+        for d in 0..4 {
+            let x = MET_IN_X + d as i16 * MET_IN_W;
+            let i = k32 * 4 + d;
+            t.item(CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, (x, y, 58, 160), (ID_MET_IN + i) as u16, COMBOBOX, "");
+            t.item(BS_AUTOCHECKBOX | WS_TABSTOP, (x + 60, y + 1, 14, 10), (ID_MET_DELTA + i) as u16, BUTTON, "");
+        }
+    }
+    let py = MET_TOP + rows * MET_ROW + 6;
+    t.item(SS_NOTIFY, (8, py + 2, 62, 10), ID_STATIC, STATIC, "\u{394} period (s):");
+    t.item(ES_NUMBER | ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP, (72, py, 32, 12), ID_MET_PERIOD as u16, EDIT, "");
+    t.item(
+        0,
+        (110, py + 2, MET_W - 118, 10),
+        ID_STATIC,
+        STATIC,
+        "\u{394} inputs compare with this many seconds ago (1 to 600).",
+    );
+    let by = cy - 20;
+    t.item(BS_PUSHBUTTON | WS_TABSTOP, (8, by, 60, 14), ID_MET_DEFAULTS as u16, BUTTON, "&Defaults");
+    t.item(BS_DEFPUSHBUTTON | WS_TABSTOP, (MET_W - 122, by, 55, 14), IDOK as u16, BUTTON, "OK");
+    t.item(BS_PUSHBUTTON | WS_TABSTOP, (MET_W - 62, by, 55, 14), IDCANCEL as u16, BUTTON, "Cancel");
+    let n = t.count();
+    (t.finish(), n)
+}
+
+/// A shape's name for the drop-down: "truncated-cube" → "Truncated cube".
+fn shape_name(k: SolidKind) -> String {
+    let s = k.id().replace('-', " ");
+    let mut c = s.chars();
+    c.next().map_or_else(String::new, |f| f.to_uppercase().chain(c).collect())
+}
+
+/// The metric drop-downs' options: the built-in ones, then any named
+/// instance (`nic:Ethernet 2`) the solids use.
+fn metric_options(solids: &[Binding]) -> Vec<String> {
+    let mut opts: Vec<String> = METRIC_CHOICES.iter().map(|(k, _)| k.to_string()).collect();
+    for b in solids {
+        for i in &b.inputs {
+            if let Some(m) = &i.metric
+                && !opts.contains(&m.key())
+            {
+                opts.push(m.key());
+            }
+        }
+    }
+    opts
+}
+
+/// A metric drop-down option's text: `nic:Ethernet 2` → `Adapter Ethernet 2`.
+fn metric_text(key: &str) -> String {
+    if let Some((_, t)) = METRIC_CHOICES.iter().find(|(k, _)| *k == key) {
+        return t.to_string();
+    }
+    match key.split_once(':') {
+        Some((kind, name)) => {
+            let kind = METRIC_CHOICES.iter().find(|(k, _)| *k == kind).map_or(kind, |(_, t)| t);
+            format!("{kind} {name}")
+        }
+        None => key.to_string(),
+    }
+}
+
+/// Show `solids` and `period` in the open Metrics dialog (unused rows
+/// unticked, ready with CPU on size, spin and colour).
+unsafe fn metrics_fill(h: HWND, solids: &[Binding], period: u32) {
+    let opts = UI.with(|u| u.borrow().metric_opts.clone());
+    let spare = Binding::parse("auto|cpu").expect("built-in binding");
+    // SAFETY: control ids from the metrics template.
+    unsafe {
+        for k in 0..screensaver::MAX_SOLIDS {
+            let k32 = k as i32;
+            let b = solids.get(k).unwrap_or(&spare);
+            CheckDlgButton(h, ID_MET_ON + k32, (k < solids.len()) as u32);
+            let shape = b.solid.and_then(|s| SolidKind::ALL.iter().position(|x| *x == s)).map_or(0, |i| i + 1);
+            SendDlgItemMessageW(h, ID_MET_SHAPE + k32, CB_SETCURSEL, shape, 0);
+            for (d, input) in b.inputs.iter().enumerate() {
+                let i = k32 * 4 + d as i32;
+                let key = input.metric.as_ref().map_or_else(|| "off".to_string(), |m| m.key());
+                SendDlgItemMessageW(h, ID_MET_IN + i, CB_SETCURSEL, opts.iter().position(|o| *o == key).unwrap_or(0), 0);
+                CheckDlgButton(h, ID_MET_DELTA + i, input.delta as u32);
+            }
+        }
+        SetDlgItemInt(h, ID_MET_PERIOD, period, 0);
+        metrics_enable(h);
+    }
+}
+
+/// Grey out unticked rows, and Δ boxes whose input is off.
+unsafe fn metrics_enable(h: HWND) {
+    // SAFETY: control ids from the metrics template.
+    unsafe {
+        for k in 0..screensaver::MAX_SOLIDS as i32 {
+            let on = IsDlgButtonChecked(h, ID_MET_ON + k) == 1;
+            EnableWindow(GetDlgItem(h, ID_MET_SHAPE + k), on as i32);
+            for d in 0..4 {
+                let i = k * 4 + d;
+                EnableWindow(GetDlgItem(h, ID_MET_IN + i), on as i32);
+                let set = SendDlgItemMessageW(h, ID_MET_IN + i, CB_GETCURSEL, 0, 0) > 0;
+                EnableWindow(GetDlgItem(h, ID_MET_DELTA + i), (on && set) as i32);
+            }
+        }
+    }
+}
+
+/// The ticked rows as solids, or why they can't be used.
+unsafe fn metrics_take(h: HWND) -> Result<(Vec<Binding>, u32), String> {
+    let opts = UI.with(|u| u.borrow().metric_opts.clone());
+    let mut solids = Vec::new();
+    // SAFETY: control ids from the metrics template; `ok` is a valid out pointer.
+    unsafe {
+        for k in 0..screensaver::MAX_SOLIDS as i32 {
+            if IsDlgButtonChecked(h, ID_MET_ON + k) != 1 {
+                continue;
+            }
+            let shape = SendDlgItemMessageW(h, ID_MET_SHAPE + k, CB_GETCURSEL, 0, 0);
+            let solid = (shape > 0).then(|| SolidKind::ALL.get(shape as usize - 1).copied()).flatten();
+            let mut inputs: [Input; 4] = Default::default();
+            for (d, input) in inputs.iter_mut().enumerate() {
+                let i = k * 4 + d as i32;
+                let sel = SendDlgItemMessageW(h, ID_MET_IN + i, CB_GETCURSEL, 0, 0).max(0) as usize;
+                let key = opts.get(sel).map_or("off", String::as_str);
+                let delta = key != "off" && IsDlgButtonChecked(h, ID_MET_DELTA + i) == 1;
+                *input = Input::parse(key).map_err(|e| format!("Solid {}: {e}", k + 1))?;
+                input.delta = delta;
+            }
+            if inputs.iter().all(|i| i.metric.is_none()) {
+                return Err(format!("Solid {} has every input off: give it at least one metric, or untick it.", k + 1));
+            }
+            solids.push(Binding { solid, inputs });
+        }
+        if solids.is_empty() {
+            return Err("Tick at least one solid.".into());
+        }
+        let mut ok = 0;
+        let period = GetDlgItemInt(h, ID_MET_PERIOD, &mut ok, 0);
+        let (lo, hi) = (screensaver::DELTA_PERIOD_RANGE.0 as u32, screensaver::DELTA_PERIOD_RANGE.1 as u32);
+        if ok == 0 || !(lo..=hi).contains(&period) {
+            return Err(format!("The \u{394} period must be a whole number of seconds from {lo} to {hi}."));
+        }
+        Ok((solids, period))
+    }
+}
+
+/// # Safety
+/// Called by the dialog manager with a valid dialog window handle.
+unsafe extern "system" fn metrics_dialog(h: HWND, msg: u32, w: usize, _l: isize) -> isize {
+    // SAFETY (whole fn): `h` is our dialog; control ids come from our template.
+    unsafe {
+        match msg {
+            WM_INITDIALOG => {
+                let (solids, period) = metrics_edit_from(&UI.with(|u| u.borrow().panel_values.clone()));
+                let opts = metric_options(&solids);
+                for k in 0..screensaver::MAX_SOLIDS as i32 {
+                    let shape = ID_MET_SHAPE + k;
+                    SendDlgItemMessageW(h, shape, CB_ADDSTRING, 0, wide("Auto").as_ptr() as isize);
+                    for s in SolidKind::ALL {
+                        SendDlgItemMessageW(h, shape, CB_ADDSTRING, 0, wide(&shape_name(s)).as_ptr() as isize);
+                    }
+                    SendDlgItemMessageW(h, shape, CB_SETDROPPEDWIDTH, 200, 0);
+                    for d in 0..4 {
+                        let id = ID_MET_IN + k * 4 + d;
+                        for o in &opts {
+                            SendDlgItemMessageW(h, id, CB_ADDSTRING, 0, wide(&metric_text(o)).as_ptr() as isize);
+                        }
+                        SendDlgItemMessageW(h, id, CB_SETDROPPEDWIDTH, 140, 0);
+                    }
+                }
+                UI.with(|u| u.borrow_mut().metric_opts = opts);
+                metrics_fill(h, &solids, period);
+                let mut tips: Vec<(i32, String)> = Vec::new();
+                for k in 0..screensaver::MAX_SOLIDS as i32 {
+                    tips.push((ID_MET_ON + k, help("metric_on").into()));
+                    tips.push((ID_MET_SHAPE + k, help("metric_shape").into()));
+                    for (d, key) in ["metric_size", "metric_spin", "metric_colour", "metric_complexity"].iter().enumerate() {
+                        let i = k * 4 + d as i32;
+                        tips.push((ID_MET_IN + i, help(key).into()));
+                        tips.push((ID_MET_DELTA + i, help("metric_delta").into()));
+                    }
+                }
+                tips.push((ID_MET_PERIOD, help("delta_period").into()));
+                tips.push((ID_MET_DEFAULTS, "Back to the five standard solids: CPU, RAM, disk, network and GPU, each driving its own size, spin and colour.".into()));
+                tips.push((IDOK, "Keep these solids (saved with OK in the main dialog).".into()));
+                tips.push((IDCANCEL, "Discard changes to the solids.".into()));
+                add_tips(h, &tips);
+                1
+            }
+            WM_COMMAND => {
+                let (id, code) = ((w & 0xFFFF) as i32, (w >> 16) & 0xFFFF);
+                match id {
+                    IDOK => {
+                        match metrics_take(h) {
+                            Ok((solids, period)) => {
+                                UI.with(|u| {
+                                    let mut u = u.borrow_mut();
+                                    u.panel_values.retain(|(k, _)| !screensaver::SOLID_KEYS.contains(k) && *k != screensaver::DELTA_PERIOD_KEY);
+                                    for (key, b) in screensaver::SOLID_KEYS.iter().zip(&solids) {
+                                        u.panel_values.push((key, b.text()));
+                                    }
+                                    u.panel_values.push((screensaver::DELTA_PERIOD_KEY, period.to_string()));
+                                });
+                                EndDialog(h, 1);
+                            }
+                            Err(e) => {
+                                MessageBoxW(h, wide(&e).as_ptr(), wide("platomon").as_ptr(), MB_ICONWARNING);
+                            }
+                        }
+                        1
+                    }
+                    IDCANCEL => {
+                        EndDialog(h, 0);
+                        1
+                    }
+                    ID_MET_DEFAULTS => {
+                        let d = ScrSettings::default();
+                        metrics_fill(h, &d.solids, d.delta_period);
+                        1
+                    }
+                    _ if (ID_MET_ON..ID_MET_ON + screensaver::MAX_SOLIDS as i32).contains(&id) && code == BN_CLICKED => {
+                        metrics_enable(h);
+                        1
+                    }
+                    _ if (ID_MET_IN..ID_MET_IN + 4 * screensaver::MAX_SOLIDS as i32).contains(&id) && code == CBN_SELCHANGE => {
+                        metrics_enable(h);
+                        1
+                    }
+                    _ => 0,
+                }
+            }
+            _ => 0,
+        }
+    }
+}
+
+/// Open the Metrics dialog over the main dialog `h`; OK keeps its solids.
+unsafe fn open_metrics(h: HWND) {
+    let (tpl, _) = metrics_template();
+    // SAFETY: a valid DWORD-aligned template; the procedure matches DLGPROC.
+    let ok = unsafe { DialogBoxIndirectParamW(GetModuleHandleW(std::ptr::null()), tpl.as_ptr() as *const u16, h, Some(metrics_dialog), 0) } == 1;
+    if ok {
+        tuning_label(h);
+        status(h, "Metrics changed (saved with OK).");
+    }
+}
+
 /// Show the configuration dialog (owned by `owner`, 0 = none). Returns true
 /// when the user saved the settings.
 pub fn configure(owner: isize) -> bool {
@@ -2043,6 +2392,18 @@ mod tests {
         let (_, items, cy) = header(&ramp);
         assert_eq!(items, 10);
         assert!(cy > 80, "height {cy}");
+        // the Metrics dialog: intro, 2 + 4 x 2 headers, per row a box, a
+        // shape and 4 x (input, delta), the period's label, edit and note,
+        // Defaults, OK, Cancel
+        let (met, n) = metrics_template();
+        let (_, items, cy) = header(&met);
+        assert_eq!(items, n);
+        assert_eq!(n, 1 + 10 + screensaver::MAX_SOLIDS * 10 + 3 + 3);
+        assert!(cy > 200 && cy < 400, "height {cy}");
+        assert_eq!(metric_text("nic:Ethernet 2"), "Adapter Ethernet 2");
+        assert_eq!(metric_text("disk-dev"), "Disk dev");
+        let solids = [Binding::parse("auto|nic:Wi-Fi|cpu").unwrap()];
+        assert_eq!(metric_options(&solids).last().map(String::as_str), Some("nic:Wi-Fi"));
         // every slider is in exactly one dialog, every dialog has something
         assert_eq!(PANELS.iter().map(|&p| panel_tunables(p).len()).sum::<usize>(), TUNABLES.len());
         assert!(PANELS.iter().all(|&p| !panel_tunables(p).is_empty()));
@@ -2054,9 +2415,15 @@ mod tests {
     fn controls_suit_their_settings_and_labels_are_short_and_distinct() {
         let by_key = |k: &str| screensaver::choices().into_iter().find(|c| c.key == k).unwrap();
         // the Appearance sliders are in the Tuning dialog
-        for k in ["bg_lum", "bg_waves", "bg_wave_speed", "halo_swing"] {
-            assert_eq!(by_key(k).panel, Some(Panel::Tuning), "{k}");
+        assert_eq!(by_key("halo_swing").panel, Some(Panel::Tuning));
+        // the background's settings are in Background options
+        for k in ["bg_color", "bg_lum", "bg_waves", "bg_wave_speed"] {
+            assert_eq!(by_key(k).panel, Some(Panel::Background), "{k}");
         }
+        for k in ["bg_contrast", "bg_scale", "bg_sway", "bg_sway_period", "bg_rotate_period", "bg_drops"] {
+            assert!(panel_tunables(Panel::Background).iter().any(|t| t.key == k), "{k}");
+        }
+        assert!(!panel_tunables(Panel::Tuning).iter().any(|t| t.key.starts_with("bg_")));
         assert!(general_choices().iter().filter(|c| c.appearance).all(|c| kind(c) != Kind::Slider));
         for k in ["wireframe", "stats", "fps_invert", "sound", "halo_bands", "tags", "overdrive"] {
             assert_eq!(kind(&by_key(k)), Kind::Toggle, "{k}");
@@ -2064,7 +2431,7 @@ mod tests {
         for k in ["bg_lum", "bg_waves", "bg_wave_speed", "budget", "levels", "colors", "halo_swing"] {
             assert_eq!(kind(&by_key(k)), Kind::Slider, "{k}");
         }
-        for k in ["layout", "camera", "color", "color_by", "bg_color", "bg_pattern", "extras", "fps_cap", "density", "tag_color", "tag_text"] {
+        for k in ["layout", "camera", "color", "color_by", "bg_color", "bg_pattern", "fps_cap", "density", "tag_color", "tag_text"] {
             assert_eq!(kind(&by_key(k)), Kind::Combo, "{k}");
         }
         assert_eq!(kind(&radius_choice()), Kind::Slider);

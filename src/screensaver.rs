@@ -6,7 +6,8 @@
 use std::time::Instant;
 
 use crate::config::{Config, SlotSpec};
-use crate::metrics::Channel;
+pub use crate::drive::{Binding, DELTA_PERIOD_DEFAULT, DELTA_PERIOD_RANGE, Drive, Input, MAX_SOLIDS};
+use crate::metrics::{Channel, MetricKind, MetricSpec};
 use crate::render::{RenderSettings, Renderer, TraceSettings};
 use crate::scene::camera::{CameraMode, CameraParams, OrbitDir};
 use crate::scene::ground::{Pattern, Spin};
@@ -119,6 +120,7 @@ pub fn randomize(rng: &mut fastrand::Rng, d: &Display) -> Config {
     c.bg_rotate_period = range(rng, 25.0, 90.0).round();
     c.bg_waves = rng.u32(5..=12);
     c.bg_wave_speed = (range(rng, 0.2, 1.2) * 10.0).round() / 10.0;
+    c.bg_drops = rng.u32(6..=24);
 
     // colour
     if rng.u8(0..10) >= 3 {
@@ -375,15 +377,6 @@ impl Plan {
 
 // ------------------------------------------------------------------ settings
 
-/// Which optional metrics to add to the five main ones.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Extras {
-    None,
-    Nic,
-    Disk,
-    Both,
-}
-
 /// How tag text is drawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TagText {
@@ -515,8 +508,12 @@ pub struct ScrSettings {
     pub wireframe: bool,
     pub stats: bool,
     pub fps_invert: bool,
-    pub extras: Extras,
     // --- always applied
+    /// The Metrics dialog: up to [`MAX_SOLIDS`] solids, each with its
+    /// shape and the inputs driving its size, spin, colour and complexity.
+    pub solids: Vec<Binding>,
+    /// Delta inputs measure the change over this many seconds.
+    pub delta_period: u32,
     /// Frame-rate cap; `None` = the display's refresh rate.
     pub fps_cap: Option<u32>,
     /// Rendering CPU budget, percent of wall time at full frame rate, for the
@@ -601,7 +598,8 @@ impl Default for ScrSettings {
             wireframe: false,
             stats: false,
             fps_invert: false,
-            extras: Extras::None,
+            solids: default_solids(),
+            delta_period: DELTA_PERIOD_DEFAULT as u32,
             fps_cap: None,
             budget_pct: (RENDER_BUDGET * 100.0).round() as u8,
             overdrive: false,
@@ -647,6 +645,8 @@ pub enum Panel {
     Tuning,
     Layout,
     Rendering,
+    /// Background options: the floor's colour, brightness, tiles and motion.
+    Background,
 }
 
 /// A numeric setting a secondary dialog edits with a slider.
@@ -717,16 +717,17 @@ macro_rules! tunable {
 /// Every numeric setting set with a slider, in the Tuning, Layout and
 /// Rendering dialogs ([`Tunable::panel`]). A set value applies every run
 /// (random look or not); unset ones keep the random or default value.
-pub const TUNABLES: [Tunable; 24] = [
+pub const TUNABLES: [Tunable; 25] = [
     tunable!(Tuning, "orbit_period", "Orbit period (s)", 15.0, 180.0, 5.0, "Seconds per camera orbit (orbit, tilt and resonance cameras). Tilt also takes one period per rise or fall."),
     tunable!(Tuning, "orbit_bob", "Orbit bob", 0.0, 1.0, 0.05, "How far the orbiting camera rises and falls twice per turn, in world units."),
     tunable!(Tuning, "focus_zoom", "Focus zoom", 0.0, 1.0, 0.05, "Focus camera: 0 only turns toward the busiest solid, 1 comes in to a close-up."),
     tunable!(Tuning, "focus_tau", "Focus glide (s)", 0.25, 5.0, 0.25, "Focus camera: how long its glides take (smoothing time constant)."),
-    tunable!(Tuning, "bg_contrast", "Floor contrast", 0.0, 1.0, 0.05, "How far the floor pattern's tones spread around its brightness."),
-    tunable!(Tuning, "bg_scale", "Floor tile size", 0.3, 4.0, 0.1, "Size of the floor pattern's tiles (the quasicrystal's wavelength), in world units."),
-    tunable!(Tuning, "bg_sway", "Floor sway", 0.0, 2.0, 0.05, "How far the floor pattern sways in a slow circle; 0 holds it still."),
-    tunable!(Tuning, "bg_sway_period", "Sway period (s)", 3.0, 30.0, 1.0, "Seconds per floor sway cycle."),
-    tunable!(Tuning, "bg_rotate_period", "Floor turn period (s)", 10.0, 180.0, 5.0, "Seconds per turn when the floor pattern rotates."),
+    tunable!(Background, "bg_contrast", "Floor contrast", 0.0, 1.0, 0.05, "How far the floor pattern's tones spread around its brightness."),
+    tunable!(Background, "bg_scale", "Floor tile size", 0.3, 4.0, 0.1, "Size of the floor pattern's tiles (the quasicrystal's wavelength), in world units."),
+    tunable!(Background, "bg_sway", "Floor sway", 0.0, 2.0, 0.05, "How far the floor pattern sways in a slow circle; 0 holds it still."),
+    tunable!(Background, "bg_sway_period", "Sway period (s)", 3.0, 30.0, 1.0, "Seconds per floor sway cycle."),
+    tunable!(Background, "bg_rotate_period", "Floor turn period (s)", 10.0, 180.0, 5.0, "Seconds per turn when the floor pattern rotates."),
+    tunable!(Background, "bg_drops", "Raindrops", 1.0, 48.0, 1.0, "Rain floor: how many raindrops ripple at once. Each lands at a random place, sends out a ring of ripples that spreads and fades, and is followed by a new one."),
     tunable!(Tuning, "min_scale", "Smallest solid size", 0.2, 1.0, 0.05, "Size of a solid whose metric is idle, as a share of full size."),
     tunable!(Tuning, "max_scale", "Largest solid size", 0.5, 1.5, 0.05, "Size of a solid whose metric is at full load."),
     tunable!(Tuning, "idle_spin", "Idle spin (rad/s)", 0.0, 1.0, 0.05, "How fast a solid spins when its metric is idle."),
@@ -756,6 +757,7 @@ pub fn set_tunable(c: &mut Config, key: &str, v: f32) {
         "bg_sway" => c.bg_sway = v,
         "bg_sway_period" => c.bg_sway_period = v,
         "bg_rotate_period" => c.bg_rotate_period = v,
+        "bg_drops" => c.bg_drops = v.round().max(1.0) as u32,
         "min_scale" => c.min_scale = v,
         "max_scale" => c.max_scale = v,
         "idle_spin" => c.idle_spin = v,
@@ -799,6 +801,7 @@ pub fn get_tunable(c: &Config, key: &str) -> f32 {
         "bg_sway" => c.bg_sway,
         "bg_sway_period" => c.bg_sway_period,
         "bg_rotate_period" => c.bg_rotate_period,
+        "bg_drops" => c.bg_drops as f32,
         "min_scale" => c.min_scale,
         "max_scale" => c.max_scale,
         "idle_spin" => c.idle_spin,
@@ -822,8 +825,8 @@ pub fn get_tunable(c: &Config, key: &str) -> f32 {
 /// dialog's own controls); empty when there is none.
 pub fn help(key: &str) -> &'static str {
     match key {
-        "random" => "Random start. On: every run starts with a new random look (layout, camera, colours, background...). Off: the look chosen in this group is used every time.",
-        "reroll" => "Roll random values into every setting of this group and into the Tuning dialog's sliders now (and turn Random start off so they are kept). Nothing is saved until OK or Apply.",
+        "random" => "Random start. On: every run starts with a new random look (layout, camera, colours, background...). Off: the look chosen in this group (and its Background options) is used every time.",
+        "reroll" => "Roll random values into every setting of this group and into the Background options and Tuning dialogs now (and turn Random start off so they are kept). Nothing is saved until OK or Apply.",
         "layout" => "Rings: the solids stand in rings on the floor. Sphere: they float on concentric spherical shells. Line: one evenly spaced row. Stack: one above another in the centre. Orbit: one solid in the centre and the others orbiting it. Ordering, spacing and the orbits are in the Layout dialog.",
         "orbit_center" => "Orbit layout: the solid the others orbit. CPU, RAM, Network or Disk: that metric's solid. Size: whichever solid is largest at the moment. Spin: whichever spins fastest. A new centre glides in smoothly.",
         "ordering" => "Which solid takes which place: in metric order, from the simplest solid (fewest edges) to the most complex, the reverse, or shuffled. The first place is the inner ring's front, the inner shell, the line's left end or the stack's bottom.",
@@ -832,14 +835,23 @@ pub fn help(key: &str) -> &'static str {
         "color" => "The colour gradient, or Off for plain monochrome text.",
         "color_by" => "What picks each solid's colour. Brightness: how lit the cell is. Load: the solid's metric. Spin: its spin speed and direction seen from the camera. Sound: the loudness of its own frequency band (bass on simple solids, treble on complex ones).",
         "bg_color" => "Colouring of the floor and sky, separate from the solids. Auto: by brightness when the solids are. Off: uncoloured. Match: the solids' gradient by brightness. Or a gradient of its own.",
-        "bg_pattern" => "The floor's pattern. Quasicrystal is a flowing, never-repeating wave pattern.",
+        "bg_pattern" => "The floor's pattern. Quasicrystal: a flowing, never-repeating wave pattern. Rain: raindrops landing at random, each sending out spreading rings of ripples. Ocean: wind-driven waves, the long ones faster and taller. Julia: a Julia set fractal slowly changing shape. Carpet: the Sierpinski carpet fractal. Clouds: drifting fractal noise. Their settings are in Background options.",
+        "bg_options" => "Background options: the floor's colour, brightness, pattern contrast and tile size, sway and turning, and the moving patterns' flow, quasicrystal waves and raindrops.",
         "bg_lum" => "Floor brightness, 0 (no floor) to 10.",
         "bg_waves" => "Quasicrystal floor: the number of plane waves, which sets its rotational symmetry (7 = sevenfold).",
-        "bg_wave_speed" => "Quasicrystal floor: how fast its waves flow.",
+        "bg_wave_speed" => "How fast the moving floor patterns flow: the quasicrystal's waves, the raindrops' ripples, the ocean's waves, the Julia set's drift and the clouds. Still holds them all.",
         "wireframe" => "Draw the edges of every solid over its shading.",
         "stats" => "A line of metric readings and frame rate along the bottom of the screen.",
         "fps_invert" => "Normally a busy machine animates faster; inverted, it slows down when busy.",
-        "extras" => "Extra solids for a network adapter and/or a disk device, beside CPU, RAM, disk, network and GPU.",
+        "metrics" => "Choose up to 12 solids and what drives each one's size, spin, colour and complexity (its shape), as a metric's value or its change over a period. Applies every run, random look or not.",
+        "metric_on" => "Show this solid. Unticked rows are left out.",
+        "metric_shape" => "The solid's shape. Auto: the random look's shape for its metric (or that metric's own). With a complexity input, the shape it starts from at rest.",
+        "metric_size" => "What sets the solid's size: small when idle, full size at full load. Off: always the smallest size.",
+        "metric_spin" => "What sets how fast the solid spins (rx/read on one axis and tx/write on the other for network and disks). Off: the idle spin.",
+        "metric_colour" => "What sets the solid's colour when Colour by is Load. Off: the start of the gradient.",
+        "metric_complexity" => "What changes the solid's shape: idle stays at its own shape, more load steps up through solids with more edges, to the most complex at full load. Off: the shape never changes.",
+        "metric_delta" => "\u{394}: use how much this metric changed over the delta period instead of its value, scaled to the largest change lately. A steady load reads as 0, a rise or fall as up to 1.",
+        "delta_period" => "How far back a \u{394} input compares, in seconds (1 to 600): short periods catch quick spikes, long ones slow trends.",
         "fps_cap" => "Highest frame rate: the display's refresh rate, or a lower fixed cap.",
         "budget" => "Share of CPU time the rendering may use; the text size is chosen so it fits.",
         "overdrive" => "Ignore the CPU budget: rendering takes all the CPU time it wants (the text is sized for the whole CPU at the full frame rate, and frames render back to back). Expect full CPU load, heat and fan noise.",
@@ -913,23 +925,34 @@ fn capitalized(s: &str) -> String {
     c.next().map_or_else(String::new, |f| f.to_uppercase().chain(c).collect())
 }
 
-fn extras_id(e: Extras) -> &'static str {
-    match e {
-        Extras::None => "none",
-        Extras::Nic => "nic",
-        Extras::Disk => "disk",
-        Extras::Both => "both",
-    }
+/// INI keys of the Metrics dialog's solids, in order (unused ones unset).
+pub const SOLID_KEYS: [&str; MAX_SOLIDS] =
+    ["solid1", "solid2", "solid3", "solid4", "solid5", "solid6", "solid7", "solid8", "solid9", "solid10", "solid11", "solid12"];
+/// INI key of the delta inputs' period, seconds.
+pub const DELTA_PERIOD_KEY: &str = "delta_period";
+
+/// The solids before any are chosen: one each for CPU, RAM, disk, network
+/// and GPU, each metric driving its solid's size, spin and colour.
+pub fn default_solids() -> Vec<Binding> {
+    ["cpu", "ram", "disk", "net", "gpu"].map(|m| Binding::of(MetricSpec::parse(m).expect("built-in metric"))).to_vec()
 }
 
-fn parse_extras(v: &str) -> Option<Extras> {
-    match v {
-        "none" => Some(Extras::None),
-        "nic" => Some(Extras::Nic),
-        "disk" => Some(Extras::Disk),
-        "both" => Some(Extras::Both),
-        _ => None,
+/// Solids from settings written before the Metrics dialog: the five main
+/// metrics plus the former Extra metrics choice (`nic`, `disk` or `both`).
+fn solids_from_extras(v: Option<&str>) -> Vec<Binding> {
+    let mut s = default_solids();
+    let (nic, disk) = match v {
+        Some("nic") => (true, false),
+        Some("disk") => (false, true),
+        Some("both") => (true, true),
+        _ => (false, false),
+    };
+    for (on, m) in [(nic, MetricKind::Nic), (disk, MetricKind::DiskDev)] {
+        if on {
+            s.push(Binding::of(MetricSpec::new(m)));
+        }
     }
+    s
 }
 
 /// A dialog drop-down: INI key, label, (INI value, shown text) choices, and
@@ -969,8 +992,8 @@ pub fn choices() -> Vec<Choice> {
     // shown with the look, but kept as set (not randomised) every run
     let styled = |key, label, options| Choice { key, label, options, look: false, appearance: true, panel: None };
     let always = |key, label, options| Choice { key, label, options, look: false, appearance: false, panel: None };
-    // sliders shown in the Tuning dialog: part of the look, or always applied
-    let tuning_look = |key, label, options| Choice { key, label, options, look: true, appearance: false, panel: Some(Panel::Tuning) };
+    // background settings, in the Background options dialog
+    let bg_look = |key, label, options| Choice { key, label, options, look: true, appearance: false, panel: Some(Panel::Background) };
     let tuning_styled =
         |key, label, options| Choice { key, label, options, look: false, appearance: false, panel: Some(Panel::Tuning) };
     let in_panel =
@@ -1012,19 +1035,14 @@ pub fn choices() -> Vec<Choice> {
                 opt("sound", "Sound: frequency band per solid"),
             ],
         ),
-        look("bg_color", "Background colour", bg_colors),
+        bg_look("bg_color", "Background colour", bg_colors),
         look("bg_pattern", "Background pattern", patterns),
-        tuning_look("bg_lum", "Background luminosity", lums),
-        tuning_look("bg_waves", "Quasicrystal waves", waves),
-        tuning_look("bg_wave_speed", "Quasicrystal flow", speeds),
+        bg_look("bg_lum", "Background luminosity", lums),
+        bg_look("bg_waves", "Quasicrystal waves", waves),
+        bg_look("bg_wave_speed", "Pattern flow", speeds),
         look("wireframe", "Wireframe overlay", on_off()),
         look("stats", "Stats bar", on_off()),
         look("fps_invert", "Inverted frame rate", on_off()),
-        look(
-            "extras",
-            "Extra metrics",
-            vec![opt("none", "None"), opt("nic", "Network adapter"), opt("disk", "Disk device"), opt("both", "Both")],
-        ),
         always("fps_cap", "Frame-rate cap", caps),
         always("budget", "CPU budget", budgets),
         always("overdrive", "Overdrive", on_off()),
@@ -1130,7 +1148,7 @@ impl ScrSettings {
     }
 
     fn look_pairs(&self) -> Vec<(&'static str, String)> {
-        vec![
+        let mut v = vec![
             ("random", on_off(self.random)),
             ("layout", layout_id(self.layout).into()),
             ("camera", self.camera.id().into()),
@@ -1144,7 +1162,6 @@ impl ScrSettings {
             ("wireframe", on_off(self.wireframe)),
             ("stats", on_off(self.stats)),
             ("fps_invert", on_off(self.fps_invert)),
-            ("extras", extras_id(self.extras).into()),
             ("fps_cap", self.fps_cap.map_or_else(|| "display".to_string(), |f| f.to_string())),
             ("budget", self.budget_pct.to_string()),
             ("overdrive", on_off(self.overdrive)),
@@ -1175,7 +1192,13 @@ impl ScrSettings {
             ("shift_min_frames", self.shift_min_frames.to_string()),
             ("shift_max_frames", self.shift_max_frames.to_string()),
             ("shift_radius", self.shift_radius.to_string()),
-        ]
+        ];
+        // the Metrics dialog: every solid key, empty (unset) past the last solid
+        for (k, key) in SOLID_KEYS.iter().enumerate() {
+            v.push((key, self.solids.get(k).map(Binding::text).unwrap_or_default()));
+        }
+        v.push((DELTA_PERIOD_KEY, self.delta_period.to_string()));
+        v
     }
 
     /// Read settings through `get(key)`; missing or invalid values fall back
@@ -1213,7 +1236,16 @@ impl ScrSettings {
             wireframe: flag("wireframe", d.wireframe),
             stats: flag("stats", d.stats),
             fps_invert: flag("fps_invert", d.fps_invert),
-            extras: val("extras").and_then(|v| parse_extras(&v)).unwrap_or(d.extras),
+            // (settings from before the Metrics dialog: the Extra metrics choice)
+            solids: if SOLID_KEYS.iter().any(|k| get(k).is_some_and(|v| !v.trim().is_empty())) {
+                let s: Vec<Binding> = SOLID_KEYS.iter().filter_map(|k| Binding::parse(get(k)?.trim()).ok()).collect();
+                if s.is_empty() { d.solids.clone() } else { s }
+            } else {
+                solids_from_extras(val("extras").as_deref())
+            },
+            delta_period: num(DELTA_PERIOD_KEY)
+                .filter(|p| (DELTA_PERIOD_RANGE.0 as u32..=DELTA_PERIOD_RANGE.1 as u32).contains(p))
+                .unwrap_or(d.delta_period),
             fps_cap: match val("fps_cap").as_deref() {
                 None | Some("display") => None,
                 Some(v) => v.parse::<u32>().ok().filter(|f| (30..=240).contains(f)).or(d.fps_cap),
@@ -1265,8 +1297,10 @@ impl ScrSettings {
         }
     }
 
-    /// Unless the look is random, replace the random look with the chosen one.
+    /// The solids (always), and unless the look is random, the chosen look
+    /// in place of the random one.
     pub fn apply(&self, c: &mut Config) {
+        self.apply_solids(c);
         if self.random {
             return;
         }
@@ -1282,24 +1316,32 @@ impl ScrSettings {
         c.wireframe = self.wireframe;
         c.show_stats = self.stats;
         c.fps_invert = self.fps_invert;
-        let mut show: Vec<String> = ["cpu", "ram", "disk", "net", "gpu"].map(String::from).to_vec();
-        if matches!(self.extras, Extras::Nic | Extras::Both) {
-            show.push("nic".into());
-        }
-        if matches!(self.extras, Extras::Disk | Extras::Both) {
-            show.push("disk-dev".into());
-        }
-        // Keep the random solids; give new metrics unused ones.
-        c.solids.retain(|k, _| show.contains(k));
-        for m in &show {
-            if !c.solids.contains_key(m) {
-                let used: Vec<String> = c.solids.values().cloned().collect();
-                if let Some(k) = SolidKind::ALL.iter().find(|k| !used.iter().any(|u| u == k.id())) {
-                    c.solids.insert(m.clone(), k.id().to_string());
+    }
+
+    /// The Metrics dialog's solids as the config's bindings. A solid left
+    /// on Auto takes the random look's solid for its metric while that is
+    /// free (so a random look still shuffles the shapes), else whatever the
+    /// config picks.
+    fn apply_solids(&self, c: &mut Config) {
+        let mut taken: Vec<SolidKind> = self.solids.iter().filter_map(|b| b.solid).collect();
+        c.bindings = self
+            .solids
+            .iter()
+            .take(MAX_SOLIDS)
+            .map(|b| {
+                let mut b = b.clone();
+                let complexity = b.input(Drive::Complexity).metric.is_some();
+                if b.solid.is_none() && !complexity {
+                    let random = b.primary().and_then(|m| c.solids.get(&m.key())).and_then(|id| SolidKind::from_id(id));
+                    if let Some(k) = random.filter(|k| !taken.contains(k)) {
+                        taken.push(k);
+                        b.solid = Some(k);
+                    }
                 }
-            }
-        }
-        c.show = show;
+                b.text()
+            })
+            .collect();
+        c.delta_period = self.delta_period as f32;
     }
 }
 
@@ -1565,7 +1607,11 @@ mod tests {
             wireframe: true,
             stats: false,
             fps_invert: true,
-            extras: Extras::Both,
+            solids: vec![
+                Binding::parse("cube|delta:cpu|ram|nic:Ethernet 2|off").unwrap(),
+                Binding::parse("auto|off|off|off|delta:disk-dev:C:\\").unwrap(),
+            ],
+            delta_period: 45,
             fps_cap: Some(60),
             budget_pct: 25,
             overdrive: true,
@@ -1630,12 +1676,37 @@ mod tests {
     }
 
     #[test]
+    fn solids_migrate_from_extra_metrics_and_apply_every_run() {
+        let keys = |s: &ScrSettings| s.solids.iter().map(|b| b.primary().unwrap().key()).collect::<Vec<_>>();
+        // settings from before the Metrics dialog
+        assert_eq!(keys(&ScrSettings::from_lookup(lookup(&[("extras", "both")]))), ["cpu", "ram", "disk", "net", "gpu", "nic", "disk-dev"]);
+        assert_eq!(keys(&ScrSettings::from_lookup(lookup(&[("extras", "disk")]))), ["cpu", "ram", "disk", "net", "gpu", "disk-dev"]);
+        assert_eq!(ScrSettings::from_lookup(lookup(&[("extras", "none")])).solids, default_solids());
+        // solid keys win over it; gaps and junk rows are skipped
+        let s = ScrSettings::from_lookup(lookup(&[("extras", "both"), ("solid2", "auto|gpu"), ("solid5", "auto|blob"), ("solid7", "cube|ram")]));
+        assert_eq!(keys(&s), ["gpu", "ram"]);
+        assert_eq!(ScrSettings::from_lookup(lookup(&[("delta_period", "0")])).delta_period, 10);
+        // random look or not, the solids are the dialog's
+        for random in [true, false] {
+            let s = ScrSettings { random, delta_period: 30, ..s.clone() };
+            for seed in 0..4 {
+                let c = plan_config(&WQHD, seed, &s);
+                let slots = c.resolve_slots().unwrap();
+                assert_eq!(slots.len(), 2);
+                assert_eq!(slots[1].solid, SolidKind::Cube);
+                assert_ne!(slots[0].solid, SolidKind::Cube, "auto takes a free shape");
+                assert_eq!(c.delta_period, 30.0);
+            }
+        }
+    }
+
+    #[test]
     fn every_dialog_choice_parses() {
         let keys: Vec<&str> = ScrSettings::default().to_pairs().iter().map(|(k, _)| *k).collect();
         let looks: Vec<&str> = choices().iter().filter(|c| c.look).map(|c| c.key).collect();
         assert_eq!(
             looks,
-            ["layout", "camera", "color", "color_by", "bg_color", "bg_pattern", "bg_lum", "bg_waves", "bg_wave_speed", "wireframe", "stats", "fps_invert", "extras"]
+            ["layout", "camera", "color", "color_by", "bg_color", "bg_pattern", "bg_lum", "bg_waves", "bg_wave_speed", "wireframe", "stats", "fps_invert"]
         );
         for c in choices() {
             assert!(keys.contains(&c.key), "{} is a settings key", c.key);
@@ -1690,7 +1761,7 @@ mod tests {
             camera: CameraMode::Static,
             color: "off".into(),
             wireframe: false,
-            extras: Extras::Disk,
+            solids: solids_from_extras(Some("disk")),
             bg_lum: 0,
             fps_cap: Some(60),
             budget_pct: 10,
@@ -1701,18 +1772,21 @@ mod tests {
             let c = &p.config;
             assert_eq!((c.layout, c.camera, c.color.as_str(), c.wireframe), (Layout::Rings, CameraMode::Static, "off", false));
             assert_eq!((c.bg_pattern, c.show_stats, c.fps_invert), (Pattern::Checker, false, false));
-            assert_eq!(c.show, ["cpu", "ram", "disk", "net", "gpu", "disk-dev"]);
+            let slots = c.resolve_slots().unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+            let keys: Vec<String> = slots.iter().map(|s| s.metric.key()).collect();
+            assert_eq!(keys, ["cpu", "ram", "disk", "net", "gpu", "disk-dev"]);
             assert_eq!((c.bg_lum, c.fps_max, p.budget), (0.0, 60.0, 0.1));
-            c.resolve_slots().unwrap_or_else(|e| panic!("seed {seed}: {e}"));
         }
-        // master toggle on: the look fields are ignored, cap and budget still apply
+        // master toggle on: the look fields are ignored (the solids are
+        // not), cap and budget still apply
         let random = ScrSettings { random: true, ..chosen.clone() };
         let mut looks = std::collections::HashSet::new();
         for seed in 0..40 {
             let mut c = randomize(&mut fastrand::Rng::with_seed(seed), &WQHD);
             let before = c.clone();
             random.apply(&mut c);
-            assert_eq!(c, before, "random look untouched");
+            assert_eq!(c, Config { bindings: c.bindings.clone(), delta_period: c.delta_period, ..before }, "random look untouched");
+            assert_eq!(c.bindings.len(), 6);
             looks.insert(format!("{:?}{:?}{}", c.layout, c.camera, c.color));
         }
         assert!(looks.len() > 10, "varied looks: {}", looks.len());
