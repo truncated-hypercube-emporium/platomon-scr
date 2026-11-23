@@ -381,6 +381,19 @@ const RAMP_PRESETS: [(&str, &str); 3] =
 const ID_METRICS: i32 = 1210;
 /// The Background options button (in the Appearance group).
 const ID_BG_OPTIONS: i32 = 1211;
+/// The Custom colour button and its dialog's controls.
+const ID_CUSTOM_COLOR: i32 = 1212;
+const ID_CC_COUNT: i32 = 3000;
+const ID_CC_SWATCH: i32 = 3010;
+const ID_CC_HEX: i32 = 3020;
+const ID_CC_PICK: i32 = 3030;
+const ID_CC_GEN: i32 = 3040;
+const ID_CC_PRESET: i32 = 3050;
+const ID_CC_LOAD: i32 = 3051;
+const ID_CC_USE_SOLIDS: i32 = 3052;
+const ID_CC_USE_BG: i32 = 3053;
+const ID_CC_NOTE: i32 = 3054;
+const ID_CC_STRIP: i32 = 3100;
 const ID_MET_ON: i32 = 2800;
 const ID_MET_SHAPE: i32 = 2820;
 const ID_MET_IN: i32 = 2840;
@@ -514,6 +527,7 @@ fn main_tips() -> Vec<(i32, String)> {
     v.extend(buttons.iter().map(|&(id, t)| (id, t.to_string())));
     v.push((ID_METRICS, help("metrics").to_string()));
     v.push((ID_BG_OPTIONS, help("bg_options").to_string()));
+    v.push((ID_CUSTOM_COLOR, help("custom_color").to_string()));
     for k in 0..LOG_ROWS_MAX as i32 {
         v.push((ID_ROW + k, "A logged configuration: click to show its settings and launch arguments below.".into()));
         v.push((
@@ -724,6 +738,8 @@ fn panel_keys() -> Vec<&'static str> {
     // the Metrics dialog's solids and delta period
     keys.extend(screensaver::SOLID_KEYS);
     keys.push(screensaver::DELTA_PERIOD_KEY);
+    // the Custom colour dialog's gradient
+    keys.push(screensaver::CUSTOM_GRADIENT_KEY);
     keys
 }
 
@@ -778,14 +794,14 @@ fn group(
     y: i16,
     items: &[(usize, &Choice)],
     extra: &[ExtraToggle],
-    button: Option<(i32, &str)>,
+    buttons: &[(i32, i16, &str)],
     tail: i16,
 ) -> (i16, i16) {
     let inline = |c: &Choice| INLINE_TOGGLES.iter().any(|&(_, k, _)| k == c.key);
     let toggles: Vec<&(usize, &Choice)> = items.iter().filter(|(_, c)| kind(c) == Kind::Toggle && !inline(c)).collect();
     let rest: Vec<&(usize, &Choice)> = items.iter().filter(|(_, c)| kind(c) != Kind::Toggle).collect();
     let cells = toggles.len() + extra.len();
-    let body = 14 + (rest.len() + button.is_some() as usize) as i16 * ROW + cells.div_ceil(2) as i16 * 12 + 4;
+    let body = 14 + (rest.len() + !buttons.is_empty() as usize) as i16 * ROW + cells.div_ceil(2) as i16 * 12 + 4;
     let h = body + tail;
     t.item(BS_GROUPBOX, (6, y, LEFT_W - 6, h), ID_STATIC, BUTTON, title);
     let mut yy = y + 12;
@@ -823,9 +839,14 @@ fn group(
         }
         yy += ROW;
     }
-    // a button to a secondary dialog, under the drop-downs
-    if let Some((bid, text)) = button {
-        t.item(BS_PUSHBUTTON | WS_TABSTOP, (120, yy - 1, 170, 13), bid as u16, BUTTON, text);
+    // buttons to secondary dialogs, in a row under the drop-downs: (id,
+    // width, text)
+    if !buttons.is_empty() {
+        let mut x = 14;
+        for &(bid, w, text) in buttons {
+            t.item(BS_PUSHBUTTON | WS_TABSTOP, (x, yy - 1, w, 13), bid as u16, BUTTON, text);
+            x += w + 4;
+        }
         yy += ROW;
     }
     for k in 0..cells {
@@ -864,9 +885,11 @@ fn build_template_counted() -> (Vec<u32>, usize) {
     let mut t = Template::new("platomon screensaver settings", DLG_W, 100);
     // Randomize, and a button that rolls a look now, close the Appearance group's check boxes.
     let randomize: ExtraToggle = (ID_RANDOM, "Rando&m start", 58, Some((ID_REROLL, REROLL_TEXT)));
-    let (_, y) = group(&mut t, "Appearance", LOG_TOP, &looks, &[randomize], Some(panel_button(Panel::Background)), 0);
+    let bg = panel_button(Panel::Background);
+    let row = [(bg.0, 160, bg.1), (ID_CUSTOM_COLOR, 112, "&Custom colour...")];
+    let (_, y) = group(&mut t, "Appearance", LOG_TOP, &looks, &[randomize], &row, 0);
     // the burn-in shift is nested at the bottom of Performance & Features
-    let (gy, left_bottom) = group(&mut t, "Performance && Features", y + 4, &always, &[], None, BURN_IN_TAIL);
+    let (gy, left_bottom) = group(&mut t, "Performance && Features", y + 4, &always, &[], &[], BURN_IN_TAIL);
     let gh = BURN_IN_H;
     t.item(BS_GROUPBOX, (12, gy, LEFT_W - 18, gh), ID_STATIC, BUTTON, "OLED burn-in protection");
     t.item(
@@ -1652,6 +1675,10 @@ pub unsafe extern "system" fn ScreenSaverConfigureDialog(h: HWND, msg: u32, w: u
                         open_panel(h, Panel::Rendering);
                         1
                     }
+                    ID_CUSTOM_COLOR if code == BN_CLICKED => {
+                        open_custom_color(h);
+                        1
+                    }
                     ID_BG_OPTIONS if code == BN_CLICKED => {
                         open_panel(h, Panel::Background);
                         1
@@ -2074,13 +2101,413 @@ unsafe extern "system" fn tuning_dialog(h: HWND, msg: u32, w: usize, l: isize) -
     }
 }
 
+// ------------------------------------------------------------------ custom colour dialog
+
+#[link(name = "gdi32")]
+unsafe extern "system" {
+    fn CreateSolidBrush(color: u32) -> isize;
+    fn DeleteObject(obj: isize) -> i32;
+}
+
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn InvalidateRect(h: HWND, r: *const Rect, erase: i32) -> i32;
+}
+
+/// CHOOSECOLORW.
+#[repr(C)]
+struct ChooseColor {
+    size: u32,
+    owner: HWND,
+    instance: isize,
+    result: u32,
+    custom: *mut u32,
+    flags: u32,
+    data: isize,
+    hook: isize,
+    template: *const u16,
+}
+
+#[link(name = "comdlg32")]
+unsafe extern "system" {
+    fn ChooseColorW(c: *mut ChooseColor) -> i32;
+}
+
+const CC_RGBINIT: u32 = 0x1;
+const CC_FULLOPEN: u32 = 0x2;
+const WM_CTLCOLORSTATIC: u32 = 0x0138;
+/// Cells in the Custom colour dialog's gradient preview.
+const CC_STRIP: usize = 40;
+
+/// The Custom colour dialog's working state.
+#[derive(Default)]
+struct CustomColor {
+    /// Every row's colour (rows past `count` keep theirs for later).
+    stops: [u32; screensaver::CUSTOM_STOPS_MAX],
+    count: usize,
+    /// The colour picker's own 16 custom colours (kept while the dialog runs).
+    picker: [u32; 16],
+    /// Brushes painting the swatches and the preview: (COLORREF, brush).
+    brushes: Vec<(u32, isize)>,
+    /// The main dialog (its Colour drop-down).
+    main: HWND,
+}
+
+thread_local! {
+    static CC: RefCell<CustomColor> = RefCell::new(CustomColor::default());
+}
+
+/// 0xRRGGBB as a Win32 COLORREF (0x00BBGGRR), and back.
+fn colorref(c: u32) -> u32 {
+    (c & 0xff) << 16 | (c & 0xff00) | (c >> 16) & 0xff
+}
+
+/// A brush of colour `c` (0xRRGGBB), made once per colour while the dialog runs.
+fn brush(c: u32) -> isize {
+    let cr = colorref(c);
+    CC.with(|cc| {
+        let mut cc = cc.borrow_mut();
+        if let Some(&(_, b)) = cc.brushes.iter().find(|(k, _)| *k == cr) {
+            return b;
+        }
+        // SAFETY: plain GDI call; the brush is deleted when the dialog closes.
+        let b = unsafe { CreateSolidBrush(cr) };
+        cc.brushes.push((cr, b));
+        b
+    })
+}
+
+/// The gradient being made, as the renderer will sample it.
+fn cc_gradient() -> crate::color::Gradient {
+    let (stops, n) = CC.with(|cc| (cc.borrow().stops, cc.borrow().count));
+    crate::color::Gradient::from_stops(&stops[..n.clamp(2, stops.len())])
+}
+
+/// The Custom colour dialog: colour count, a row per colour (swatch, hex,
+/// Pick), generators and presets on the right, the preview strip, and
+/// what to use it for.
+fn custom_color_template() -> (Vec<u32>, usize) {
+    let rows = screensaver::CUSTOM_STOPS_MAX as i16;
+    let top = 44;
+    let strip_y = top + rows * 16 + 6;
+    let cy = strip_y + 64;
+    let mut t = Template::new("Custom colour", 330, cy);
+    t.item(
+        0,
+        (10, 6, 310, 18),
+        ID_STATIC,
+        STATIC,
+        "A gradient of your own, darkest first: the solids and background are coloured along it. Type #rrggbb, Pick a colour, or generate one.",
+    );
+    t.item(0, (10, 28, 40, 10), ID_STATIC, STATIC, "Colours:");
+    t.item(CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, (52, 26, 40, 120), ID_CC_COUNT as u16, COMBOBOX, "");
+    for k in 0..rows {
+        let y = top + k * 16;
+        let k = k as i32;
+        // an empty static painted in the stop's colour (WM_CTLCOLORSTATIC)
+        t.item(SS_NOTIFY | WS_BORDER, (10, y, 26, 12), (ID_CC_SWATCH + k) as u16, STATIC, "");
+        t.item(ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP, (40, y, 52, 12), (ID_CC_HEX + k) as u16, EDIT, "");
+        t.item(BS_PUSHBUTTON | WS_TABSTOP, (96, y, 40, 12), (ID_CC_PICK + k) as u16, BUTTON, "Pick...");
+    }
+    t.item(0, (160, 28, 160, 10), ID_STATIC, STATIC, "Generate from colour 1:");
+    for (k, how) in screensaver::Harmony::ALL.iter().enumerate() {
+        let (x, y) = (160 + (k % 2) as i16 * 82, top + (k / 2) as i16 * 18);
+        t.item(BS_PUSHBUTTON | WS_TABSTOP, (x, y, 78, 14), (ID_CC_GEN + k as i32) as u16, BUTTON, how.label());
+    }
+    let gy = top + 3 * 18;
+    t.item(BS_PUSHBUTTON | WS_TABSTOP, (242, gy - 18, 78, 14), (ID_CC_GEN + 5) as u16, BUTTON, "Re&verse");
+    t.item(0, (160, gy + 8, 160, 10), ID_STATIC, STATIC, "Start from a preset:");
+    t.item(CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, (160, gy + 20, 112, 160), ID_CC_PRESET as u16, COMBOBOX, "");
+    t.item(BS_PUSHBUTTON | WS_TABSTOP, (276, gy + 20, 44, 13), ID_CC_LOAD as u16, BUTTON, "L&oad");
+    // the preview: the gradient sampled in cells
+    let w = 310 / CC_STRIP as i16;
+    for i in 0..CC_STRIP as i16 {
+        t.item(0, (10 + i * w, strip_y, w, 14), (ID_CC_STRIP + i as i32) as u16, STATIC, "");
+    }
+    let uy = strip_y + 20;
+    t.item(0, (10, uy + 1, 36, 10), ID_STATIC, STATIC, "Use for:");
+    t.item(BS_AUTOCHECKBOX | WS_TABSTOP, (48, uy, 90, 10), ID_CC_USE_SOLIDS as u16, BUTTON, "&Solids (Colour)");
+    t.item(BS_AUTOCHECKBOX | WS_TABSTOP, (140, uy, 90, 10), ID_CC_USE_BG as u16, BUTTON, "&Background");
+    t.item(0, (10, uy + 13, 200, 20), ID_CC_NOTE as u16, STATIC, "");
+    t.item(BS_DEFPUSHBUTTON | WS_TABSTOP, (210, cy - 20, 55, 14), IDOK as u16, BUTTON, "OK");
+    t.item(BS_PUSHBUTTON | WS_TABSTOP, (268, cy - 20, 55, 14), IDCANCEL as u16, BUTTON, "Cancel");
+    let n = t.count();
+    (t.finish(), n)
+}
+
+/// Show the working stops in the dialog: the count, each row's hex text
+/// (unused rows greyed out) and the swatches and preview repainted.
+unsafe fn cc_show(h: HWND, with_text: bool) {
+    let (stops, n) = CC.with(|cc| (cc.borrow().stops, cc.borrow().count));
+    // SAFETY: control ids from the custom colour template.
+    unsafe {
+        SendDlgItemMessageW(h, ID_CC_COUNT, CB_SETCURSEL, n - 2, 0);
+        for (k, c) in stops.iter().enumerate() {
+            let k32 = k as i32;
+            if with_text {
+                SetDlgItemTextW(h, ID_CC_HEX + k32, wide(&format!("#{c:06x}")).as_ptr());
+            }
+            let on = (k < n) as i32;
+            for id in [ID_CC_HEX, ID_CC_PICK, ID_CC_SWATCH] {
+                EnableWindow(GetDlgItem(h, id + k32), on);
+            }
+            InvalidateRect(GetDlgItem(h, ID_CC_SWATCH + k32), std::ptr::null(), 1);
+        }
+        for i in 0..CC_STRIP as i32 {
+            InvalidateRect(GetDlgItem(h, ID_CC_STRIP + i), std::ptr::null(), 1);
+        }
+    }
+}
+
+/// Note under the Use for boxes: what a Random start means for them.
+unsafe fn cc_note(h: HWND) {
+    let random = UI.with(|u| u.borrow().random_look);
+    let text = if random {
+        "Random start is on: each run picks its own colours, so this gradient shows only once it is off."
+    } else {
+        ""
+    };
+    // SAFETY: control id from the custom colour template.
+    unsafe { SetDlgItemTextW(h, ID_CC_NOTE, wide(text).as_ptr()) };
+}
+
+/// # Safety
+/// Called by the dialog manager with a valid dialog window handle.
+unsafe extern "system" fn custom_color_dialog(h: HWND, msg: u32, w: usize, l: isize) -> isize {
+    // SAFETY (whole fn): `h` is our dialog; control ids come from our template.
+    unsafe {
+        match msg {
+            WM_INITDIALOG => {
+                for n in 2..=screensaver::CUSTOM_STOPS_MAX {
+                    SendDlgItemMessageW(h, ID_CC_COUNT, CB_ADDSTRING, 0, wide(&n.to_string()).as_ptr() as isize);
+                }
+                for (id, _, _) in crate::color::PRESETS {
+                    SendDlgItemMessageW(h, ID_CC_PRESET, CB_ADDSTRING, 0, wide(&capitalise(id)).as_ptr() as isize);
+                }
+                SendDlgItemMessageW(h, ID_CC_PRESET, CB_SETCURSEL, 0, 0);
+                for k in 0..screensaver::CUSTOM_STOPS_MAX as i32 {
+                    SendDlgItemMessageW(h, ID_CC_HEX + k, EM_SETLIMITTEXT, 7, 0);
+                }
+                let main = CC.with(|cc| cc.borrow().main);
+                let colour_custom = general_choices()
+                    .iter()
+                    .position(|c| c.key == "color")
+                    .is_some_and(|i| get_choice(main, ID_COMBO + i as i32, &general_choices()[i]) == screensaver::CUSTOM);
+                let bg_custom = UI.with(|u| u.borrow().panel_values.iter().any(|(k, v)| *k == "bg_color" && v == screensaver::CUSTOM));
+                CheckDlgButton(h, ID_CC_USE_SOLIDS, colour_custom as u32);
+                CheckDlgButton(h, ID_CC_USE_BG, bg_custom as u32);
+                cc_show(h, true);
+                cc_note(h);
+                let mut tips: Vec<(i32, String)> = vec![
+                    (ID_CC_COUNT, "How many colours the gradient has (2 to 8).".into()),
+                    (ID_CC_LOAD, "Replace the colours with the chosen preset's.".into()),
+                    (ID_CC_PRESET, "A built-in gradient to start from (Load).".into()),
+                    (ID_CC_USE_SOLIDS, "Colour the solids with this gradient (sets Colour to Custom).".into()),
+                    (ID_CC_USE_BG, "Colour the floor and sky with this gradient (sets Background colour to Custom).".into()),
+                    (ID_CC_GEN + 5, "Turn the gradient round: the brightest colour first.".into()),
+                ];
+                let gen_tips = [
+                    "Random hues, dark to light.",
+                    "Hues next to colour 1's, dark to light.",
+                    "From colour 1's hue across the colour wheel to its opposite, dark to light.",
+                    "Colour 1's hue and the two a third of the wheel away, dark to light.",
+                    "Colour 1's own shades: from near black through it to near white.",
+                ];
+                tips.extend(gen_tips.iter().enumerate().map(|(k, t)| (ID_CC_GEN + k as i32, t.to_string())));
+                for k in 0..screensaver::CUSTOM_STOPS_MAX as i32 {
+                    tips.push((ID_CC_HEX + k, "This colour as #rrggbb (or #rgb).".into()));
+                    tips.push((ID_CC_PICK + k, "Choose this colour in the colour picker.".into()));
+                    tips.push((ID_CC_SWATCH + k, "This colour; click it to choose another.".into()));
+                }
+                add_tips(h, &tips);
+                1
+            }
+            WM_CTLCOLORSTATIC => {
+                let id = GetDlgCtrlID(l as HWND);
+                let (stops, n) = CC.with(|cc| (cc.borrow().stops, cc.borrow().count));
+                let c = if (ID_CC_SWATCH..ID_CC_SWATCH + n as i32).contains(&id) {
+                    Some(stops[(id - ID_CC_SWATCH) as usize])
+                } else if (ID_CC_STRIP..ID_CC_STRIP + CC_STRIP as i32).contains(&id) {
+                    let t = (id - ID_CC_STRIP) as f32 / (CC_STRIP - 1) as f32;
+                    Some(cc_gradient().sample(t, 1.0))
+                } else {
+                    None
+                };
+                match c {
+                    Some(c) => brush(c),
+                    None => 0,
+                }
+            }
+            WM_DESTROY => {
+                CC.with(|cc| {
+                    for (_, b) in cc.borrow_mut().brushes.drain(..) {
+                        DeleteObject(b);
+                    }
+                });
+                0
+            }
+            WM_COMMAND => {
+                let (id, code) = ((w & 0xFFFF) as i32, (w >> 16) & 0xFFFF);
+                let max = screensaver::CUSTOM_STOPS_MAX as i32;
+                match id {
+                    ID_CC_COUNT if code == CBN_SELCHANGE => {
+                        let n = SendDlgItemMessageW(h, ID_CC_COUNT, CB_GETCURSEL, 0, 0).max(0) as usize + 2;
+                        CC.with(|cc| cc.borrow_mut().count = n.min(max as usize));
+                        cc_show(h, false);
+                        1
+                    }
+                    _ if (ID_CC_HEX..ID_CC_HEX + max).contains(&id) && code == EN_CHANGE => {
+                        if let Some(c) = screensaver::parse_hex_color(&dlg_text(h, id)) {
+                            CC.with(|cc| cc.borrow_mut().stops[(id - ID_CC_HEX) as usize] = c);
+                            cc_show(h, false);
+                        }
+                        1
+                    }
+                    _ if ((ID_CC_PICK..ID_CC_PICK + max).contains(&id) || (ID_CC_SWATCH..ID_CC_SWATCH + max).contains(&id))
+                        && code == BN_CLICKED =>
+                    {
+                        let k = if id >= ID_CC_PICK { id - ID_CC_PICK } else { id - ID_CC_SWATCH } as usize;
+                        let mut picker = CC.with(|cc| cc.borrow().picker);
+                        let mut cc = ChooseColor {
+                            size: std::mem::size_of::<ChooseColor>() as u32,
+                            owner: h,
+                            instance: 0,
+                            result: colorref(CC.with(|c| c.borrow().stops[k])),
+                            custom: picker.as_mut_ptr(),
+                            flags: CC_RGBINIT | CC_FULLOPEN,
+                            data: 0,
+                            hook: 0,
+                            template: std::ptr::null(),
+                        };
+                        if ChooseColorW(&mut cc) != 0 {
+                            // COLORREF back to 0xRRGGBB (the swap is its own inverse)
+                            let c = colorref(cc.result);
+                            CC.with(|s| {
+                                let mut s = s.borrow_mut();
+                                s.stops[k] = c;
+                                s.picker = picker;
+                            });
+                            SetDlgItemTextW(h, ID_CC_HEX + k as i32, wide(&format!("#{c:06x}")).as_ptr());
+                            cc_show(h, false);
+                        }
+                        1
+                    }
+                    _ if (ID_CC_GEN..ID_CC_GEN + 6).contains(&id) => {
+                        CC.with(|cc| {
+                            let mut cc = cc.borrow_mut();
+                            let n = cc.count;
+                            if id == ID_CC_GEN + 5 {
+                                cc.stops[..n].reverse();
+                            } else {
+                                let how = screensaver::Harmony::ALL[(id - ID_CC_GEN) as usize];
+                                let g = screensaver::generate_gradient(how, cc.stops[0], n, &mut fastrand::Rng::new());
+                                cc.stops[..n].copy_from_slice(&g);
+                            }
+                        });
+                        cc_show(h, true);
+                        1
+                    }
+                    ID_CC_LOAD => {
+                        let i = SendDlgItemMessageW(h, ID_CC_PRESET, CB_GETCURSEL, 0, 0).max(0) as usize;
+                        if let Some((_, _, stops)) = crate::color::PRESETS.get(i) {
+                            CC.with(|cc| {
+                                let mut cc = cc.borrow_mut();
+                                let n = stops.len().min(max as usize);
+                                cc.stops[..n].copy_from_slice(&stops[..n]);
+                                cc.count = n;
+                            });
+                            cc_show(h, true);
+                        }
+                        1
+                    }
+                    IDOK => {
+                        // every used row must hold a colour
+                        let n = CC.with(|cc| cc.borrow().count);
+                        if let Some(k) = (0..n).find(|&k| screensaver::parse_hex_color(&dlg_text(h, ID_CC_HEX + k as i32)).is_none()) {
+                            let why = format!("Colour {} is not a colour: type it as #rrggbb (e.g. #ff8800) or #rgb.", k + 1);
+                            MessageBoxW(h, wide(&why).as_ptr(), wide("platomon").as_ptr(), MB_ICONWARNING);
+                            return 1;
+                        }
+                        let (stops, main) = CC.with(|cc| (cc.borrow().stops[..n].to_vec(), cc.borrow().main));
+                        let (solids, bg) = (IsDlgButtonChecked(h, ID_CC_USE_SOLIDS) == 1, IsDlgButtonChecked(h, ID_CC_USE_BG) == 1);
+                        UI.with(|u| {
+                            let mut u = u.borrow_mut();
+                            u.panel_values.retain(|(k, _)| *k != screensaver::CUSTOM_GRADIENT_KEY);
+                            u.panel_values.push((screensaver::CUSTOM_GRADIENT_KEY, screensaver::gradient_text(&stops)));
+                            // the background colour: custom, or back to auto if it was
+                            let was = u.panel_values.iter().any(|(k, v)| *k == "bg_color" && v == screensaver::CUSTOM);
+                            if bg || was {
+                                u.panel_values.retain(|(k, _)| *k != "bg_color");
+                                u.panel_values.push(("bg_color", if bg { screensaver::CUSTOM } else { "auto" }.to_string()));
+                            }
+                        });
+                        // the solids' colour in the main dialog: custom, or back to the default if it was
+                        if let Some(i) = general_choices().iter().position(|c| c.key == "color") {
+                            let c = &general_choices()[i];
+                            let was = get_choice(main, ID_COMBO + i as i32, c) == screensaver::CUSTOM;
+                            if solids || was {
+                                let v = if solids { screensaver::CUSTOM.to_string() } else { ScrSettings::default().color };
+                                set_choice(main, ID_COMBO + i as i32, ID_VALUE + i as i32, c, &v);
+                            }
+                        }
+                        EndDialog(h, 1);
+                        1
+                    }
+                    IDCANCEL => {
+                        EndDialog(h, 0);
+                        1
+                    }
+                    _ => 0,
+                }
+            }
+            _ => 0,
+        }
+    }
+}
+
+/// A name capitalised for a drop-down: "inferno" → "Inferno".
+fn capitalise(id: &str) -> String {
+    let mut c = id.chars();
+    c.next().map_or_else(String::new, |f| f.to_uppercase().chain(c).collect())
+}
+
+/// Open the Custom colour dialog over the main dialog `h`.
+unsafe fn open_custom_color(h: HWND) {
+    let stops = UI.with(|u| {
+        let u = u.borrow();
+        u.panel_values
+            .iter()
+            .find(|(k, _)| *k == screensaver::CUSTOM_GRADIENT_KEY)
+            .and_then(|(_, v)| screensaver::parse_gradient(v))
+            .unwrap_or_else(|| screensaver::CUSTOM_GRADIENT_DEFAULT.to_vec())
+    });
+    // SAFETY: control id from our template.
+    let random = unsafe { IsDlgButtonChecked(h, ID_RANDOM) } == 1;
+    UI.with(|u| u.borrow_mut().random_look = random);
+    CC.with(|cc| {
+        let mut cc = cc.borrow_mut();
+        // unused rows start as the gradient's own colours further along
+        let g = crate::color::Gradient::from_stops(&stops);
+        for (k, s) in cc.stops.iter_mut().enumerate() {
+            *s = stops.get(k).copied().unwrap_or_else(|| g.sample(k as f32 / 7.0, 1.0));
+        }
+        cc.count = stops.len();
+        cc.main = h;
+    });
+    let (tpl, _) = custom_color_template();
+    // SAFETY: a valid DWORD-aligned template; the procedure matches DLGPROC.
+    let ok = unsafe { DialogBoxIndirectParamW(GetModuleHandleW(std::ptr::null()), tpl.as_ptr() as *const u16, h, Some(custom_color_dialog), 0) } == 1;
+    if ok {
+        tuning_label(h);
+        status(h, "Custom colour changed (saved with OK).");
+    }
+}
+
 // ------------------------------------------------------------------ metrics dialog
 
 /// A floor pattern's name as the drop-down shows it.
 fn pattern_name(p: Pattern) -> String {
-    let id = p.id();
-    let mut c = id.chars();
-    c.next().map_or_else(String::new, |f| f.to_uppercase().chain(c).collect())
+    capitalise(p.id())
 }
 
 /// The Metrics button's text with nothing counted yet.

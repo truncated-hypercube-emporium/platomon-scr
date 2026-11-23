@@ -11,9 +11,7 @@ use std::str::FromStr;
 pub const LUM_REF: f32 = 5.0;
 pub const ALBEDO_AT_REF: f32 = 0.15;
 pub const LUM_MAX: f32 = 10.0;
-/// Approximate angle one terminal cell subtends (≈ 50° over 120 columns), for
-/// fading patterns to their mean once tiles shrink below a cell.
-const PIXEL_ANGLE: f32 = 0.0075;
+
 
 /// Mean albedo for a luminosity value (linear: 5 → 0.15, 0 → off).
 pub fn albedo_for_lum(lum: f32) -> f32 {
@@ -525,13 +523,15 @@ impl Ground {
         (d - self.frame_offset) * self.inv_scale
     }
 
-    /// Albedo at ground point `p`, hit at distance `t` (for anti-alias fading).
+    /// Albedo at ground point `p`, where a pixel covers a patch `footprint`
+    /// across (world units): the pattern fades to its mean tone as its tiles
+    /// shrink toward a pixel, instead of aliasing.
     #[inline]
-    pub fn albedo(&self, p: Vec3A, t: f32) -> f32 {
+    pub fn albedo(&self, p: Vec3A, footprint: f32) -> f32 {
         if self.pattern == Pattern::Solid || self.contrast <= 0.0 {
             return self.base;
         }
-        let fade = (1.0 - 1.5 * t * PIXEL_ANGLE * self.inv_scale).clamp(0.0, 1.0);
+        let fade = (1.0 - 1.5 * footprint * self.inv_scale).clamp(0.0, 1.0);
         if fade <= 0.0 {
             return self.base;
         }
@@ -783,20 +783,20 @@ mod tests {
         assert!(!ground(GroundParams { lum: 0.0, ..Default::default() }).enabled);
         let g = ground(GroundParams::default());
         assert!(g.enabled);
-        assert_eq!(g.albedo(Vec3A::new(3.3, 0.0, -7.1), 4.0), 0.15, "solid = original look");
+        assert_eq!(g.albedo(Vec3A::new(3.3, 0.0, -7.1), 0.03), 0.15, "solid = original look");
     }
 
     #[test]
     fn checker_alternates_and_keeps_mean() {
         let g = ground(GroundParams { pattern: Pattern::Checker, contrast: 0.5, ..Default::default() });
-        let a = g.albedo(Vec3A::new(0.5, 0.0, 0.5), 1.0);
-        let b = g.albedo(Vec3A::new(1.5, 0.0, 0.5), 1.0);
-        let c = g.albedo(Vec3A::new(1.5, 0.0, 1.5), 1.0);
+        let a = g.albedo(Vec3A::new(0.5, 0.0, 0.5), 0.0075);
+        let b = g.albedo(Vec3A::new(1.5, 0.0, 0.5), 0.0075);
+        let c = g.albedo(Vec3A::new(1.5, 0.0, 1.5), 0.0075);
         assert!(a > b && (a - c).abs() < 1e-6, "{a} {b} {c}");
         assert!(((a + b) / 2.0 - 0.15).abs() < 1e-3, "mean equals luminosity");
         // contrast 0 = uniform; far away fades to the mean
         let flat = ground(GroundParams { pattern: Pattern::Checker, contrast: 0.0, ..Default::default() });
-        assert_eq!(flat.albedo(Vec3A::new(0.5, 0.0, 0.5), 1.0), 0.15);
+        assert_eq!(flat.albedo(Vec3A::new(0.5, 0.0, 0.5), 0.0075), 0.15);
         assert_eq!(g.albedo(Vec3A::new(0.5, 0.0, 0.5), 1000.0), 0.15);
     }
 
@@ -881,16 +881,16 @@ mod tests {
         let pt = Vec3A::new(0.37, 0.0, -0.61);
         let mut q = ground(p(Pattern::Quasicrystal));
         let mut c = ground(p(Pattern::Checker));
-        let (q0, c0) = (q.albedo(pt, 1.0), c.albedo(pt, 1.0));
+        let (q0, c0) = (q.albedo(pt, 0.0075), c.albedo(pt, 0.0075));
         q.advance(1.3);
         c.advance(1.3);
-        assert_ne!(q.albedo(pt, 1.0), q0, "quasicrystal moves");
-        assert_eq!(c.albedo(pt, 1.0), c0, "checker doesn't");
+        assert_ne!(q.albedo(pt, 0.0075), q0, "quasicrystal moves");
+        assert_eq!(c.albedo(pt, 0.0075), c0, "checker doesn't");
         let still = GroundParams { wave_speed: 0.0, ..p(Pattern::Quasicrystal) };
         let mut s = ground(still);
-        let s0 = s.albedo(pt, 1.0);
+        let s0 = s.albedo(pt, 0.0075);
         s.advance(5.0);
-        assert_eq!(s.albedo(pt, 1.0), s0, "speed 0 holds still");
+        assert_eq!(s.albedo(pt, 0.0075), s0, "speed 0 holds still");
         assert_eq!("Quasicrystal".parse::<Pattern>().unwrap(), Pattern::Quasicrystal);
     }
 

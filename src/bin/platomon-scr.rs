@@ -781,7 +781,7 @@ mod win {
     enum Next {
         Quit,
         /// A preview's settings changed: run again with these.
-        Reload(ScrSettings),
+        Reload(Box<ScrSettings>),
     }
 
     /// Run `plan` on a `win`-sized picture (`full`: the display, for the
@@ -795,7 +795,7 @@ mod win {
             match run_with(&mut screen, &plan, seed, kind, watch.as_mut())? {
                 Next::Quit => return Ok(()),
                 Next::Reload(s) => {
-                    plan = Plan { config: screensaver::plan_config(full, seed, &s), settings: s, ..plan };
+                    plan = Plan { config: screensaver::plan_config(full, seed, &s), settings: *s, ..plan };
                     screen.set_shift((0, 0));
                 }
             }
@@ -919,7 +919,7 @@ mod win {
                 return Ok(Next::Quit);
             }
             if let Some(s) = watch.as_mut().and_then(|w| w.poll()).filter(|s| *s != plan.settings) {
-                return Ok(Next::Reload(s));
+                return Ok(Next::Reload(Box::new(s)));
             }
             if REPAINT.swap(false, Ordering::SeqCst) {
                 screen.all_dirty = true;

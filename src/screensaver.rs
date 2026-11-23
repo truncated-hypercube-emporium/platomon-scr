@@ -501,6 +501,9 @@ pub struct ScrSettings {
     /// Background colouring, independent of the solids: `auto`, `off`,
     /// `match` or a gradient preset id.
     pub bg_color: String,
+    /// The Custom colour dialog's gradient: 2..=[`CUSTOM_STOPS_MAX`] colours
+    /// (0xRRGGBB), used where the colour or background colour is `custom`.
+    pub custom_gradient: Vec<u32>,
     pub bg_pattern: Pattern,
     pub bg_lum: u8,
     /// Quasicrystal background: plane waves (its rotational symmetry).
@@ -591,6 +594,7 @@ impl Default for ScrSettings {
             layout: Layout::Rings,
             camera: CameraMode::Orbit,
             color: "inferno".into(),
+            custom_gradient: CUSTOM_GRADIENT_DEFAULT.to_vec(),
             color_by: ColorBy::Lum,
             bg_color: color::BG_COLOR_DEFAULT.into(),
             bg_pattern: Pattern::Checker,
@@ -725,7 +729,7 @@ pub const TUNABLES: [Tunable; 37] = [
     tunable!(Tuning, "focus_zoom", "Focus zoom", 0.0, 1.0, 0.05, "Focus camera: 0 only turns toward the busiest solid, 1 comes in to a close-up."),
     tunable!(Tuning, "focus_tau", "Focus glide (s)", 0.25, 5.0, 0.25, "Focus camera: how long its glides take (smoothing time constant)."),
     tunable!(Background, "bg_contrast", "Floor contrast", 0.0, 1.0, 0.05, "How far the floor pattern's tones spread around its brightness."),
-    tunable!(Background, "bg_scale", "Floor tile size", 0.3, 4.0, 0.1, "Size of the floor pattern's tiles (the quasicrystal's wavelength), in world units."),
+    tunable!(Background, "bg_scale", "Floor tile size", 0.3, 25.0, 0.1, "Size of the floor pattern's tiles (the quasicrystal's wavelength), in world units."),
     tunable!(Background, "bg_sway", "Floor sway", 0.0, 2.0, 0.05, "How far the floor pattern sways in a slow circle; 0 holds it still."),
     tunable!(Background, "bg_sway_period", "Sway period (s)", 3.0, 30.0, 1.0, "Seconds per floor sway cycle."),
     tunable!(Background, "bg_rotate_period", "Floor turn period (s)", 10.0, 180.0, 5.0, "Seconds per turn when the floor pattern rotates."),
@@ -756,7 +760,7 @@ pub const TUNABLES: [Tunable; 37] = [
     tunable!(Rendering, "spp", "Samples per cell", 1.0, 4.0, 1.0, "Light paths traced per character cell: more is smoother and less noisy, and costs that many times the work."),
     tunable!(Rendering, "bounces", "Light bounces", 0.0, 4.0, 1.0, "Indirect bounces after the first hit: 0 gives hard direct light only, more fills shadows with reflected light at more cost."),
     tunable!(Rendering, "max_steps", "March steps", 16.0, 256.0, 8.0, "Most sphere-tracing steps per ray: fewer is faster but can miss thin edges and grazing surfaces."),
-    tunable!(Rendering, "max_dist", "Render distance", 20.0, 200.0, 10.0, "How far rays travel before they count as sky, in world units; the extended floor multiplies it."),
+    tunable!(Rendering, "max_dist", "Render distance", 20.0, 200.0, 10.0, "How far the floor reaches round the solids, in world units (measured across the floor, so a high camera sees the same floor); the extended floor multiplies it."),
 ];
 
 /// Whether Background options setting `key` does anything with floor
@@ -890,7 +894,8 @@ pub fn help(key: &str) -> &'static str {
         "ordering" => "Which solid takes which place: in metric order, from the simplest solid (fewest edges) to the most complex, the reverse, or shuffled. The first place is the inner ring's front, the inner shell, the line's left end or the stack's bottom.",
         "adaptive" => "When frames run late, render with fewer samples, then fewer bounces, and step back up when there is time again.",
         "camera" => "Static: a fixed overview. Orbit: circles the solids. Focus: glides toward the busiest solid. Tilt: orbits while rising from 20 to 80 degrees and back, pausing half an orbit at each end. Resonance: orbits with three 20-degree rises and falls per turn.",
-        "color" => "The colour gradient, or Off for plain monochrome text.",
+        "color" => "The colour gradient, or Off for plain monochrome text. Custom: the gradient made in the Custom colour dialog.",
+        "custom_color" => "Make a colour gradient of your own: 2 to 8 colours, picked or typed, or generated (random, harmonies, a single hue's shades) or started from a preset, and use it for the solids and/or the background.",
         "color_by" => "What picks each solid's colour. Brightness: how lit the cell is. Load: the solid's metric. Spin: its spin speed and direction seen from the camera. Sound: the loudness of its own frequency band (bass on simple solids, treble on complex ones).",
         "bg_color" => "Colouring of the floor and sky, separate from the solids. Auto: by brightness when the solids are. Off: uncoloured. Match: the solids' gradient by brightness. Or a gradient of its own.",
         "bg_pattern" => "The floor's pattern. Quasicrystal: a flowing, never-repeating wave pattern. Rain: raindrops landing at random, each sending out spreading rings of ripples. Ocean: wind-driven waves, the long ones faster and taller. Julia: a Julia set fractal slowly changing shape. Carpet: the Sierpinski carpet fractal. Clouds: drifting fractal noise. Their settings are in Background options.",
@@ -983,6 +988,133 @@ fn capitalized(s: &str) -> String {
     c.next().map_or_else(String::new, |f| f.to_uppercase().chain(c).collect())
 }
 
+/// The Colour and Background colour setting that means the custom gradient.
+pub const CUSTOM: &str = "custom";
+/// INI key of the custom gradient (`#rrggbb:#rrggbb:...`).
+pub const CUSTOM_GRADIENT_KEY: &str = "custom_gradient";
+/// Colours a custom gradient can have.
+pub const CUSTOM_STOPS_MAX: usize = 8;
+/// The custom gradient before one is made: night blue to pale gold.
+pub const CUSTOM_GRADIENT_DEFAULT: [u32; 4] = [0x0b1d3a, 0x2f6db5, 0x7ad3e8, 0xf4f1c9];
+
+/// A gradient's colours as stored: `#rrggbb:#rrggbb:...`.
+pub fn gradient_text(stops: &[u32]) -> String {
+    stops.iter().map(|c| format!("#{:06x}", c & 0xff_ffff)).collect::<Vec<_>>().join(":")
+}
+
+/// A stored custom gradient: 2..=[`CUSTOM_STOPS_MAX`] hex colours
+/// (`#rrggbb` or `rrggbb`, separated by `:` `,` `;` `/` or spaces).
+pub fn parse_gradient(v: &str) -> Option<Vec<u32>> {
+    let v = v.trim().trim_matches('"');
+    let stops: Option<Vec<u32>> = v.split([',', ':', ';', '/', ' ']).filter(|p| !p.is_empty()).map(parse_hex_color).collect();
+    stops.filter(|s| (2..=CUSTOM_STOPS_MAX).contains(&s.len()))
+}
+
+/// `#rrggbb`, `rrggbb` or `#rgb` as 0xRRGGBB.
+pub fn parse_hex_color(s: &str) -> Option<u32> {
+    let h = s.trim().trim_start_matches('#');
+    match h.len() {
+        6 => u32::from_str_radix(h, 16).ok(),
+        3 => {
+            let v = u32::from_str_radix(h, 16).ok()?;
+            let (r, g, b) = ((v >> 8) & 0xf, (v >> 4) & 0xf, v & 0xf);
+            Some(((r * 17) << 16) | ((g * 17) << 8) | (b * 17))
+        }
+        _ => None,
+    }
+}
+
+/// Ways the Custom colour dialog generates a gradient.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Harmony {
+    /// Random hues, dark to light.
+    Random,
+    /// Neighbouring hues round the first colour's, dark to light.
+    Analogous,
+    /// From the first colour's hue across to its opposite.
+    Complementary,
+    /// The first colour's hue and the two a third of the wheel away.
+    Triadic,
+    /// The first colour's own shades, black through it to white.
+    Shades,
+}
+
+impl Harmony {
+    pub const ALL: [Harmony; 5] = [Harmony::Random, Harmony::Analogous, Harmony::Complementary, Harmony::Triadic, Harmony::Shades];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Harmony::Random => "&Random",
+            Harmony::Analogous => "&Analogous",
+            Harmony::Complementary => "Co&mplementary",
+            Harmony::Triadic => "&Triadic",
+            Harmony::Shades => "S&hades",
+        }
+    }
+}
+
+/// 0xRRGGBB as (hue 0..1, saturation, lightness).
+pub fn rgb_to_hsl(c: u32) -> (f32, f32, f32) {
+    let [r, g, b] = [(c >> 16) & 0xff, (c >> 8) & 0xff, c & 0xff].map(|v| v as f32 / 255.0);
+    let (hi, lo) = (r.max(g).max(b), r.min(g).min(b));
+    let l = (hi + lo) / 2.0;
+    let d = hi - lo;
+    if d < 1e-6 {
+        return (0.0, 0.0, l);
+    }
+    let s = d / (1.0 - (2.0 * l - 1.0).abs()).max(1e-6);
+    let h = if hi == r {
+        ((g - b) / d).rem_euclid(6.0)
+    } else if hi == g {
+        (b - r) / d + 2.0
+    } else {
+        (r - g) / d + 4.0
+    } / 6.0;
+    (h, s.min(1.0), l)
+}
+
+/// (hue 0..1 (wraps), saturation, lightness) as 0xRRGGBB.
+pub fn hsl_to_rgb(h: f32, s: f32, l: f32) -> u32 {
+    let (s, l) = (s.clamp(0.0, 1.0), l.clamp(0.0, 1.0));
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let hp = h.rem_euclid(1.0) * 6.0;
+    let x = c * (1.0 - (hp.rem_euclid(2.0) - 1.0).abs());
+    let (r, g, b) = match hp as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = l - c / 2.0;
+    let to = |v: f32| (((v + m).clamp(0.0, 1.0)) * 255.0).round() as u32;
+    (to(r) << 16) | (to(g) << 8) | to(b)
+}
+
+/// A gradient of `n` colours made `how`, from `first` (the first colour
+/// now; Random ignores it). Each runs dark to light, so it reads as a
+/// brightness ramp too.
+pub fn generate_gradient(how: Harmony, first: u32, n: usize, rng: &mut fastrand::Rng) -> Vec<u32> {
+    let n = n.clamp(2, CUSTOM_STOPS_MAX);
+    let (h0, s0, _) = rgb_to_hsl(first);
+    let s0 = if s0 < 0.15 { 0.65 } else { s0 };
+    let at = |k: usize| k as f32 / (n - 1) as f32;
+    // dark to light, never quite black or white
+    let light = |k: usize| 0.08 + 0.82 * at(k);
+    match how {
+        Harmony::Random => {
+            let (base, step) = (rng.f32(), (rng.f32() - 0.5) * 0.5);
+            let sat = 0.5 + 0.4 * rng.f32();
+            (0..n).map(|k| hsl_to_rgb(base + step * k as f32 + 0.04 * (rng.f32() - 0.5), sat, light(k))).collect()
+        }
+        Harmony::Analogous => (0..n).map(|k| hsl_to_rgb(h0 + (at(k) - 0.5) / 6.0, s0, light(k))).collect(),
+        Harmony::Complementary => (0..n).map(|k| hsl_to_rgb(h0 + 0.5 * at(k), s0, light(k))).collect(),
+        Harmony::Triadic => (0..n).map(|k| hsl_to_rgb(h0 + (k % 3) as f32 / 3.0, s0, light(k))).collect(),
+        Harmony::Shades => (0..n).map(|k| hsl_to_rgb(h0, s0, 0.03 + 0.94 * at(k))).collect(),
+    }
+}
+
 /// INI keys of the Metrics dialog's solids, in order (unused ones unset).
 pub const SOLID_KEYS: [&str; MAX_SOLIDS] =
     ["solid1", "solid2", "solid3", "solid4", "solid5", "solid6", "solid7", "solid8", "solid9", "solid10", "solid11", "solid12"];
@@ -1033,12 +1165,14 @@ pub fn choices() -> Vec<Choice> {
     let on_off = || vec![opt("on", "On"), opt("off", "Off")];
     let mut colors = vec![opt("off", "Off (monochrome)")];
     colors.extend(color::PRESETS.iter().map(|(id, _, _)| opt(id, &capitalized(id))));
+    colors.push(opt(CUSTOM, "Custom (the Custom colour dialog's)"));
     let mut bg_colors = vec![
         opt("auto", "Auto (by brightness when the solids are)"),
         opt("off", "Off (uncoloured)"),
         opt("match", "Match (the solids' gradient, by brightness)"),
     ];
     bg_colors.extend(color::PRESETS.iter().map(|(id, _, _)| opt(id, &capitalized(id))));
+    bg_colors.push(opt(CUSTOM, "Custom (the Custom colour dialog's)"));
     let patterns = Pattern::ALL.iter().map(|p| opt(p.id(), &capitalized(p.id()))).collect();
     let lums = (0..=10).map(|l| opt(&l.to_string(), &if l == 0 { "0 (no floor)".into() } else { l.to_string() })).collect();
     let waves = (WAVES_CHOICE_MIN..=WAVES_CHOICE_MAX).map(|n| opt(&n.to_string(), &format!("{n}-fold"))).collect();
@@ -1213,6 +1347,7 @@ impl ScrSettings {
             ("color", self.color.clone()),
             ("color_by", self.color_by.id().into()),
             ("bg_color", self.bg_color.clone()),
+            (CUSTOM_GRADIENT_KEY, gradient_text(&self.custom_gradient)),
             ("bg_pattern", self.bg_pattern.id().into()),
             ("bg_lum", self.bg_lum.to_string()),
             ("bg_waves", self.bg_waves.to_string()),
@@ -1276,11 +1411,11 @@ impl ScrSettings {
             layout: val("layout").and_then(|v| v.parse().ok()).unwrap_or(d.layout),
             camera: val("camera").and_then(|v| v.parse().ok()).unwrap_or(d.camera),
             color: val("color")
-                .filter(|v| v == "off" || color::PRESETS.iter().any(|(id, _, _)| id == v))
+                .filter(|v| v == "off" || v == CUSTOM || color::PRESETS.iter().any(|(id, _, _)| id == v))
                 .unwrap_or(d.color.clone()),
             color_by: val("color_by").and_then(|v| v.parse().ok()).unwrap_or(d.color_by),
             bg_color: val("bg_color")
-                .filter(|v| ["auto", "off", "match"].contains(&v.as_str()) || color::PRESETS.iter().any(|(id, _, _)| id == v))
+                .filter(|v| ["auto", "off", "match", CUSTOM].contains(&v.as_str()) || color::PRESETS.iter().any(|(id, _, _)| id == v))
                 .unwrap_or(d.bg_color.clone()),
             bg_pattern: val("bg_pattern")
                 .and_then(|v| Pattern::ALL.into_iter().find(|p| p.id() == v))
@@ -1291,6 +1426,7 @@ impl ScrSettings {
                 .and_then(|v| v.parse::<f32>().ok())
                 .filter(|v| v.is_finite() && (-20.0..=20.0).contains(v))
                 .unwrap_or(d.bg_wave_speed),
+            custom_gradient: get(CUSTOM_GRADIENT_KEY).and_then(|v| parse_gradient(&v)).unwrap_or(d.custom_gradient.clone()),
             wireframe: flag("wireframe", d.wireframe),
             stats: flag("stats", d.stats),
             fps_invert: flag("fps_invert", d.fps_invert),
@@ -1355,6 +1491,12 @@ impl ScrSettings {
         }
     }
 
+    /// A colour setting as the config takes it: `custom` becomes the
+    /// custom gradient's colours.
+    fn color_spec(&self, v: &str) -> String {
+        if v == CUSTOM { gradient_text(&self.custom_gradient) } else { v.to_string() }
+    }
+
     /// The solids (always), and unless the look is random, the chosen look
     /// in place of the random one.
     pub fn apply(&self, c: &mut Config) {
@@ -1364,9 +1506,9 @@ impl ScrSettings {
         }
         c.layout = self.layout;
         c.camera = self.camera;
-        c.color = self.color.clone();
+        c.color = self.color_spec(&self.color);
         c.color_by = self.color_by;
-        c.bg_color = self.bg_color.clone();
+        c.bg_color = self.color_spec(&self.bg_color);
         c.bg_pattern = self.bg_pattern;
         c.bg_lum = self.bg_lum as f32;
         c.bg_waves = self.bg_waves;
@@ -1658,6 +1800,7 @@ mod tests {
             color: "viridis".into(),
             color_by: ColorBy::Spin,
             bg_color: "ice".into(),
+            custom_gradient: vec![0x102030, 0xffeedd, 0x00ff80],
             bg_pattern: Pattern::Hex,
             bg_lum: 0,
             bg_waves: 5,
@@ -1731,6 +1874,50 @@ mod tests {
         ]));
         assert_eq!((j.layout, j.color.as_str(), j.bg_lum, j.fps_cap, j.budget_pct), (d.layout, "inferno", 2, None, 15));
         assert_eq!((j.shift_min_frames, j.shift_max_frames, j.wireframe, j.random), (500, 500, true, false));
+    }
+
+    #[test]
+    fn custom_gradient_round_trips_and_colours_the_run() {
+        assert_eq!(parse_gradient("#0b1d3a:2f6db5, #FFF"), Some(vec![0x0b1d3a, 0x2f6db5, 0xffffff]));
+        assert_eq!(parse_gradient("\"#000:#fff\""), Some(vec![0, 0xffffff]), "quotes dropped");
+        for junk in ["#000", "", "#12345:#000", "#000:#111:#222:#333:#444:#555:#666:#777:#888"] {
+            assert_eq!(parse_gradient(junk), None, "{junk:?}");
+        }
+        assert_eq!(gradient_text(&[0x0b1d3a, 0xff]), "#0b1d3a:#0000ff");
+        let s = ScrSettings { random: false, color: CUSTOM.into(), bg_color: CUSTOM.into(), custom_gradient: vec![0x101010, 0xff8800], ..ScrSettings::default() };
+        let pairs = s.to_pairs();
+        let back = ScrSettings::from_lookup(|k| pairs.iter().find(|(pk, _)| *pk == k).map(|(_, v)| v.clone()));
+        assert_eq!((back.color.as_str(), back.bg_color.as_str(), &back.custom_gradient), (CUSTOM, CUSTOM, &s.custom_gradient));
+        let c = plan_config(&WQHD, 3, &s);
+        assert_eq!((c.color.as_str(), c.bg_color.as_str()), ("#101010:#ff8800", "#101010:#ff8800"));
+        assert!(c.color_map().unwrap().is_some(), "the renderer takes it");
+        // a junk stored gradient falls back to the default one
+        assert_eq!(ScrSettings::from_lookup(lookup(&[(CUSTOM_GRADIENT_KEY, "nope")])).custom_gradient, CUSTOM_GRADIENT_DEFAULT);
+    }
+
+    #[test]
+    fn generated_gradients_run_dark_to_light_and_keep_the_hue() {
+        let lum = |c: u32| rgb_to_hsl(c).2;
+        let mut rng = fastrand::Rng::with_seed(9);
+        for how in Harmony::ALL {
+            for n in [2, 5, 8] {
+                let g = generate_gradient(how, 0x2f6db5, n, &mut rng);
+                assert_eq!(g.len(), n);
+                assert!(g.windows(2).all(|w| lum(w[0]) < lum(w[1]) + 0.02), "{how:?} {n}: {:x?}", g);
+            }
+        }
+        let base = rgb_to_hsl(0x2f6db5).0;
+        for c in generate_gradient(Harmony::Shades, 0x2f6db5, 6, &mut rng).iter().skip(1).take(4) {
+            assert!((rgb_to_hsl(*c).0 - base).abs() < 0.02, "shades keep the hue: {c:06x}");
+        }
+        for c in [0x000000u32, 0xffffff, 0xff0000, 0x00ff80, 0x2f6db5, 0x7f7f7f] {
+            let (h, s, l) = rgb_to_hsl(c);
+            let back = hsl_to_rgb(h, s, l);
+            for sh in [16, 8, 0] {
+                assert!((((c >> sh) & 0xff) as i32 - ((back >> sh) & 0xff) as i32).abs() <= 1, "{c:06x} -> {back:06x}");
+            }
+        }
+        assert_eq!(parse_hex_color("#f80"), Some(0xff8800));
     }
 
     #[test]

@@ -126,6 +126,16 @@ already faded to its mean tone and no solid's shadow reaches, so instead of samp
 tracing shadow rays and bouncing, each far floor point gets the light's direct contribution in
 closed form plus the averaged sky term: about 0–0.4 ms per frame at 640×240 cells.
 
+**Seen from far above.** The floor's reach (`max_dist` in the config file, *Render distance* in the screensaver's Rendering
+dialog; 50 by default, 8x with the extended floor) is a radius round the scene's centre measured across the floor, not a distance along each
+ray, so a camera high above the floor (a large orbit height, the dynamic camera distance backing
+out) sees the same floor as one near it; before, a camera more than 50 away lost the floor and then
+the solids too. Solids are found however far away the camera is. The floor's outer 15% fades into
+the background, so its edge is soft rather than a ragged circle. Patterns fade to their mean tone
+by how much floor each character cell covers: the cell's angle (from the field of view and the
+rendering resolution, so finer text keeps finer tiles) times the distance, stretched at grazing
+angles, which removes the moiré and flicker where tiles shrink below a cell toward the horizon or
+seen from high up.
 ### Dynamic camera distance
 
 `--auto-distance` (*Dynamic camera distance* in the screensaver) keeps every solid in frame by
@@ -644,7 +654,7 @@ drop-downs and above its check boxes, opens the background's settings (the patte
 *Appearance*): *Background colour* (moved here from *Appearance*), *Background luminosity*,
 *Quasicrystal waves* and *Pattern flow* (the speed of every moving pattern: quasicrystal, rain,
 ocean, julia and clouds; Still holds them all; these four are part of the look, greyed out while
-Random start is on), then the sliders moved here from *Tuning*: floor contrast, tile size, sway and
+Random start is on), then the sliders moved here from *Tuning*: floor contrast, tile size (0.3 to 25), sway and
 its period and floor turn period, and new sliders: floor scroll X and Z, and each pattern's own
 settings: *Radial sectors*; for rain *Ripple spacing*, *Drop life* and *Raindrops* (how many drops
 ripple at once, 1–48); for the ocean *Wind direction* and *Wave choppiness*; for julia *Julia shape*
@@ -655,6 +665,17 @@ its waves. With *Random start* on, the pattern is random, so every setting is sh
 hidden for the current pattern keep their values. The sliders work like *Tuning*'s
 (`tune_bg_contrast`, ..., `tune_bg_drops`, `tune_bg_wind`, ...); the button shows how many of its
 settings are set.
+
+**Custom colour.** *Custom colour…*, beside *Background options…*, makes a colour gradient of your
+own: 2 to 8 colours (*Colours*), darkest first, each typed as `#rrggbb` (or `#rgb`) or chosen with
+*Pick…* (or a click on its swatch) in the Windows colour picker, with a preview strip of the
+gradient below. *Generate from colour 1* fills the colours in for you, each dark to light: *Random*
+(random hues), *Analogous* (hues next to colour 1's), *Complementary* (from colour 1's hue across
+to its opposite), *Triadic* (colour 1's hue and the two a third of the wheel away) and *Shades*
+(colour 1 from near black to near white); *Reverse* turns it round, and *Start from a preset*
+*Load*s a built-in gradient to edit. *Use for* sets *Colour* (the solids) and/or *Background
+colour* to *Custom*, which both drop-downs also offer. The gradient is saved as
+`custom_gradient=#rrggbb:#rrggbb:...` and used, like any look setting, with Random start off.
 
 **Tuning.** *Tuning…* opens a dialog of sliders: halo size swing (stepped like the main dialog's
 sliders, saved as a plain key), then numeric values: orbit period and bob, focus zoom and glide,
@@ -807,9 +828,10 @@ ordering=listed        ; listed | simple | complex | random
 orbit_center=cpu       ; orbit layout's centre: cpu | ram | net | disk | size | spin
 adaptive=on            ; adaptive quality
 camera=orbit           ; static | orbit | focus | tilt | resonance
-color=inferno          ; off | inferno | viridis | ... (see --list gradients)
+color=inferno          ; off | inferno | viridis | ... (see --list gradients) | custom
+custom_gradient=#0b1d3a:#2f6db5:#7ad3e8:#f4f1c9 ; the Custom colour dialog's gradient, 2-8 colours
 color_by=lum           ; lum | load | spin | sound
-bg_color=auto          ; auto | off | match | a gradient preset (background, by brightness)
+bg_color=auto          ; auto | off | match | custom | a gradient preset (background, by brightness)
 colors=16              ; 16 | 32 | 64 | 128 (palette size; always applies)
 bg_pattern=checker     ; solid | checker | diamond | brick | triangles | hex | radial | quasicrystal | rain | ocean | julia | carpet | clouds
 bg_lum=2               ; 0..10 (Background options)

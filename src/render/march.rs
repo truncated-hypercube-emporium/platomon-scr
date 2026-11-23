@@ -186,15 +186,30 @@ pub fn march(scene: &Scene, ro: Vec3A, rd: Vec3A, max_dist: f32, max_steps: u32)
 }
 
 /// [`march`] restricted to the solids in `allowed`.
+///
+/// `max_dist` is the floor's reach: its radius round the scene's centre,
+/// measured across the floor, so a camera high above it sees the same floor
+/// as one near it. Solids are found however far the camera is (past the far
+/// side of the scene's bounds nothing can be hit).
 #[inline]
 pub fn march_in(scene: &Scene, ro: Vec3A, rd: Vec3A, max_dist: f32, max_steps: u32, allowed: u64) -> Option<Hit> {
     let t_plane =
         if scene.ground.enabled && rd.y < -1e-7 && ro.y > 0.0 { -ro.y / rd.y } else { f32::INFINITY };
-    let limit = max_dist.min(t_plane);
+    let beyond = (ro - scene.centroid).length() + scene.extent + SCENE_MARGIN;
+    let limit = beyond.min(t_plane);
     if let Some(h) = march_solids_in(scene, ro, rd, 0.0, limit, max_steps, allowed) {
         return Some(h);
     }
-    (t_plane <= max_dist).then_some(Hit { t: t_plane, id: GROUND })
+    (t_plane.is_finite() && floor_radius(scene, ro + rd * t_plane) <= max_dist).then_some(Hit { t: t_plane, id: GROUND })
+}
+
+/// Room past the scene's bounds (solids' halos, rounding).
+const SCENE_MARGIN: f32 = 2.0;
+
+/// How far floor point `p` is from the scene's centre, across the floor.
+#[inline(always)]
+pub fn floor_radius(scene: &Scene, p: Vec3A) -> f32 {
+    (p.x - scene.centroid.x).hypot(p.z - scene.centroid.z)
 }
 
 /// Tetrahedral 4-tap gradient of one solid's SDF.
@@ -226,6 +241,24 @@ mod tests {
         assert_eq!(h.id, GROUND);
         assert!((h.t - 5.0).abs() < 1e-4);
         assert!(march(&s, far, Vec3A::Y, 50.0, 64).is_none());
+    }
+
+    #[test]
+    fn a_camera_far_above_still_sees_the_floor_and_the_solids() {
+        let s = Scene::demo(&AnimParams::default());
+        let c = s.centroid;
+        // 300 up, far past the 50-unit floor reach along the ray: the floor
+        // is still there out to 50 across it, and not beyond
+        let eye = Vec3A::new(c.x, 300.0, c.z);
+        let at = |dx: f32| (Vec3A::new(c.x + dx, 0.0, c.z) - eye).normalize();
+        assert_eq!(march(&s, eye, at(40.0), 50.0, 64).map(|h| h.id), Some(GROUND));
+        assert!(march(&s, eye, at(60.0), 50.0, 64).is_none(), "past the floor's edge");
+        // and every solid, seen from far away along a slant
+        for (i, inst) in s.solids.iter().enumerate() {
+            let ro = inst.center + Vec3A::new(120.0, 160.0, -90.0);
+            let h = march(&s, ro, (inst.center - ro).normalize(), 50.0, 128).expect("solid seen from far");
+            assert_eq!(h.id as usize, i);
+        }
     }
 
     #[test]
