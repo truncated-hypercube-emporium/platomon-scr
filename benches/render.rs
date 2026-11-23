@@ -107,6 +107,8 @@ fn bench(c: &mut Criterion) {
         tag_labels: &[],
         tag_ink: platomon::color::NONE,
         tag_scale: 0,
+        tag_place: platomon::overlay::TagPlace::Circle,
+        tag_font: platomon::overlay::TagFont::Strokes,
         tag_fixed: false,
     };
     c.bench_function("wqhd_640x240_overlays_wireframe_legend", |b| {

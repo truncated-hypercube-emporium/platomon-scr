@@ -328,6 +328,7 @@ pub fn plan_config(d: &Display, seed: u64, s: &ScrSettings) -> Config {
     config.auto_distance = s.auto_distance;
     config.far_ground = s.far_ground;
     config.tag_fixed_len = s.tag_fixed;
+    config.tag_place = s.tag_place;
     config.halo_color = s.halo_color;
     config.ordering = s.ordering;
     config.orbit_center = s.orbit_center;
@@ -567,8 +568,12 @@ pub struct ScrSettings {
     pub tags: bool,
     /// Tag colour with a colour gradient on (always lifted to stay readable).
     pub tag_color: crate::color::TagColor,
-    /// One line, or three-row block letters on small text.
+    /// Tag size: one line, or block letters on small text.
     pub tag_text: TagText,
+    /// Where the tags go.
+    pub tag_place: crate::overlay::TagPlace,
+    /// Random font: a random block-letter font each run.
+    pub tag_font_random: bool,
     /// Tuning overrides from the Tuning dialog: (key, value) for each
     /// [`TUNABLES`] entry the user has set, applied every run.
     pub tuning: Vec<(&'static str, f32)>,
@@ -619,6 +624,8 @@ impl Default for ScrSettings {
             tags: true,
             tag_color: crate::color::TagColor::Complement,
             tag_text: TagText::Auto,
+            tag_place: crate::overlay::TagPlace::Circle,
+            tag_font_random: false,
             tuning: Vec::new(),
             shift: true,
             shift_min_frames: 600,
@@ -847,7 +854,9 @@ pub fn help(key: &str) -> &'static str {
         "halo_color" => "Colour of the sound halo (with a colour gradient on). Under: whatever it passes over. Solid: its own solid's colour. Size: quiet halos at the gradient's start, loud ones at its end. Bass: the bass level, which also sets its brightness.",
         "halo_bands" => "On: each solid's halo follows its own frequency band, simple solids the bass and complex ones the treble. Off: every halo follows the overall level.",
         "far_ground" => "Draw the floor 8 times further out, toward the horizon. Past the normal distance it is shaded cheaply (averaged pattern, exact lighting, no sampling), so it costs little.",
-        "tag_fixed" => "On: each tag sits beside its solid and its leader line keeps one length, following the solid as it grows and shrinks. Off: the tags sit on a circle 80% of the picture's height across, each gliding round to the point nearest its solid.",
+        "tag_fixed" => "For tags beside, below or trailing their solids. On: placed for each solid's current size, so the leader line keeps one length as it grows and shrinks. Off: placed for the solid at full size, so tags hold still.",
+        "tag_place" => "Circle: on a circle 80% of the picture's height across, each gliding round to the point nearest its solid. Beside: next to each solid, toward the picture's nearest corner. Fixed corner: stacked in the corner on its solid's side. Below: centred under each solid. Trailing: behind each solid as it moves.",
+        "tag_font_random" => "Draw block-letter tags in a randomly chosen font each run: strokes, or pixel letters of #, o, *, @ or [] bricks. Off: the stroke letters.",
         "auto_distance" => "The camera moves in and out so every solid stays in frame: closer when they are small or bunched up, further back as they grow or spread. Not with the focus camera.",
         "tags" => "A label with each solid's metric, joined to it by a short line.",
         "tag_color" => "Tag colour with a gradient on: complementary to the theme, a tint of the theme, or white. Always kept readable.",
@@ -1070,8 +1079,21 @@ pub fn choices() -> Vec<Choice> {
             crate::color::TagColor::CHOICES.iter().map(|c| opt(&c.id(), c.describe())).collect(),
         ),
         styled(
+            "tag_place",
+            "Tag positions",
+            vec![
+                opt("circle", "Circle"),
+                opt("beside", "Beside"),
+                // a no-break space keeps both words in the drop-down
+                opt("corner", "Fixed\u{a0}corner"),
+                opt("below", "Below"),
+                opt("trailing", "Trailing"),
+            ],
+        ),
+        styled("tag_font_random", "Random font", on_off()),
+        styled(
             "tag_text",
-            "Tag style",
+            "Tag size",
             vec![
                 opt("auto", "Auto (sized to the text: one line, or block letters 1x to 3x)"),
                 opt("line", "Line (always one line)"),
@@ -1147,6 +1169,8 @@ impl ScrSettings {
             ("tags", on_off(self.tags)),
             ("tag_color", self.tag_color.id()),
             ("tag_text", self.tag_text.id().into()),
+            ("tag_place", self.tag_place.id().into()),
+            ("tag_font_random", on_off(self.tag_font_random)),
             ("shift", on_off(self.shift)),
             ("shift_min_frames", self.shift_min_frames.to_string()),
             ("shift_max_frames", self.shift_max_frames.to_string()),
@@ -1225,6 +1249,13 @@ impl ScrSettings {
             tags: flag("tags", d.tags),
             tag_color: val("tag_color").and_then(|v| v.parse().ok()).unwrap_or(d.tag_color),
             tag_text: val("tag_text").and_then(|v| TagText::parse(&v)).unwrap_or(d.tag_text),
+            // (settings from before Tag positions: fixed tag length meant
+            // tags beside their solids, off the circle)
+            tag_place: val("tag_place")
+                .and_then(|v| v.parse().ok())
+                .or_else(|| flag("tag_fixed", false).then_some(crate::overlay::TagPlace::Beside))
+                .unwrap_or(d.tag_place),
+            tag_font_random: flag("tag_font_random", d.tag_font_random),
             shift: flag("shift", d.shift),
             shift_min_frames: shift_min,
             shift_max_frames: shift_max,
@@ -1480,6 +1511,13 @@ mod tests {
             assert_eq!(s.tag_text, t);
             assert_eq!(t.id(), v, "round trip");
         }
+        // tag positions: older settings with fixed tag length on meant beside
+        use crate::overlay::TagPlace;
+        let pos = |pairs: &[(&str, &str)]| ScrSettings::from_lookup(lookup(pairs)).tag_place;
+        assert_eq!(pos(&[]), TagPlace::Circle);
+        assert_eq!(pos(&[("tag_fixed", "on")]), TagPlace::Beside);
+        assert_eq!(pos(&[("tag_fixed", "on"), ("tag_place", "below")]), TagPlace::Below);
+        assert_eq!(pos(&[("tag_place", "corner")]), TagPlace::Corner);
         // manual rendering resolution: 60 rows per step, whatever the budget
         let d = Display { width: 2560, height: 1440, refresh: 60 };
         assert_eq!(manual_font(&d, 1).0, 24);
@@ -1552,6 +1590,8 @@ mod tests {
             tags: false,
             tag_color: crate::color::TagColor::Theme,
             tag_text: TagText::Blocks(3),
+            tag_place: crate::overlay::TagPlace::Trailing,
+            tag_font_random: true,
             shift: false,
             shift_min_frames: 10,
             shift_max_frames: 20,

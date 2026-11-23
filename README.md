@@ -48,7 +48,8 @@ platomon [OPTIONS]
 | **Camera** | | |
 | `--camera` | `static\|orbit\|focus\|tilt\|resonance` (focus: glide toward the busiest solid; tilt: orbit while rising 20–80° and back; resonance: orbit with three 20° waves per turn) | `static` |
 | `--far-ground` | flag: extended floor, drawn 8x further out toward the horizon; past the normal distance it is shaded in closed form (averaged pattern, exact light, no sampling), about +0–0.4 ms per frame | off |
-| `--tag-fixed-length` | flag: tag leader lines keep one length, following each solid as it grows and shrinks, and only lengthen to keep a tag off another solid | off |
+| `--tag-fixed-length` | flag (beside, below and trailing tags): tag leader lines keep one length, following each solid as it grows and shrinks, and only lengthen to keep a tag off another solid | off |
+| `--tag-place` | where tags go: `circle` (round the picture's centre, nearest each solid), `beside`, `corner` (stacked in the corners), `below` or `trailing` (behind moving solids) | `circle` |
 | `--auto-distance` | flag: dynamic camera distance, moving in and out so every solid stays in frame (all cameras but focus) | off |
 | `--focus-zoom` | `0..1`: 0 = only turn toward the busiest solid, 1 = close-up | 0.6 |
 | `--focus-tau` | glide time constant, seconds | 1.5 |
@@ -481,8 +482,8 @@ later in Windows Security › Virus & threat protection › Exclusions).
 
 **New in 1.3.23:**
 
-- **Block-letter tags on small text**: below 10 px cells, tags switch to three-row block letters made of ordinary glyphs, larger on finer text (*Tag style*: automatic, always one line, or block letters 1x to 4x; INI `tag_text`).
-- **Tag circle**: with fixed tag length off, tags ring the picture on a circle 80% of its height across, each gliding to the point nearest its solid.
+- **Block-letter tags on small text**: below 10 px cells, tags switch to three-row block letters made of ordinary glyphs, larger on finer text (*Tag size*: automatic, always one line, or block letters 1x to 4x; INI `tag_text`), in a random font each run with *Random font*.
+- **Tag positions**: tags on a circle round the picture (each gliding to the point nearest its solid), beside their solids, stacked in the corners, below their solids or trailing behind them (INI `tag_place`).
 - **Tag boxes keep off the solids**: each tag box slides along its leader line as close to its solid as it can while staying clear of it (full size, halo room) and of every other solid.
 - **Luminosity levels** are 8, 16 (default) or 32: the random choice is gone and the 10-level ramp became an 8-level one (`" .:-=+#@"`). Saved `auto` reads as 16 and `10` as 8.
 
@@ -554,8 +555,8 @@ inverted frame rate and extra metrics, plus the background luminosity and quasic
 *Tuning* (all greyed out while Random start is on). The **Randomize** button beside it rolls
 random values into every *Appearance* setting and every *Tuning* slider now, and turns Random
 start off so they are kept (saved with OK or *Apply*). The rest of *Appearance* always applies,
-Random start or not (Randomize still rolls it): halo colour, tag colour, *Tag style*, sound halo, halo bounce by frequency,
-extended floor distance, *Tags* and *Fixed tag length*. The *Performance & Features* group always applies too: the frame-rate cap (the
+Random start or not (Randomize still rolls it): halo colour, tag colour, *Tag positions*, *Tag size*, sound halo, halo bounce by frequency,
+extended floor distance, *Tags*, *Fixed tag length* and *Random font*. The *Performance & Features* group always applies too: the frame-rate cap (the
 display's refresh rate by default), the CPU budget used to size the text, the *Rendering resolution*
 with its *Manual* box, the number of luminosity levels, the palette size and dynamic camera distance, with
 the OLED burn-in shift (on/off, frame interval, range) nested at its bottom. On/off settings are
@@ -688,24 +689,39 @@ table for the tone curve (within 2e-6 of the exact curve), the colour pipeline t
 per frame (compose + draw) at 16 colours, down from 4.2–4.6 ms. Larger palettes cost almost nothing to
 compose; colouring by brightness at 64 or 128 colours redraws more cells (finer steps change more
 often), about +0.9–1.0 ms of drawing per frame.
-**Tag style.** On small text (cells under 10 px tall) *Auto* switches tags to three-row block letters
-drawn with ordinary glyphs (`_ | / \ ( )`), which stay readable where single letters are only a few
-pixels high, and draws them larger the finer the text: 1x from 5 px cells, 2x at 3–4 px and 3x
-below (so tags stay roughly 15–30 px tall). *Tag style* (INI `tag_text`) can also keep one line
-always (`line`), or always use block letters at a size of your choosing for fine pitch resolutions:
-*Blocks*, *Blocks 2x*, *Blocks 3x* or *Blocks 4x* (`blocks`, `blocks2`..`blocks4`). Larger letters
-redraw each stroke over a k × k square (`_` along its bottom, `|` down its middle, `/` and `\`
-corner to corner). Each tag is a solid box that hides what is behind it.
+**Tag size.** On small text (cells under 10 px tall) *Auto* switches tags to block letters drawn
+with ordinary glyphs, which stay readable where single letters are only a few pixels high, and
+draws them larger the finer the text: 1x from 5 px cells, 2x at 3–4 px and 3x below (so tags stay
+roughly 15–30 px tall). *Tag size* (INI `tag_text`) can also keep one line always (`line`), or
+always use block letters at a size of your choosing for fine pitch resolutions: *Blocks*, *Blocks
+2x*, *Blocks 3x* or *Blocks 4x* (`blocks`, `blocks2`..`blocks4`). Each tag is a solid box that
+hides what is behind it.
 
-**Tag placement.** With *Fixed tag length* on, each tag sits beside its solid on the diagonal toward
-the picture's nearest corner, as close as it can while staying clear of that solid (with its halo's
-room) and of every other solid, and its leader keeps one length as the solid grows and shrinks. With
-it off (the default), the tags sit on a circle round the picture's centre, 80% of the picture's
-height across: each heads for the point of the circle nearest its solid (straight out from the
-centre through it), so its leader is as short as the circle allows, and glides round toward it as
-the solids and the camera move. Neighbouring tags push each other apart along the circle so they
-never overlap, and the text runs outward, so the tags ring the picture with their leaders pointing
-in.
+**Random font.** Block letters normally use the three-row stroke font (`_ | / \ ( )`; larger sizes
+redraw each stroke over a k × k square). With *Random font* on (INI `tag_font_random=on`), each run
+picks one of six fonts at random: the strokes, or five-row pixel letters drawn with `#`, `o`, `*`,
+`@` or `[]` bricks (larger sizes fill each pixel's k × k square).
+
+**Tag positions.** *Tag positions* (INI `tag_place`) chooses where the tags go:
+
+- *Circle* (`circle`, the default): on a circle round the picture's centre, 80% of the picture's
+  height across. Each tag heads for the point of the circle nearest its solid (straight out from the
+  centre through it), so its leader is as short as the circle allows, and glides round toward it as
+  the solids and the camera move. Neighbouring tags push each other apart along the circle so they
+  never overlap, and the text runs outward, so the tags ring the picture with their leaders pointing in.
+- *Beside* (`beside`): next to its solid on the diagonal toward the picture's nearest corner, as
+  close as it can while staying clear of that solid (with its halo's room) and of every other solid.
+- *Fixed corner* (`corner`): stacked in the picture's corner on its solid's side (its quarter of
+  the picture), in the order of the solids' heights so leaders rarely cross.
+- *Below* (`below`): centred under its solid, past its halo, with the leader running straight up;
+  a tag that would sit on another steps down below it.
+- *Trailing* (`trailing`): just past its solid's halo on the side away from the way the solid is
+  moving across the picture, swinging round smoothly as the motion changes, like a trail.
+
+*Fixed tag length* (in *Appearance*) applies to beside, below and trailing tags: on, they are
+placed for each solid's current size, so the leader keeps one length as it grows and shrinks; off,
+for the solid at full size, so they hold still. (Older settings with fixed tag length on and no
+`tag_place` load as *Beside*.)
 
 **Luminosity levels.** 8, 16 (default) or 32 glyphs from dark to bright, the same every run. The
 8-level ramp `" .:-=+#@"` is the classic 10-level one without `*` and `%`. The 32-level ramp `` `-.':"~=*+c7ix5ah6HmB80$MWNQg&@`` (after a
@@ -748,7 +764,9 @@ tag_color=complement   ; complement | theme | white | #RRGGBB (lifted to stay re
 tag_text=auto          ; auto (line, or block letters 1x-3x under 10 px) | line | blocks | blocks2 | blocks3 | blocks4
 auto_distance=off      ; dynamic camera distance (keep every solid in frame)
 far_ground=off         ; extended floor distance
-tag_fixed=off          ; on = tags beside their solids, fixed leader length; off = tags on a circle
+tag_fixed=off          ; beside/below/trailing tags: on = placed for the current size (fixed leader length)
+tag_place=circle       ; circle | beside | corner | below | trailing
+tag_font_random=off    ; on = a random block-letter font each run
 tune_orbit_period=45   ; Tuning values (only those set): tune_<name>, see Tuning above
 shift=on
 shift_min_frames=600

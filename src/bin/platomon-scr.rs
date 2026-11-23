@@ -44,7 +44,7 @@ mod win {
     use platomon::collector::Collector;
     use platomon::color::{self, ColorBy, ColorMap};
     use platomon::metrics::{MetricsState, activity_score};
-    use platomon::overlay::{Halo, OverlayOptions, Overlays, halo_factor, halo_lum, halo_reach};
+    use platomon::overlay::{Halo, OverlayOptions, Overlays, TagFont, halo_factor, halo_lum, halo_reach};
     use platomon::render::{QualityGovernor, Renderer};
     use platomon::scrconfig;
     use platomon::tiles::TileCache;
@@ -828,6 +828,9 @@ mod win {
         let tags_on = s.tags;
         let tag_ink = s.tag_color.resolve(cmap.as_ref().map(|m| &m.gradient));
         let tag_blocks = s.tag_text.scale(plan.font_px);
+        // Random font: a block-letter font of its own each run (the same
+        // for the run's seed)
+        let tag_font = if s.tag_font_random { TagFont::random(seed) } else { TagFont::Strokes };
         let mut tag_labels: Vec<String> = Vec::new();
         // Sound: the halo, and/or the solids' colours by their frequency band.
         let halo_on = s.sound;
@@ -937,7 +940,7 @@ mod win {
                     let th = Instant::now();
                     if let Some(view) = renderer.view() {
                         let hl = sh.next();
-                        let opt = options(&cfg, &ramp, cmap.as_ref(), &levels, Some(hl), &sh.factors, tags_on.then_some((&tag_labels[..], tag_ink, tag_blocks)));
+                        let opt = options(&cfg, &ramp, cmap.as_ref(), &levels, Some(hl), &sh.factors, tags_on.then_some((&tag_labels[..], tag_ink, tag_blocks, tag_font)));
                         let u = overlays.update_halo(&view, vp.w, vp.h, &scene, &opt);
                         screen.draw_dirty(u.dirty, vp.w, u.chars, u.colors);
                         screen.present();
@@ -993,7 +996,7 @@ mod win {
             render_avg = if render_avg == 0.0 { r } else { 0.9 * render_avg + 0.1 * r };
             if let Some(view) = renderer.view() {
                 let factors = sound.as_ref().filter(|_| halo_on).map_or(&[][..], |s| &s.factors[..]);
-                let opt = options(&cfg, &ramp, cmap.as_ref(), &levels, halo, factors, tags_on.then_some((&tag_labels[..], tag_ink, tag_blocks)));
+                let opt = options(&cfg, &ramp, cmap.as_ref(), &levels, halo, factors, tags_on.then_some((&tag_labels[..], tag_ink, tag_blocks, tag_font)));
                 let cells = overlays.compose(&view, vp.w, vp.h, &scene, &opt);
                 let t2 = Instant::now();
                 spent[1] += (t2 - t1).as_secs_f64();
@@ -1102,8 +1105,8 @@ mod win {
         levels: &'a [f32],
         halo: Option<Halo>,
         halo_factors: &'a [f32],
-        // Tag labels, colour and text size, when tags are on.
-        tags: Option<(&'a [String], u32, u8)>,
+        // Tag labels, colour, text size and block font, when tags are on.
+        tags: Option<(&'a [String], u32, u8, TagFont)>,
     ) -> OverlayOptions<'a> {
         OverlayOptions {
             wireframe: cfg.wireframe,
@@ -1121,6 +1124,8 @@ mod win {
             tag_labels: tags.map_or(&[][..], |t| t.0),
             tag_ink: tags.map_or(color::NONE, |t| t.1),
             tag_scale: tags.map_or(0, |t| t.2),
+            tag_place: cfg.tag_place,
+            tag_font: tags.map_or(TagFont::Strokes, |t| t.3),
             tag_fixed: cfg.tag_fixed_len,
         }
     }

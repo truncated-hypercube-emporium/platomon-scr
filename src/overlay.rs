@@ -62,6 +62,89 @@ impl Default for LegendParams {
     }
 }
 
+/// Where the solid tags go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TagPlace {
+    /// On a circle round the picture's centre, each at the point nearest
+    /// its solid ([`TAG_CIRCLE`]).
+    #[default]
+    Circle,
+    /// Beside each solid, on the diagonal toward the picture's nearest
+    /// corner.
+    Beside,
+    /// Stacked in the picture's corner on its solid's side.
+    Corner,
+    /// Centred under each solid.
+    Below,
+    /// Behind each solid as it moves across the picture, like a trail.
+    Trailing,
+}
+
+impl TagPlace {
+    pub const ALL: [TagPlace; 5] = [TagPlace::Circle, TagPlace::Beside, TagPlace::Corner, TagPlace::Below, TagPlace::Trailing];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            TagPlace::Circle => "circle",
+            TagPlace::Beside => "beside",
+            TagPlace::Corner => "corner",
+            TagPlace::Below => "below",
+            TagPlace::Trailing => "trailing",
+        }
+    }
+}
+
+impl FromStr for TagPlace {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        let s = s.trim().to_ascii_lowercase();
+        Self::ALL
+            .into_iter()
+            .find(|p| p.id() == s)
+            .ok_or_else(|| format!("unknown tag position '{s}' (circle|beside|corner|below|trailing)"))
+    }
+}
+
+/// The block-letter font of tags on small text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TagFont {
+    /// Three rows of strokes (`_ | / \ ( )`).
+    #[default]
+    Strokes,
+    /// Five-row pixel letters drawn with `#`.
+    Hash,
+    /// ...with `o`.
+    Dots,
+    /// ...with `*`.
+    Stars,
+    /// ...with `@`.
+    At,
+    /// ...with `[]` bricks (two columns per pixel).
+    Bricks,
+}
+
+impl TagFont {
+    pub const ALL: [TagFont; 6] = [TagFont::Strokes, TagFont::Hash, TagFont::Dots, TagFont::Stars, TagFont::At, TagFont::Bricks];
+
+    /// A font chosen at random from `seed` (the same for the same seed).
+    pub fn random(seed: u64) -> Self {
+        Self::ALL[fastrand::Rng::with_seed(seed ^ 0x666f_6e74).usize(0..Self::ALL.len())]
+    }
+
+    /// The glyph(s) a lit pixel of the pixel fonts is drawn with.
+    fn ink(self) -> Option<&'static str> {
+        match self {
+            TagFont::Strokes => None,
+            TagFont::Hash => Some("#"),
+            TagFont::Dots => Some("o"),
+            TagFont::Stars => Some("*"),
+            TagFont::At => Some("@"),
+            TagFont::Bricks => Some("[]"),
+        }
+    }
+}
+
 // ------------------------------------------------------------------ wire models
 
 /// Unit-circumradius edge model of one solid.
@@ -409,13 +492,16 @@ pub struct OverlayOptions<'a> {
     pub tags: bool,
     /// One tag text per slot (falls back to the solid's name).
     pub tag_labels: &'a [String],
-    /// Tag text size: 0 = one line, k = three-row block letters drawn k
-    /// times as large (for small text).
+    /// Tag text size: 0 = one line, k = block letters drawn k times as
+    /// large (for small text).
     pub tag_scale: u8,
-    /// Fixed tag length: tags placed beside each solid for its current size,
-    /// so the leader line keeps one length. Off: tags sit on a circle round
-    /// the picture's centre ([`TAG_CIRCLE`]), each at the point nearest its
-    /// solid.
+    /// The block letters' font.
+    pub tag_font: TagFont,
+    /// Where the tags go.
+    pub tag_place: TagPlace,
+    /// Fixed tag length (beside, below and trailing tags): placed for each
+    /// solid's current size, so the leader line keeps one length; off: for
+    /// the solid at full size, so tags hold still as solids grow.
     pub tag_fixed: bool,
     /// Tag colour when colour is on ([`color::NONE`] = default text colour;
     /// see [`color::TagColor`]).
@@ -436,6 +522,9 @@ struct TagAnchor {
     rightward: bool,
     /// The tag is above its solid.
     above: bool,
+    /// Where its leader line starts, (column, row), when not at the box's
+    /// inner corner (a tag centred under its solid starts at its top middle).
+    lead: Option<(f32, f32)>,
 }
 
 /// Underscores either side of a tag's label (`__RAM 42%__`).
@@ -458,15 +547,24 @@ const TAG_SLACK_ROWS: f32 = 6.0;
 /// doesn't flicker.
 const TAG_FLIP: f32 = 0.06;
 
-/// Tags on a circle (fixed tag length off): its diameter as a share of the
-/// picture's height.
+/// Tags on a circle: its diameter as a share of the picture's height.
 pub const TAG_CIRCLE: f32 = 0.8;
+/// Trailing tags: how far their trail direction turns toward the solid's
+/// latest motion each frame.
+const TAG_TRAIL_EASE: f32 = 0.12;
+/// Columns kept clear between a corner's stacked tags and the picture's
+/// edge, and rows between them.
+const TAG_CORNER_MARGIN: usize = 1;
 /// How far a circle tag moves toward its target angle each frame (eased,
 /// so tags glide round the circle).
 const TAG_CIRCLE_EASE: f32 = 0.2;
 /// A circle tag turns its text to the circle's other side only once it is
 /// this far (cosine or sine of its angle) past the dividing axis.
 const TAG_CIRCLE_FLIP: f32 = 0.15;
+
+/// A trailing tag's memory: its solid's last screen position (column,
+/// row) and the trail direction (unit; columns scaled by the cell aspect).
+type Trail = ((f32, f32), (f32, f32));
 
 /// Each solid's tag side from last frame, and the cells the tags covered
 /// last frame, with what lay under them.
@@ -478,6 +576,9 @@ struct TagState {
     /// Circle tags: each solid's tag angle round the circle (radians, NaN =
     /// not placed yet).
     angles: Vec<f32>,
+    /// Trailing tags: each solid's last screen position and its trail
+    /// direction (unit, rows; columns scaled by the cell aspect).
+    trails: Vec<Option<Trail>>,
     /// Cells holding tag text this frame (cleared after drawing).
     text_mask: Vec<bool>,
     /// The legend panel (rows r0..=r1, columns c0..=c1) from the last full
@@ -602,29 +703,116 @@ fn block_glyph(c: char) -> [&'static str; 3] {
 /// three rows of [`block_glyph`] letters (one blank column between letters
 /// and either side, so the box hides what is behind it), drawn `scale`
 /// times as large ([`scale_blocks`]).
+#[cfg(test)]
 fn tag_lines(label: &str, scale: u8) -> Vec<Vec<char>> {
+    tag_lines_in(label, scale, TagFont::Strokes)
+}
+
+/// [`tag_lines`] in block-letter font `font`: the strokes font's three
+/// rows, or five rows of [`pixel_glyph`] letters drawn with the font's ink.
+fn tag_lines_in(label: &str, scale: u8, font: TagFont) -> Vec<Vec<char>> {
     let label: String = label.chars().filter(|c| !c.is_control()).collect();
     if scale == 0 {
         return vec![format!("{TAG_RULE}{label}{TAG_RULE}").chars().collect()];
     }
-    let mut rows = vec![vec![' '], vec![' '], vec![' ']];
+    let Some(ink) = font.ink() else {
+        let mut rows = vec![vec![' '], vec![' '], vec![' ']];
+        for c in label.chars() {
+            for (row, part) in rows.iter_mut().zip(block_glyph(c)) {
+                row.extend(part.chars());
+                row.push(' ');
+            }
+        }
+        return scale_blocks(&rows, scale, false);
+    };
+    let ink: Vec<char> = ink.chars().collect();
+    let blank = vec![' '; ink.len()];
+    let mut rows = vec![blank.clone(); 5];
     for c in label.chars() {
-        for (row, part) in rows.iter_mut().zip(block_glyph(c)) {
-            row.extend(part.chars());
-            row.push(' ');
+        for (row, part) in rows.iter_mut().zip(pixel_glyph(c)) {
+            for p in part.chars() {
+                row.extend(if p == '#' { &ink } else { &blank });
+            }
+            row.extend(&blank);
         }
     }
-    scale_blocks(&rows, scale)
+    scale_blocks(&rows, scale, true)
 }
 
-/// Block letters `k` times as large: every cell becomes a k × k square,
-/// redrawn so strokes stay strokes: `_` along its bottom, `|`, `(` and `)`
-/// down its middle, `/` and `\` across its diagonal, anything else once in
-/// its middle.
-fn scale_blocks(rows: &[Vec<char>], k: u8) -> Vec<Vec<char>> {
+/// Five-row pixel letters (`#` = lit) for the pixel fonts. Unknown
+/// characters show as `?`.
+fn pixel_glyph(c: char) -> [&'static str; 5] {
+    match c.to_ascii_uppercase() {
+        'A' => [".#.", "#.#", "###", "#.#", "#.#"],
+        'B' => ["##.", "#.#", "##.", "#.#", "##."],
+        'C' => [".##", "#..", "#..", "#..", ".##"],
+        'D' => ["##.", "#.#", "#.#", "#.#", "##."],
+        'E' => ["###", "#..", "##.", "#..", "###"],
+        'F' => ["###", "#..", "##.", "#..", "#.."],
+        'G' => [".##", "#..", "#.#", "#.#", ".##"],
+        'H' => ["#.#", "#.#", "###", "#.#", "#.#"],
+        'I' => ["###", ".#.", ".#.", ".#.", "###"],
+        'J' => ["..#", "..#", "..#", "#.#", ".#."],
+        'K' => ["#.#", "#.#", "##.", "#.#", "#.#"],
+        'L' => ["#..", "#..", "#..", "#..", "###"],
+        'M' => ["#...#", "##.##", "#.#.#", "#...#", "#...#"],
+        'N' => ["#..#", "##.#", "#.##", "#..#", "#..#"],
+        'O' => [".#.", "#.#", "#.#", "#.#", ".#."],
+        'P' => ["##.", "#.#", "##.", "#..", "#.."],
+        'Q' => [".#.", "#.#", "#.#", "##.", ".##"],
+        'R' => ["##.", "#.#", "##.", "#.#", "#.#"],
+        'S' => [".##", "#..", ".#.", "..#", "##."],
+        'T' => ["###", ".#.", ".#.", ".#.", ".#."],
+        'U' => ["#.#", "#.#", "#.#", "#.#", "###"],
+        'V' => ["#.#", "#.#", "#.#", "#.#", ".#."],
+        'W' => ["#...#", "#...#", "#.#.#", "##.##", "#...#"],
+        'X' => ["#.#", "#.#", ".#.", "#.#", "#.#"],
+        'Y' => ["#.#", "#.#", ".#.", ".#.", ".#."],
+        'Z' => ["###", "..#", ".#.", "#..", "###"],
+        '0' => ["###", "#.#", "#.#", "#.#", "###"],
+        '1' => [".#.", "##.", ".#.", ".#.", "###"],
+        '2' => ["##.", "..#", ".#.", "#..", "###"],
+        '3' => ["##.", "..#", ".#.", "..#", "##."],
+        '4' => ["#.#", "#.#", "###", "..#", "..#"],
+        '5' => ["###", "#..", "##.", "..#", "##."],
+        '6' => [".##", "#..", "###", "#.#", "###"],
+        '7' => ["###", "..#", ".#.", ".#.", ".#."],
+        '8' => ["###", "#.#", "###", "#.#", "###"],
+        '9' => ["###", "#.#", "###", "..#", "##."],
+        '%' => ["#.#", "..#", ".#.", "#..", "#.#"],
+        '.' => [".", ".", ".", ".", "#"],
+        ',' => [".", ".", ".", "#", "#"],
+        ':' => [".", "#", ".", "#", "."],
+        '-' => ["...", "...", "###", "...", "..."],
+        '+' => ["...", ".#.", "###", ".#.", "..."],
+        '/' => ["..#", "..#", ".#.", "#..", "#.."],
+        '(' => [".#", "#.", "#.", "#.", ".#"],
+        ')' => ["#.", ".#", ".#", ".#", "#."],
+        '<' => ["..#", ".#.", "#..", ".#.", "..#"],
+        '>' => ["#..", ".#.", "..#", ".#.", "#.."],
+        ' ' => ["..", "..", "..", "..", ".."],
+        _ => ["##.", "..#", ".#.", "...", ".#."],
+    }
+}
+
+/// Block letters `k` times as large: every cell becomes a k × k square.
+/// Pixel fonts (`pixel`) fill it with the cell's glyph; the strokes font
+/// redraws it so strokes stay strokes: `_` along its bottom, `|`, `(` and
+/// `)` down its middle, `/` and `\` across its diagonal, anything else once
+/// in its middle.
+fn scale_blocks(rows: &[Vec<char>], k: u8, pixel: bool) -> Vec<Vec<char>> {
     let k = k.max(1) as usize;
     if k == 1 {
         return rows.to_vec();
+    }
+    if pixel {
+        return rows
+            .iter()
+            .flat_map(|row| {
+                let wide: Vec<char> = row.iter().flat_map(|&c| std::iter::repeat_n(c, k)).collect();
+                std::iter::repeat_n(wide, k)
+            })
+            .collect();
     }
     let wide = rows.iter().map(Vec::len).max().unwrap_or(0);
     let mut out = vec![vec![' '; wide * k]; rows.len() * k];
@@ -826,7 +1014,7 @@ fn place_tags(
         leaders.push(leader(x, y));
         // Remember the outward corner (a neighbouring one is only a detour).
         sides[i] = (sx, sy);
-        out[i] = Some(TagAnchor { y: y as usize, x: x as usize, rightward: hx > 0, above: vy < 0 });
+        out[i] = Some(TagAnchor { y: y as usize, x: x as usize, rightward: hx > 0, above: vy < 0, lead: None });
     }
     out
 }
@@ -934,7 +1122,193 @@ fn place_tags_circle(
         if keep_out.is_some_and(|(p0, p1, q0, q1)| r0 <= p1 as f32 && p0 as f32 <= r1 && c0 <= q1 as f32 && q0 as f32 <= c1) {
             continue;
         }
-        out[i] = Some(TagAnchor { y: y as usize, x: x as usize, rightward: sx > 0, above: sy < 0 });
+        out[i] = Some(TagAnchor { y: y as usize, x: x as usize, rightward: sx > 0, above: sy < 0, lead: None });
+    }
+    out
+}
+
+/// Each solid's circle on screen for the tags placed beside it: at its
+/// current size (`fixed`) or at full size, widened by `clear` for its halo.
+fn tag_circles(frame: &FrameView<'_>, scene: &Scene, fixed: bool, clear: f32) -> Vec<Option<((f32, f32), f32)>> {
+    scene
+        .solids
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            if fixed {
+                screen_circle(frame, s.center, s.scale)
+            } else {
+                screen_circle(frame, scene.full_size_center(i), s.scale.max(scene.max_radius))
+            }
+        })
+        .map(|c| c.filter(|((x, y), _)| x.is_finite() && y.is_finite()).map(|(c, r)| (c, r * clear)))
+        .collect()
+}
+
+/// Does a box (rows r0..=r1, columns c0..=c1) meet one in `placed`, with a
+/// cell between them?
+fn box_clash((r0, r1, c0, c1): (f32, f32, f32, f32), placed: &[(f32, f32, f32, f32)]) -> bool {
+    placed.iter().any(|&(p0, p1, q0, q1)| r0 <= p1 + 1.0 && p0 <= r1 + 1.0 && c0 <= q1 + 1.0 && q0 <= c1 + 1.0)
+}
+
+fn legend_box(keep_out: Option<(usize, usize, usize, usize)>) -> Vec<(f32, f32, f32, f32)> {
+    keep_out.into_iter().map(|(r0, r1, c0, c1)| (r0 as f32, r1 as f32, c0 as f32, c1 as f32)).collect()
+}
+
+/// Tags centred under their solids (clear of the halo, with a short gap for
+/// the leader, which runs straight up from the box's top middle). A tag
+/// that would sit on another steps down below it.
+#[allow(clippy::too_many_arguments)]
+fn place_tags_below(
+    frame: &FrameView<'_>,
+    w: usize,
+    h: usize,
+    scene: &Scene,
+    boxes: &[(usize, usize)],
+    clear: f32,
+    fixed: bool,
+    keep_out: Option<(usize, usize, usize, usize)>,
+) -> Vec<Option<TagAnchor>> {
+    let circles = tag_circles(frame, scene, fixed, clear);
+    let mut placed = legend_box(keep_out);
+    // the highest solids first, so lower tags step down past them
+    let mut order: Vec<usize> = (0..circles.len()).filter(|&i| circles[i].is_some()).collect();
+    order.sort_by(|&a, &b| circles[a].map_or(0.0, |c| c.0.1).total_cmp(&circles[b].map_or(0.0, |c| c.0.1)));
+    let mut out = vec![None; circles.len()];
+    for i in order {
+        let ((cx, cy), rr) = circles[i].expect("placed");
+        let (tw, th) = boxes.get(i).copied().unwrap_or((TAG_MIN_W, 1));
+        let (tw, th) = (tw.clamp(1, w.max(1)) as f32, th.clamp(1, h.max(1)) as f32);
+        let x0 = (cx - tw * 0.5).round().clamp(0.0, w as f32 - tw);
+        let mut top = (cy + rr + TAG_GAP_ROWS).round();
+        for _ in 0..8 {
+            if !box_clash((top, top + th - 1.0, x0, x0 + tw - 1.0), &placed) {
+                break;
+            }
+            top += th + 1.0;
+        }
+        let top = top.clamp(0.0, h as f32 - th);
+        let b = (top, top + th - 1.0, x0, x0 + tw - 1.0);
+        if keep_out.is_some() && box_clash(b, &legend_box(keep_out)) {
+            continue;
+        }
+        placed.push(b);
+        let lead = Some(((x0 + (tw * 0.5).floor()).min(w as f32 - 1.0) + 0.5, top - 1.0 + 0.5));
+        out[i] = Some(TagAnchor { y: top as usize, x: x0 as usize, rightward: true, above: false, lead });
+    }
+    out
+}
+
+/// Tags stacked in the picture's corners: each in the corner on its
+/// solid's side (its quarter of the picture, kept until the solid is
+/// clearly past the centre line), the stack running in from the corner in
+/// the order of the solids' heights so leaders rarely cross.
+#[allow(clippy::too_many_arguments)]
+fn place_tags_corner(
+    sides: &mut Vec<(i8, i8)>,
+    frame: &FrameView<'_>,
+    w: usize,
+    h: usize,
+    scene: &Scene,
+    boxes: &[(usize, usize)],
+    keep_out: Option<(usize, usize, usize, usize)>,
+) -> Vec<Option<TagAnchor>> {
+    let n = scene.solids.len();
+    sides.resize(n, (0, 0));
+    let (hw, hh) = (w as f32 * 0.5, h as f32 * 0.5);
+    let centres: Vec<Option<(f32, f32)>> =
+        scene.solids.iter().map(|s| frame.proj.project(s.center).filter(|(x, y)| x.is_finite() && y.is_finite())).collect();
+    for (i, c) in centres.iter().enumerate() {
+        let Some((cx, cy)) = *c else { continue };
+        let (mut sx, mut sy) = sides[i];
+        if sx == 0 || (cx - hw) * (sx as f32) < -TAG_FLIP * w as f32 {
+            sx = if cx >= hw { 1 } else { -1 };
+        }
+        if sy == 0 || (cy - hh) * (sy as f32) < -TAG_FLIP * h as f32 {
+            sy = if cy >= hh { 1 } else { -1 };
+        }
+        sides[i] = (sx, sy);
+    }
+    let legend = legend_box(keep_out);
+    let m = TAG_CORNER_MARGIN as f32;
+    let mut out = vec![None; n];
+    for (sx, sy) in [(-1i8, -1i8), (1, -1), (-1, 1), (1, 1)] {
+        let mut group: Vec<usize> = (0..n).filter(|&i| centres[i].is_some() && sides[i] == (sx, sy)).collect();
+        // top corners stack downward, highest solid first; bottom ones upward
+        group.sort_by(|&a, &b| {
+            let y = |i: usize| centres[i].map_or(0.0, |c| c.1);
+            if sy < 0 { y(a).total_cmp(&y(b)) } else { y(b).total_cmp(&y(a)) }
+        });
+        let mut run = m;
+        for i in group {
+            let (tw, th) = boxes.get(i).copied().unwrap_or((TAG_MIN_W, 1));
+            let (tw, th) = (tw.clamp(1, w.max(1)) as f32, th.clamp(1, h.max(1)) as f32);
+            let (r0, r1) = if sy < 0 { (run, run + th - 1.0) } else { (h as f32 - 1.0 - run - th + 1.0, h as f32 - 1.0 - run) };
+            run += th + 1.0;
+            if r0 < 0.0 || r1 > h as f32 - 1.0 {
+                break; // the corner is full
+            }
+            let (c0, c1) = if sx < 0 { (m, m + tw - 1.0) } else { (w as f32 - m - tw, w as f32 - 1.0 - m) };
+            if c0 < 0.0 || box_clash((r0, r1, c0, c1), &legend) {
+                continue;
+            }
+            // attach at the inner end, toward the picture's middle
+            let (x, rightward) = if sx < 0 { (c1, false) } else { (c0, true) };
+            let (y, above) = if sy < 0 { (r1, true) } else { (r0, false) };
+            out[i] = Some(TagAnchor { y: y as usize, x: x as usize, rightward, above, lead: None });
+        }
+    }
+    out
+}
+
+/// Tags trailing behind their solids: each sits just past its solid's halo
+/// on the side away from the way the solid is moving across the picture,
+/// the direction easing round as the motion changes ([`TAG_TRAIL_EASE`]);
+/// a solid that holds still keeps its tag where it is (below and to the
+/// right at first). `trails` carries each solid's last position and trail
+/// direction from frame to frame.
+#[allow(clippy::too_many_arguments)]
+fn place_tags_trailing(
+    trails: &mut Vec<Option<Trail>>,
+    frame: &FrameView<'_>,
+    w: usize,
+    h: usize,
+    scene: &Scene,
+    boxes: &[(usize, usize)],
+    clear: f32,
+    fixed: bool,
+    aspect: f32,
+) -> Vec<Option<TagAnchor>> {
+    let circles = tag_circles(frame, scene, fixed, clear);
+    trails.resize(circles.len(), None);
+    let unit = |(x, y): (f32, f32)| {
+        let l = x.hypot(y);
+        if l > 1e-6 { (x / l, y / l) } else { (std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2) }
+    };
+    let mut out = vec![None; circles.len()];
+    for (i, c) in circles.iter().enumerate() {
+        let Some(((cx, cy), rr)) = *c else {
+            trails[i] = None;
+            continue;
+        };
+        let (last, dir) = trails[i].unwrap_or(((cx, cy), unit((1.0, 1.0))));
+        let v = ((cx - last.0) * aspect, cy - last.1);
+        let speed = v.0.hypot(v.1);
+        let dir = if speed > 0.05 {
+            let back = (-v.0 / speed, -v.1 / speed);
+            unit((dir.0 + (back.0 - dir.0) * TAG_TRAIL_EASE, dir.1 + (back.1 - dir.1) * TAG_TRAIL_EASE))
+        } else {
+            dir
+        };
+        trails[i] = Some(((cx, cy), dir));
+        let d = rr + TAG_GAP_ROWS;
+        let (px, py) = (cx + dir.0 * d / aspect, cy + dir.1 * d);
+        let (sx, sy) = (if dir.0 >= 0.0 { 1 } else { -1 }, if dir.1 < 0.0 { -1 } else { 1 });
+        let (tw, th) = boxes.get(i).copied().unwrap_or((TAG_MIN_W, 1));
+        let (tw, th) = (tw.clamp(1, w.max(1)) as f32, th.clamp(1, h.max(1)) as f32);
+        let x = if sx > 0 { px.round().clamp(0.0, w as f32 - tw) } else { px.round().clamp(tw - 1.0, w as f32 - 1.0) };
+        let y = if sy < 0 { py.round().clamp(th - 1.0, h as f32 - 1.0) } else { py.round().clamp(0.0, h as f32 - th) };
+        out[i] = Some(TagAnchor { y: y as usize, x: x as usize, rightward: sx > 0, above: sy < 0, lead: None });
     }
     out
 }
@@ -993,15 +1367,18 @@ fn draw_tags(
         .enumerate()
         .map(|(i, inst)| {
             let label = opt.tag_labels.get(i).cloned().unwrap_or_else(|| inst.poly.kind().id().to_string());
-            tag_lines(&label, opt.tag_scale)
+            tag_lines_in(&label, opt.tag_scale, opt.tag_font)
         })
         .collect();
     let boxes: Vec<(usize, usize)> = lines.iter().map(|l| tag_box(l)).collect();
     let clear = if sizes.is_some() { opt.halo.map_or(TAG_CLEAR_HALO, |hl| hl.reach.max(TAG_CLEAR_PLAIN)) } else { TAG_CLEAR_PLAIN };
-    let anchors = if opt.tag_fixed {
-        place_tags(&mut t.sides, frame, w, h, scene, &boxes, clear, aspect, t.keep_out, true)
-    } else {
-        place_tags_circle(&mut t.angles, &mut t.sides, frame, w, h, scene, &boxes, aspect, t.keep_out)
+    let fixed = opt.tag_fixed;
+    let anchors = match opt.tag_place {
+        TagPlace::Circle => place_tags_circle(&mut t.angles, &mut t.sides, frame, w, h, scene, &boxes, aspect, t.keep_out),
+        TagPlace::Beside => place_tags(&mut t.sides, frame, w, h, scene, &boxes, clear, aspect, t.keep_out, fixed),
+        TagPlace::Corner => place_tags_corner(&mut t.sides, frame, w, h, scene, &boxes, t.keep_out),
+        TagPlace::Below => place_tags_below(frame, w, h, scene, &boxes, clear, fixed, t.keep_out),
+        TagPlace::Trailing => place_tags_trailing(&mut t.trails, frame, w, h, scene, &boxes, clear, fixed, aspect),
     };
     let mut text_cells: Vec<usize> = Vec::new();
     let put = |c: usize, ch: char, t: &mut TagState, j: &mut Journal, cells: &mut [char], colors: &mut [u32]| {
@@ -1050,8 +1427,10 @@ fn draw_tags(
         let Some(((cx, cy), r)) = screen_circle(frame, inst.center, inst.scale * factor.max(1.0)) else { continue };
         // Start at the tag's inner corner, on the solid's side: the line runs
         // only through the gap between the two, never under the text.
-        let sx = if a.rightward { a.x as f32 - 1.0 } else { a.x as f32 + 1.0 } + 0.5;
-        let sy = a.y as f32 + if a.above { 1.0 } else { -1.0 } + 0.5;
+        let (sx, sy) = a.lead.unwrap_or((
+            if a.rightward { a.x as f32 - 1.0 } else { a.x as f32 + 1.0 } + 0.5,
+            a.y as f32 + if a.above { 1.0 } else { -1.0 } + 0.5,
+        ));
         let (dx, dy) = (cx - sx, cy - sy);
         if dy * if a.above { 1.0 } else { -1.0 } <= 0.0 {
             continue; // the solid isn't past the tag's row: no line needed
@@ -1681,6 +2060,8 @@ mod tests {
             tag_labels: &[],
             tag_ink: color::NONE,
             tag_scale: 0,
+            tag_place: TagPlace::Circle,
+            tag_font: TagFont::Strokes,
             tag_fixed: false,
         };
         let out = o.compose(&view, W, H, &scene, &opt);
@@ -1788,6 +2169,8 @@ mod tests {
             tag_ink: color::NONE,
             tag_scale: 0,
             // beside each solid (the circle has its own test)
+            tag_place: TagPlace::Beside,
+            tag_font: TagFont::Strokes,
             tag_fixed: true,
         }
     }
@@ -1964,6 +2347,120 @@ mod tests {
             }
             let full = Overlays::new(&scene).compose(&view, w, h, &scene, &opt(f)).chars.to_vec();
             assert_eq!(chars, full, "halo {f}: incremental matches full");
+        }
+    }
+
+    #[test]
+    fn pixel_fonts_draw_every_glyph_in_five_even_rows() {
+        for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789%.,:-+/()<> ?".chars() {
+            let g = pixel_glyph(c);
+            assert!(g.iter().all(|r| r.len() == g[0].len() && r.chars().all(|p| p == '#' || p == '.')), "{c:?}: {g:?}");
+        }
+        for font in TagFont::ALL {
+            for k in [1, 2] {
+                let rows = tag_lines_in("NET 7%", k, font);
+                let want = if font == TagFont::Strokes { 3 } else { 5 } * k as usize;
+                assert_eq!(rows.len(), want, "{font:?} {k}x");
+                assert!(rows.iter().all(|r| r.len() == rows[0].len()), "{font:?} {k}x: even rows");
+                if let Some(ink) = font.ink() {
+                    let lit: String = rows.iter().flatten().filter(|c| **c != ' ').collect();
+                    assert!(!lit.is_empty() && lit.chars().all(|c| ink.contains(c)), "{font:?}: only its ink");
+                }
+            }
+            // one-line tags are the same in every font
+            assert_eq!(tag_lines_in("CPU 1%", 0, font), tag_lines("CPU 1%", 0));
+        }
+        assert_eq!(TagFont::random(9), TagFont::random(9), "the same for a seed");
+        let seen: std::collections::HashSet<_> = (0..60).map(|s| format!("{:?}", TagFont::random(s))).collect();
+        assert!(seen.len() >= 4, "seeds pick different fonts: {seen:?}");
+    }
+
+    #[test]
+    fn every_tag_position_keeps_tags_on_the_picture_and_beside_the_right_solid() {
+        let (w, h) = (200, 70);
+        let anim = AnimParams::default();
+        let slots: Vec<crate::scene::SlotLayout> =
+            (0..5).map(|i| crate::scene::SlotLayout { solid: SolidKind::ALL[i], ring: None }).collect();
+        let cam = crate::scene::CameraParams { mode: crate::scene::camera::CameraMode::Orbit, ..Default::default() };
+        let labels: Vec<String> = ["CPU 12%", "RAM 40%", "GPU 3%", "DSK 1.0M", "NET 0.2M"].map(String::from).to_vec();
+        let ramp = Ramp::default();
+        let ch = vec![crate::metrics::Channel { available: true, level: 0.6, spin_y: 0.5, spin_x: 0.2, activity: 0.6 }; 5];
+        for place in TagPlace::ALL {
+            let mut scene = Scene::new(&slots, &anim, &cam);
+            let mut r = Renderer::new();
+            let mut ov = Overlays::new(&scene);
+            let opt = OverlayOptions { tag_place: place, ..tag_opts(&ramp, &labels, None, false) };
+            for step in 0..12 {
+                r.render(&scene, w, h, &RenderSettings { spp: 1, ..RenderSettings::default() });
+                let view = r.view().unwrap();
+                let chars = ov.compose(&view, w, h, &scene, &opt).chars.to_vec();
+                // every tag drawn once, whole
+                for l in &labels {
+                    let text = format!("{TAG_RULE}{l}{TAG_RULE}");
+                    let found = chars.chunks(w).filter(|row| row.iter().collect::<String>().contains(&text)).count();
+                    assert_eq!(found, 1, "{place:?} step {step}: {text} drawn once");
+                }
+                let boxes: Vec<(usize, usize)> = labels.iter().map(|l| tag_box(&tag_lines(l, 0))).collect();
+                match place {
+                    TagPlace::Below => {
+                        let a = place_tags_below(&view, w, h, &scene, &boxes, TAG_CLEAR_PLAIN, true, None);
+                        for (i, s) in scene.solids.iter().enumerate() {
+                            let ((cx, cy), _) = screen_circle(&view, s.center, s.scale).unwrap();
+                            let a = a[i].unwrap();
+                            let mid = a.x as f32 + boxes[i].0 as f32 * 0.5;
+                            assert!(a.y as f32 > cy, "{step}: tag {i} under its solid");
+                            assert!((mid - cx).abs() < 1.5 || a.x == 0 || a.x + boxes[i].0 == w, "{step}: tag {i} centred ({mid} vs {cx})");
+                        }
+                    }
+                    TagPlace::Corner => {
+                        let a = place_tags_corner(&mut Vec::new(), &view, w, h, &scene, &boxes, None);
+                        for (i, s) in scene.solids.iter().enumerate() {
+                            let (cx, cy) = view.proj.project(s.center).unwrap();
+                            let a = a[i].unwrap();
+                            let at_edge = if cx < w as f32 / 2.0 { a.x + 1 - boxes[i].0 == TAG_CORNER_MARGIN } else { a.x + boxes[i].0 == w - TAG_CORNER_MARGIN };
+                            assert!(at_edge, "{step}: tag {i} at its side's edge");
+                            assert_eq!(a.above, cy < h as f32 / 2.0, "{step}: tag {i} in its half's corner");
+                        }
+                    }
+                    _ => {}
+                }
+                scene.update(&ch, &anim, 0.25);
+            }
+        }
+    }
+
+    #[test]
+    fn trailing_tags_settle_behind_the_motion() {
+        let (w, h) = (200, 70);
+        let anim = AnimParams::default();
+        let cam = crate::scene::CameraParams { mode: crate::scene::camera::CameraMode::Orbit, ..Default::default() };
+        let slots: Vec<crate::scene::SlotLayout> =
+            (0..5).map(|i| crate::scene::SlotLayout { solid: SolidKind::ALL[i], ring: None }).collect();
+        let mut scene = Scene::new(&slots, &anim, &cam);
+        let boxes = vec![(TAG_MIN_W, 1); 5];
+        let mut trails = Vec::new();
+        let mut r = Renderer::new();
+        let ch = vec![crate::metrics::Channel { available: true, level: 0.5, spin_y: 0.3, spin_x: 0.1, activity: 0.5 }; 5];
+        let mut last: Vec<(f32, f32)> = Vec::new();
+        for step in 0..60 {
+            r.render(&scene, w, h, &RenderSettings { spp: 1, ..RenderSettings::default() });
+            let view = r.view().unwrap();
+            let aspect = frame_aspect(&view);
+            let a = place_tags_trailing(&mut trails, &view, w, h, &scene, &boxes, TAG_CLEAR_PLAIN, true, aspect);
+            let now: Vec<(f32, f32)> = scene.solids.iter().map(|s| view.proj.project(s.center).unwrap()).collect();
+            if step >= 40 {
+                for i in 0..5 {
+                    let v = ((now[i].0 - last[i].0) * aspect, now[i].1 - last[i].1);
+                    let (_, dir) = trails[i].unwrap();
+                    if v.0.hypot(v.1) > 0.3 {
+                        // the trail points (mostly) the other way from the motion
+                        assert!(dir.0 * v.0 + dir.1 * v.1 < 0.0, "step {step}: tag {i} trails its solid");
+                    }
+                    assert!(a[i].is_some());
+                }
+            }
+            last = now;
+            scene.update(&ch, &anim, 0.25);
         }
     }
 
@@ -2342,6 +2839,8 @@ mod tests {
                 tag_labels: &[],
                 tag_ink: color::NONE,
                 tag_scale: 0,
+                tag_place: TagPlace::Circle,
+                tag_font: TagFont::Strokes,
                 tag_fixed: false,
             };
             let steps = [
@@ -2404,6 +2903,8 @@ mod tests {
                 tag_labels: &[],
                 tag_ink: color::NONE,
                 tag_scale: 0,
+                tag_place: TagPlace::Circle,
+                tag_font: TagFont::Strokes,
                 tag_fixed: false,
             };
             let loud = Halo { factor: 1.2, lum: 1.0, reach: 1.5 };
@@ -2476,6 +2977,8 @@ mod tests {
             tag_labels: &[],
             tag_ink: color::NONE,
             tag_scale: 0,
+            tag_place: TagPlace::Circle,
+            tag_font: TagFont::Strokes,
             tag_fixed: false,
         };
         let calm: &'static [f32] = &[1.15; 5];

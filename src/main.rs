@@ -12,7 +12,7 @@ use platomon::color::{self, ColorBy, ColorMap, Gradient};
 use platomon::collector::{Collector, gpu::GpuSampler, system::SystemSampler};
 use platomon::config::{Config, SlotSpec, split_assignment};
 use platomon::metrics::{Channel, MetricKind, MetricsState, Reading, activity_score};
-use platomon::overlay::{LegendPos, OverlayOptions, Overlays};
+use platomon::overlay::{LegendPos, OverlayOptions, Overlays, TagPlace};
 use platomon::render::{QualityGovernor, RenderSettings, Renderer, TraceSettings};
 use platomon::scene::camera::{CameraMode, CameraParams, OrbitDir};
 use platomon::scene::ground::{Pattern, Spin, parse_vec2};
@@ -133,9 +133,14 @@ struct Cli {
     /// Draw tag text as three-row block letters, easier to read on small fonts.
     #[arg(long)]
     tag_blocks: bool,
-    /// Fixed tag length: leader lines keep one length, growing only to keep tags off other solids.
+    /// Fixed tag length (beside, below and trailing tags): leader lines keep one length,
+    /// growing only to keep tags off other solids.
     #[arg(long)]
     tag_fixed_length: bool,
+    /// Where tags go: circle (round the picture's centre, nearest each solid), beside,
+    /// corner (stacked in the picture's corners), below or trailing (behind moving solids).
+    #[arg(long, value_name = "circle|beside|corner|below|trailing")]
+    tag_place: Option<TagPlace>,
     /// Extended floor: draw the ground plane 8x further out (shaded cheaply past the normal distance).
     #[arg(long)]
     far_ground: bool,
@@ -281,7 +286,7 @@ fn apply_cli(cfg: &mut Config, cli: &Cli) -> Result<(), String> {
     }
     set!(spp, bounces, fps_min, fps_max, ramp, char_aspect, aspect, aspect_mode, camera, orbit_period, orbit_dir, orbit_bob);
     set!(bg_lum, bg_pattern, bg_contrast, bg_scale, bg_sway, bg_sway_period, bg_rotate, bg_rotate_period, bg_waves, bg_wave_speed);
-    set!(legend_size, legend_opacity, legend_pos);
+    set!(legend_size, legend_opacity, legend_pos, tag_place);
     set!(color, color_by, bg_color, layout, ordering, spacing, focus_zoom, focus_tau);
     set!(distance_scale, orbit_center, orbit_velocity, orbit_inclination, orbit_eccentricity, orbit_variation);
     if let Some(n) = &cli.colors {
@@ -603,6 +608,8 @@ fn snapshot(cfg: &Config, slots: &[SlotSpec], ratio: Option<f32>, (w, h): (usize
         tag_labels: &labels,
         tag_ink: cfg.tag_ink(cmap.as_ref()),
         tag_scale: cfg.tag_blocks as u8,
+        tag_place: cfg.tag_place,
+        tag_font: platomon::overlay::TagFont::Strokes,
         tag_fixed: cfg.tag_fixed_len,
     };
     let mut overlays = Overlays::new(&scene);
@@ -943,6 +950,8 @@ fn run(
             tag_labels: &tag_labels,
             tag_ink,
             tag_scale: cfg.tag_blocks as u8,
+            tag_place: cfg.tag_place,
+            tag_font: platomon::overlay::TagFont::Strokes,
             tag_fixed: cfg.tag_fixed_len,
         };
         if let Some(view) = renderer.view() {

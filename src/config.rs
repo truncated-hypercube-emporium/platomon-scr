@@ -9,7 +9,7 @@ use crate::clock::FpsCurve;
 use crate::color::{self, ColorBy, ColorMap, Gradient, HaloColor};
 use crate::scene::{Arrangement, DISTANCE_SCALE_RANGE, Layout, OrbitCenter, OrbitParams, Ordering, SPACING_RANGE};
 use crate::metrics::{MetricKind, MetricSpec};
-use crate::overlay::{LEGEND_SIZE_MAX, LEGEND_SIZE_MIN, LegendParams, LegendPos};
+use crate::overlay::{LEGEND_SIZE_MAX, LEGEND_SIZE_MIN, LegendParams, LegendPos, TagPlace};
 use crate::scene::camera::{CameraMode, OrbitDir};
 use crate::scene::ground::{self, GroundParams, Pattern, Spin};
 use crate::scene::sdf::SolidKind;
@@ -174,6 +174,9 @@ pub struct Config {
     /// Fixed tag length: tags placed for each solid's current size so the
     /// leader keeps one length, growing only to keep tags off other solids.
     pub tag_fixed_len: bool,
+    /// Where tags go: `circle` (round the picture's centre), `beside`,
+    /// `corner` (stacked in the corners), `below` or `trailing`.
+    pub tag_place: TagPlace,
     /// Sound halo colour (with a gradient on): `under` (what it passes
     /// over), `solid` (its own solid's colour), `size` (quiet → loud along
     /// the gradient) or `bass`. The halo itself is the screensaver's.
@@ -277,6 +280,7 @@ impl Default for Config {
             auto_distance: false,
             far_ground: false,
             tag_fixed_len: false,
+            tag_place: TagPlace::Circle,
             halo_color: HaloColor::Under,
             camera: CameraMode::Static,
             orbit_period: 60.0,
