@@ -1,5 +1,5 @@
 //! The scene: one solid per slot on concentric rings, a ground plane at
-//! y = 0, one spherical area light and a dim uniform sky.
+//! z = 0, one spherical area light and a dim uniform sky.
 
 pub mod camera;
 pub mod ground;
@@ -78,7 +78,7 @@ pub struct Light {
 
 /// Where the light sits relative to the centroid, per unit of layout scale,
 /// and its radius (tuned on the default 5-solid ring).
-const LIGHT_OFFSET: Vec3A = Vec3A::new(-7.0, 11.0, 4.0);
+const LIGHT_OFFSET: Vec3A = Vec3A::new(-7.0, -4.0, 11.0);
 const LIGHT_RADIUS: f32 = 2.2;
 /// The light's near surface stays at least this many times the camera's
 /// furthest reach from the centroid.
@@ -118,12 +118,12 @@ pub struct SlotLayout {
     pub ring: Option<u32>,
 }
 
-/// Ground-plane positions (y = 0) and the compacted ring index of every slot.
+/// Ground-plane positions (z = 0) and the compacted ring index of every slot.
 ///
 /// Explicit rings are honoured; automatic slots fill rings from the inside,
 /// `RING_CAPACITY` per ring. Empty rings are skipped, so ring numbers only
 /// order the rings. Within a ring, slots keep their `show` order, starting at
-/// the front (+z); odd rings are rotated half a step so solids interleave.
+/// the front (−y, toward the camera's starting view); odd rings are rotated half a step so solids interleave.
 pub fn ring_layout(rings: &[Option<u32>]) -> (Vec<Vec3A>, Vec<usize>) {
     ring_layout_spaced(rings, 1.0)
 }
@@ -154,7 +154,7 @@ pub fn ring_layout_spaced(rings: &[Option<u32>], spacing: f32) -> (Vec<Vec3A>, V
         let offset = if k % 2 == 1 { PI / n } else { 0.0 };
         for (j, &i) in members.iter().enumerate() {
             let th = offset + j as f32 * TAU / n;
-            pos[i] = Vec3A::new(r * th.sin(), 0.0, r * th.cos());
+            pos[i] = Vec3A::new(r * th.sin(), -(r * th.cos()), 0.0);
         }
     }
     (pos, compact)
@@ -166,10 +166,10 @@ pub fn fibonacci_sphere(n: usize, yaw: f32) -> Vec<Vec3A> {
     let golden = PI * (3.0 - 5f32.sqrt());
     (0..n)
         .map(|i| {
-            let y = 1.0 - 2.0 * (i as f32 + 0.5) / n as f32;
-            let r = (1.0 - y * y).max(0.0).sqrt();
+            let z = 1.0 - 2.0 * (i as f32 + 0.5) / n as f32;
+            let r = (1.0 - z * z).max(0.0).sqrt();
             let th = yaw + i as f32 * golden;
-            Vec3A::new(r * th.sin(), y, r * th.cos())
+            Vec3A::new(r * th.sin(), -(r * th.cos()), z)
         })
         .collect()
 }
@@ -213,7 +213,7 @@ pub fn shell_layout_spaced(rings: &[Option<u32>], spacing: f32) -> (Vec<Vec3A>, 
         prev = Some(r);
     }
     let outer = radii.last().copied().unwrap_or(0.0);
-    let centre = Vec3A::new(0.0, outer + BASE_RADIUS + HOVER, 0.0);
+    let centre = Vec3A::new(0.0, 0.0, outer + BASE_RADIUS + HOVER);
     let mut pos = vec![centre; rings.len()];
     let mut next = vec![0usize; nshells];
     for (i, &k) in compact.iter().enumerate() {
@@ -231,10 +231,10 @@ pub fn line_layout(n: usize, spacing: f32) -> Vec<Vec3A> {
 }
 
 /// `n` centres one above another on the vertical axis, `SPACING × spacing`
-/// apart, the lowest at y = 0 (the scene lifts the stack clear of the floor).
+/// apart, the lowest at z = 0 (the scene lifts the stack clear of the floor).
 pub fn stack_layout(n: usize, spacing: f32) -> Vec<Vec3A> {
     let gap = SPACING * spacing;
-    (0..n).map(|i| Vec3A::new(0.0, i as f32 * gap, 0.0)).collect()
+    (0..n).map(|i| Vec3A::new(0.0, 0.0, i as f32 * gap)).collect()
 }
 
 /// The order slots take the layout's places in (first place first: the
@@ -469,9 +469,9 @@ pub struct Scene {
     pub sky: f32,
     /// Radiance of escaping camera rays.
     pub background: f32,
-    /// Background plane at y = 0 (pattern, motion; disabled at luminosity 0).
+    /// Background plane at z = 0 (pattern, motion; disabled at luminosity 0).
     pub ground: Ground,
-    /// Top of the y-slab that contains every solid.
+    /// Top of the z-slab (height band) that contains every solid.
     pub slab_top: f32,
     /// Circumradius of a solid at full size.
     pub max_radius: f32,
@@ -509,7 +509,7 @@ impl Scene {
         let order = placement_order(&kinds, arr.ordering, arr.seed);
         let rings: Vec<Option<u32>> = order.iter().map(|&i| slots[i].ring).collect();
         let max_r = BASE_RADIUS * anim.max_scale.max(anim.min_scale);
-        let float_y = max_r * HALO_REACH_MAX + FLOAT_GAP;
+        let float_z = max_r * HALO_REACH_MAX + FLOAT_GAP;
         let k_dist = clamp_distance_scale(arr.distance_scale);
         // Orbits: the centre is raised so the lowest point of any orbit
         // keeps the largest halo clear of the ground.
@@ -519,7 +519,7 @@ impl Scene {
         let mut orbits = (layout == Layout::Orbit).then(|| {
             let clear = SPACING * spacing.max(ORBIT_MIN_CLEARANCE);
             let step = orbit::ORBIT_STEP * spacing;
-            Orbits::new(&order, &arr.orbit, arr.center_slot, clear, MIN_RING_RADIUS * spacing, step, float_y, arr.seed)
+            Orbits::new(&order, &arr.orbit, arr.center_slot, clear, MIN_RING_RADIUS * spacing, step, float_z, arr.seed)
         });
         // Orbiting solids' neighbours come and go: allow for the largest
         // size distance scaling can give them (a negative factor grows
@@ -529,7 +529,7 @@ impl Scene {
             k => distance_factor(k, 2.0 * o.reach),
         });
         if let (Some(o), Some(g)) = (&mut orbits, orbit_grow) {
-            o.centre.y += max_r * (g - 1.0).max(0.0) * HALO_REACH_MAX;
+            o.centre.z += max_r * (g - 1.0).max(0.0) * HALO_REACH_MAX;
         }
         let (placed, placed_index, centroid) = match layout {
             Layout::Orbit => {
@@ -559,7 +559,7 @@ impl Scene {
         let size_factor = nearest_factors(k_dist, &ring_pos);
         let grow = orbit_grow.unwrap_or_else(|| size_factor.iter().copied().fold(0.0, f32::max)).max(DISTANCE_FACTOR.0);
         let max_r = max_r * grow;
-        let float_y = max_r * HALO_REACH_MAX + FLOAT_GAP;
+        let float_z = max_r * HALO_REACH_MAX + FLOAT_GAP;
         // (orbiting solids reach their apoapsis, wherever they start)
         let reach = orbits.as_ref().map_or(0.0, |o| o.reach);
         let extent =
@@ -572,14 +572,14 @@ impl Scene {
         let (mut ring_pos, mut centroid) = (ring_pos, centroid);
         match layout {
             Layout::Orbit => {}
-            Layout::Rings | Layout::Line => centroid.y += float_y - (max_r + HOVER),
+            Layout::Rings | Layout::Line => centroid.z += float_z - (max_r + HOVER),
             Layout::Sphere | Layout::Stack => {
-                let low = ring_pos.iter().map(|p| p.y).fold(f32::INFINITY, f32::min) - max_r * HALO_REACH_MAX;
+                let low = ring_pos.iter().map(|p| p.z).fold(f32::INFINITY, f32::min) - max_r * HALO_REACH_MAX;
                 let lift = (FLOAT_GAP - low).max(0.0);
                 for p in &mut ring_pos {
-                    p.y += lift;
+                    p.z += lift;
                 }
-                centroid.y += lift;
+                centroid.z += lift;
             }
         }
         let k = extent / REF_EXTENT;
@@ -628,7 +628,7 @@ impl Scene {
             sky: 0.12,
             background: 0.0,
             // Rotation centre: the focal point the camera looks at, on the ground.
-            ground: Ground::new(&GroundParams::default(), Vec2::new(centroid.x, centroid.z)),
+            ground: Ground::new(&GroundParams::default(), Vec2::new(centroid.x, centroid.y)),
             slab_top: 2.0 * BASE_RADIUS + HOVER,
             max_radius: max_r,
             grounded,
@@ -647,7 +647,7 @@ impl Scene {
 
     /// Replace the background settings (keeps the focal-point pivot).
     pub fn with_ground(mut self, p: &GroundParams) -> Self {
-        self.ground = Ground::new(p, Vec2::new(self.centroid.x, self.centroid.z));
+        self.ground = Ground::new(p, Vec2::new(self.centroid.x, self.centroid.y));
         self
     }
 
@@ -659,14 +659,14 @@ impl Scene {
 
     fn set_scale(&mut self, i: usize, scale: f32) {
         let r = (scale * BASE_RADIUS).max(1e-3);
-        let float_y = self.float_y();
+        let float_z = self.float_z();
         let inst = &mut self.solids[i];
         inst.scale = r;
         inst.inv_scale = 1.0 / r;
         inst.center = if self.grounded {
             // Float at a fixed height whatever the size, high enough that the
             // largest halo never dips into the ground.
-            self.ring_pos[i] + Vec3A::new(0.0, float_y, 0.0)
+            self.ring_pos[i] + Vec3A::new(0.0, 0.0, float_z)
         } else {
             self.ring_pos[i]
         };
@@ -681,7 +681,7 @@ impl Scene {
     }
 
     /// Rings: the height every solid's centre floats at.
-    pub fn float_y(&self) -> f32 {
+    pub fn float_z(&self) -> f32 {
         self.max_radius * HALO_REACH_MAX + FLOAT_GAP
     }
 
@@ -689,7 +689,7 @@ impl Scene {
     /// a fixed height, so this is where it always is).
     pub fn full_size_center(&self, i: usize) -> Vec3A {
         let p = self.ring_pos.get(i).copied().unwrap_or(self.centroid);
-        if self.grounded { p + Vec3A::new(0.0, self.float_y(), 0.0) } else { p }
+        if self.grounded { p + Vec3A::new(0.0, 0.0, self.float_z()) } else { p }
     }
 
     /// Slot the focus camera is on (or heading to).
@@ -729,7 +729,7 @@ impl Scene {
         let mut top: f32 = 0.0;
         for (inst, &(pitch, yaw)) in self.solids.iter_mut().zip(&self.angles) {
             inst.inv_rot = inverse_rotation(pitch, yaw);
-            top = top.max(inst.center.y + inst.scale);
+            top = top.max(inst.center.z + inst.scale);
         }
         self.slab_top = top + 1e-2;
     }
@@ -743,8 +743,8 @@ impl Scene {
         for (i, s) in self.solids.iter().enumerate() {
             let (pr, yr) = self.spin_rates.get(i).copied().unwrap_or_default();
             let yaw = self.angles.get(i).map_or(0.0, |a| a.1);
-            // R = Ry(yaw) * Rx(pitch): world angular velocity
-            let w = Vec3A::Y * yr + Mat3A::from_rotation_y(yaw) * Vec3A::X * pr;
+            // R = Rz(yaw) * Rx(pitch): world angular velocity
+            let w = Vec3A::Z * yr + Mat3A::from_rotation_z(yaw) * Vec3A::X * pr;
             let view = (eye - s.center).normalize_or_zero();
             out.push((0.5 + 0.5 * w.dot(view) / self.spin_max).clamp(0.0, 1.0));
         }
@@ -817,11 +817,11 @@ mod tests {
         let mut s = Scene::demo(&anim);
         s.update(&full(5), &anim, 0.1);
         for inst in &s.solids {
-            assert!(inst.center.y - inst.scale >= HOVER - 1e-5);
-            assert!(inst.center.y + inst.scale <= s.slab_top);
+            assert!(inst.center.z - inst.scale >= HOVER - 1e-5);
+            assert!(inst.center.z + inst.scale <= s.slab_top);
             assert!((inst.scale - anim.max_scale * BASE_RADIUS).abs() < 1e-6);
         }
-        assert!((s.ring_pos[0] - Vec3A::new(0.0, 0.0, MIN_RING_RADIUS)).length() < 1e-5, "first slot front-centre");
+        assert!((s.ring_pos[0] - Vec3A::new(0.0, -MIN_RING_RADIUS, 0.0)).length() < 1e-5, "first slot front-centre");
     }
 
     fn min_gap(pos: &[Vec3A]) -> f32 {
@@ -866,7 +866,7 @@ mod tests {
                 assert!(min_gap(&pos) >= SPACING - 1e-3, "n={n}: {}", min_gap(&pos));
             }
             for p in &pos {
-                assert!(p.y - BASE_RADIUS >= HOVER - 1e-4, "n={n}: full-size solid clears the ground");
+                assert!(p.z - BASE_RADIUS >= HOVER - 1e-4, "n={n}: full-size solid clears the ground");
             }
             assert_eq!(shell.iter().filter(|&&s| s == 0).count(), n.min(RING_CAPACITY));
             // every member of a shell is the same distance from the centre
@@ -891,10 +891,10 @@ mod tests {
         s.update(&full(12), &anim, 0.1);
         for (a, b) in before.iter().zip(&s.solids) {
             assert!((*a - b.center).length() < 1e-5, "scaling about a fixed centre");
-            assert!(b.center.y - b.scale >= HOVER - 1e-4);
-            assert!(b.center.y + b.scale <= s.slab_top);
+            assert!(b.center.z - b.scale >= HOVER - 1e-4);
+            assert!(b.center.z + b.scale <= s.slab_top);
         }
-        assert!(s.centroid.y > 1.0, "shell centre is raised");
+        assert!(s.centroid.z > 1.0, "shell centre is raised");
         assert!("Sphere".parse::<Layout>().unwrap() == Layout::Sphere && "x".parse::<Layout>().is_err());
     }
 
@@ -992,8 +992,8 @@ mod tests {
             assert!((w[1] - w[0] - SPACING).abs() < 1e-4, "even gaps: {xs:?}");
         }
         assert!(xs.iter().sum::<f32>().abs() < 1e-3, "centred");
-        assert!(line.solids.iter().all(|i| (i.center.y - line.solids[0].center.y).abs() < 1e-5 && i.center.z.abs() < 1e-5));
-        assert!(line.solids.iter().all(|i| i.center.y - i.scale * HALO_REACH_MAX >= FLOAT_GAP - 1e-3), "halos clear the floor");
+        assert!(line.solids.iter().all(|i| (i.center.z - line.solids[0].center.z).abs() < 1e-5 && i.center.y.abs() < 1e-5));
+        assert!(line.solids.iter().all(|i| i.center.z - i.scale * HALO_REACH_MAX >= FLOAT_GAP - 1e-3), "halos clear the floor");
         // listed order runs left to right; simple-first puts the tetrahedron left, the most complex right
         let x = cx(&line);
         assert!(x.windows(2).all(|w| w[0] < w[1]), "listed order: {x:?}");
@@ -1008,14 +1008,14 @@ mod tests {
         assert!((gap(&wide) - 2.0 * gap(&line)).abs() < 1e-4);
         // stack: one column, evenly spaced, the lowest halo clear of the floor
         let stack = build(Layout::Stack, Ordering::Complex, 1.0);
-        let mut by_y: Vec<(f32, SolidKind)> = stack.solids.iter().map(|i| (i.center.y, i.poly.kind())).collect();
+        let mut by_y: Vec<(f32, SolidKind)> = stack.solids.iter().map(|i| (i.center.z, i.poly.kind())).collect();
         by_y.sort_by(|a, b| a.0.total_cmp(&b.0));
-        assert!(stack.solids.iter().all(|i| i.center.x.abs() < 1e-4 && i.center.z.abs() < 1e-4), "a column");
+        assert!(stack.solids.iter().all(|i| i.center.x.abs() < 1e-4 && i.center.y.abs() < 1e-4), "a column");
         for w in by_y.windows(2) {
             assert!((w[1].0 - w[0].0 - SPACING).abs() < 1e-4, "even steps");
             assert!(w[0].1.complexity() >= w[1].1.complexity(), "complex at the bottom: {by_y:?}");
         }
-        let lowest = stack.solids.iter().map(|i| i.center.y - stack.max_radius * HALO_REACH_MAX).fold(f32::MAX, f32::min);
+        let lowest = stack.solids.iter().map(|i| i.center.z - stack.max_radius * HALO_REACH_MAX).fold(f32::MAX, f32::min);
         assert!(lowest >= FLOAT_GAP - 1e-3, "lowest halo clear: {lowest}");
         // random: a permutation, the same for the same seed
         let k = [SolidKind::Cube; 6];
@@ -1027,7 +1027,7 @@ mod tests {
         assert!((0..20).any(|s| placement_order(&k, Ordering::Random, s) != a), "seeds differ");
         // rings and spheres take ordering too: simple-first puts the simplest solid in slot order's first place
         let rings = build(Layout::Rings, Ordering::Simple, 1.0);
-        let front = rings.solids.iter().max_by(|a, b| a.center.z.total_cmp(&b.center.z)).unwrap();
+        let front = rings.solids.iter().min_by(|a, b| a.center.y.total_cmp(&b.center.y)).unwrap();
         assert_eq!(front.poly.kind(), SolidKind::Tetrahedron, "first place (the front) holds the simplest");
         assert!("Line".parse::<Layout>().unwrap() == Layout::Line && "stack".parse::<Layout>().unwrap() == Layout::Stack);
         assert_eq!("complex".parse::<Ordering>().unwrap(), Ordering::Complex);
@@ -1045,8 +1045,8 @@ mod tests {
         for _ in 0..600 {
             s.update(&full(6), &anim, 1.0 / 30.0);
             for inst in &s.solids {
-                assert!(inst.center.y - inst.scale * HALO_REACH_MAX >= FLOAT_GAP - 1e-3, "halo clear of the floor");
-                assert!(inst.center.y + inst.scale <= s.slab_top);
+                assert!(inst.center.z - inst.scale * HALO_REACH_MAX >= FLOAT_GAP - 1e-3, "halo clear of the floor");
+                assert!(inst.center.z + inst.scale <= s.slab_top);
                 assert!((inst.center - s.centroid).length() <= s.extent, "inside the framed extent");
             }
         }
@@ -1073,7 +1073,7 @@ mod tests {
             let r = plain.solids[i].scale;
             assert!((big.solids[i].scale - 1.5 * r).abs() < 1e-4, "1 + 0.5 x (2 - 1)");
             assert!((small.solids[i].scale - 0.5 * r).abs() < 1e-4);
-            assert!(big.solids[i].center.y - big.solids[i].scale * HALO_REACH_MAX >= FLOAT_GAP - 1e-3, "grown halos clear the floor");
+            assert!(big.solids[i].center.z - big.solids[i].scale * HALO_REACH_MAX >= FLOAT_GAP - 1e-3, "grown halos clear the floor");
         }
         assert!(big.extent > plain.extent);
         // clamped at both ends
@@ -1090,7 +1090,7 @@ mod tests {
                 s.update(&full(5), &anim, 1.0 / 30.0);
                 seen.push(s.size_factor[1]);
                 for inst in &s.solids {
-                    assert!(inst.center.y - inst.scale * HALO_REACH_MAX >= FLOAT_GAP - 1e-3, "k={k}");
+                    assert!(inst.center.z - inst.scale * HALO_REACH_MAX >= FLOAT_GAP - 1e-3, "k={k}");
                 }
             }
             assert!(seen.iter().any(|f| (f - seen[0]).abs() > 1e-3), "k={k}: the factor changes as solids move");
@@ -1158,6 +1158,6 @@ mod tests {
         let s = Scene::demo(&AnimParams::default());
         let inst = &s.solids[1]; // cube
         assert!((inst.sdf(inst.center) + inst.poly.inradius() * inst.scale).abs() < 1e-4);
-        assert!(inst.sdf(inst.center + Vec3A::new(0.0, inst.scale * 1.01, 0.0)) > 0.0);
+        assert!(inst.sdf(inst.center + Vec3A::new(0.0, 0.0, inst.scale * 1.01)) > 0.0);
     }
 }

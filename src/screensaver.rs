@@ -341,6 +341,14 @@ pub fn plan_config(d: &Display, seed: u64, s: &ScrSettings) -> Config {
     config.ordering = s.ordering;
     config.orbit_center = s.orbit_center;
     config.adaptive_quality = s.adaptive;
+    if !s.random {
+        // a chosen look keeps its floor as the dialog shows it: Background
+        // sliders on auto at their defaults (not the random roll's scroll,
+        // sway or pattern shape); it turns as Floor turn says (in apply)
+        for t in TUNABLES.iter().filter(|t| t.panel == Panel::Background) {
+            set_tunable(&mut config, t.key, tunable_auto(t.key));
+        }
+    }
     for &(k, v) in &s.tuning {
         set_tunable(&mut config, k, v);
     }
@@ -516,6 +524,8 @@ pub struct ScrSettings {
     pub bg_wave_speed: f32,
     /// Polka floor: inverted on one side of a line through the centre.
     pub bg_invert_half: bool,
+    /// The floor pattern's turn (off, clockwise, anticlockwise).
+    pub bg_rotate: Spin,
     pub wireframe: bool,
     pub stats: bool,
     pub fps_invert: bool,
@@ -608,6 +618,7 @@ impl Default for ScrSettings {
             bg_waves: crate::scene::ground::WAVES_DEFAULT,
             bg_wave_speed: crate::scene::ground::WAVE_SPEED_DEFAULT,
             bg_invert_half: false,
+            bg_rotate: Spin::Off,
             wireframe: false,
             stats: false,
             fps_invert: false,
@@ -741,7 +752,7 @@ pub const TUNABLES: [Tunable; 40] = [
     tunable!(Background, "bg_sway_period", "Sway period (s)", 3.0, 30.0, 1.0, "Seconds per floor sway cycle."),
     tunable!(Background, "bg_rotate_period", "Floor turn period (s)", 10.0, 180.0, 5.0, "Seconds per turn when the floor pattern rotates."),
     tunable!(Background, "bg_scroll_x", "Floor scroll X", -1.0, 1.0, 0.05, "How fast the floor pattern slides sideways (x), world units per second; 0 holds it."),
-    tunable!(Background, "bg_scroll_z", "Floor scroll Z", -1.0, 1.0, 0.05, "How fast the floor pattern slides forward or back (z), world units per second; 0 holds it."),
+    tunable!(Background, "bg_scroll_y", "Floor scroll Y", -1.0, 1.0, 0.05, "How fast the floor pattern slides forward or back (y, away from the camera's starting view), world units per second; 0 holds it."),
     tunable!(Background, "bg_sectors", "Radial sectors", 4.0, 32.0, 2.0, "Radial floor: how many sectors the rings are cut into round the focal point."),
     tunable!(Background, "bg_ripple", "Ripple spacing", 0.3, 2.0, 0.05, "Rain floor: the distance between a drop's ripples, in tiles."),
     tunable!(Background, "bg_drop_life", "Drop life (s)", 1.0, 12.0, 0.5, "Rain floor: how long a drop's rings spread before they fade and a new drop lands (each drop varies by up to 30%)."),
@@ -794,6 +805,10 @@ pub fn bg_applies(key: &str, p: Option<Pattern>) -> bool {
     }
 }
 
+/// INI key of the Floor scroll Z slider, from before the floor was the x, y
+/// plane (read as Floor scroll Y, negated; cleared on save).
+const LEGACY_SCROLL_Z: &str = "tune_bg_scroll_z";
+
 /// Set config field `key` (a [`TUNABLES`] key) to `v`.
 pub fn set_tunable(c: &mut Config, key: &str, v: f32) {
     match key {
@@ -808,7 +823,7 @@ pub fn set_tunable(c: &mut Config, key: &str, v: f32) {
         "bg_rotate_period" => c.bg_rotate_period = v,
         "bg_drops" => c.bg_drops = v.round().max(1.0) as u32,
         "bg_scroll_x" => c.bg_scroll[0] = v,
-        "bg_scroll_z" => c.bg_scroll[1] = v,
+        "bg_scroll_y" => c.bg_scroll[1] = v,
         "bg_sectors" => c.bg_sectors = v.round().max(2.0) as u32,
         "bg_ripple" => c.bg_ripple = v,
         "bg_drop_life" => c.bg_drop_life = v,
@@ -867,7 +882,7 @@ pub fn get_tunable(c: &Config, key: &str) -> f32 {
         "bg_rotate_period" => c.bg_rotate_period,
         "bg_drops" => c.bg_drops as f32,
         "bg_scroll_x" => c.bg_scroll[0],
-        "bg_scroll_z" => c.bg_scroll[1],
+        "bg_scroll_y" => c.bg_scroll[1],
         "bg_sectors" => c.bg_sectors as f32,
         "bg_ripple" => c.bg_ripple,
         "bg_drop_life" => c.bg_drop_life,
@@ -919,6 +934,7 @@ pub fn help(key: &str) -> &'static str {
         "bg_options" => "Background options: the floor's colour, brightness, pattern contrast and tile size, sway and turning, and the moving patterns' flow, quasicrystal waves, raindrops and polka dots.",
         "bg_lum" => "Floor brightness, 0 (no floor) to 10.",
         "bg_invert_half" => "Polka floor: swap light and dark on one side of a line through the centre of the floor (the line turns when the floor turns).",
+        "bg_rotate" => "Whether the floor pattern slowly turns about the centre, and which way (seen from above). Floor turn period sets how fast.",
         "bg_waves" => "Quasicrystal floor: the number of plane waves, which sets its rotational symmetry (7 = sevenfold).",
         "bg_wave_speed" => "How fast the moving floor patterns flow: the quasicrystal's waves, the raindrops' ripples, the ocean's waves, the Julia set's drift and the clouds. Still holds them all.",
         "wireframe" => "Draw the edges of every solid over its shading.",
@@ -1251,6 +1267,7 @@ pub fn choices() -> Vec<Choice> {
         bg_look("bg_waves", "Quasicrystal waves", waves),
         bg_look("bg_wave_speed", "Pattern flow", speeds),
         bg_look("bg_invert_half", "Invert half", on_off()),
+        bg_look("bg_rotate", "Floor turn", vec![opt("off", "Off"), opt("cw", "Clockwise"), opt("ccw", "Anticlockwise")]),
         look("wireframe", "Wireframe overlay", on_off()),
         look("stats", "Stats bar", on_off()),
         look("fps_invert", "Inverted frame rate", on_off()),
@@ -1355,6 +1372,8 @@ impl ScrSettings {
             let set = self.tuning.iter().find(|(k, _)| *k == t.key).map(|&(_, x)| t.show(x));
             v.push((t.ini, set.unwrap_or_default()));
         }
+        // (cleared: Floor scroll Z, from before the floor was the x, y plane)
+        v.push((LEGACY_SCROLL_Z, String::new()));
         v
     }
 
@@ -1372,6 +1391,7 @@ impl ScrSettings {
             ("bg_waves", self.bg_waves.to_string()),
             ("bg_wave_speed", self.bg_wave_speed.to_string()),
             ("bg_invert_half", on_off(self.bg_invert_half)),
+            ("bg_rotate", match self.bg_rotate { Spin::Off => "off", Spin::Cw => "cw", Spin::Ccw => "ccw" }.into()),
             ("wireframe", on_off(self.wireframe)),
             ("stats", on_off(self.stats)),
             ("fps_invert", on_off(self.fps_invert)),
@@ -1447,6 +1467,7 @@ impl ScrSettings {
                 .filter(|v| v.is_finite() && (-20.0..=20.0).contains(v))
                 .unwrap_or(d.bg_wave_speed),
             bg_invert_half: flag("bg_invert_half", d.bg_invert_half),
+            bg_rotate: val("bg_rotate").and_then(|v| v.parse().ok()).unwrap_or(d.bg_rotate),
             custom_gradient: get(CUSTOM_GRADIENT_KEY).and_then(|v| parse_gradient(&v)).unwrap_or(d.custom_gradient.clone()),
             wireframe: flag("wireframe", d.wireframe),
             stats: flag("stats", d.stats),
@@ -1481,7 +1502,10 @@ impl ScrSettings {
             tuning: TUNABLES
                 .iter()
                 .filter_map(|t| {
-                    let v = val(t.ini)?.parse::<f32>().ok().filter(|v| v.is_finite())?;
+                    let num = |k: &str| val(k)?.parse::<f32>().ok().filter(|v| v.is_finite());
+                    // Floor scroll Z from before the floor was the x, y plane:
+                    // z ran toward the camera, y runs away from it
+                    let v = num(t.ini).or_else(|| (t.key == "bg_scroll_y").then(|| num(LEGACY_SCROLL_Z).map(|z| -z)).flatten())?;
                     Some((t.key, t.snap(v)))
                 })
                 .collect(),
@@ -1535,6 +1559,7 @@ impl ScrSettings {
         c.bg_waves = self.bg_waves;
         c.bg_wave_speed = self.bg_wave_speed;
         c.bg_invert_half = self.bg_invert_half;
+        c.bg_rotate = self.bg_rotate;
         c.wireframe = self.wireframe;
         c.show_stats = self.stats;
         c.fps_invert = self.fps_invert;
@@ -1667,6 +1692,28 @@ mod tests {
     }
 
     const WQHD: Display = Display { width: 2560, height: 1440, refresh: 144 };
+
+    #[test]
+    fn a_chosen_look_keeps_the_floor_as_the_dialog_shows_it() {
+        let d = Config::default();
+        let chosen = ScrSettings { random: false, tuning: vec![("bg_scroll_x", 0.25)], ..ScrSettings::default() };
+        let mut rolled = false;
+        for seed in 0..40 {
+            // Random start off: auto Background sliders at the default the
+            // dialog shows, the floor still (no random scroll, sway or turn)
+            let c = plan_config(&WQHD, seed, &chosen);
+            assert_eq!((c.bg_scroll, c.bg_sway, c.bg_rotate), ([0.25, 0.0], 0.0, Spin::Off), "seed {seed}");
+            assert_eq!((c.bg_dot_size, c.bg_dot_spacing, c.bg_scale), (d.bg_dot_size, d.bg_dot_spacing, d.bg_scale));
+            // Floor turn as chosen
+            let turning = plan_config(&WQHD, seed, &ScrSettings { bg_rotate: Spin::Cw, ..chosen.clone() });
+            assert_eq!(turning.bg_rotate, Spin::Cw);
+            // Random start on: still rolled
+            let r = plan_config(&WQHD, seed, &ScrSettings { random: true, ..chosen.clone() });
+            assert_eq!(r.bg_scroll[0], 0.25, "set sliders apply to a random look too");
+            rolled |= r.bg_sway > 0.0 || r.bg_rotate != Spin::Off;
+        }
+        assert!(rolled, "a random look still moves its floor sometimes");
+    }
 
     #[test]
     fn random_configs_are_valid_and_cheap() {
@@ -1828,6 +1875,7 @@ mod tests {
             bg_waves: 5,
             bg_wave_speed: 0.0,
             bg_invert_half: true,
+            bg_rotate: Spin::Ccw,
             wireframe: true,
             stats: false,
             fps_invert: true,
@@ -1974,7 +2022,7 @@ mod tests {
         let looks: Vec<&str> = choices().iter().filter(|c| c.look).map(|c| c.key).collect();
         assert_eq!(
             looks,
-            ["layout", "camera", "color", "color_by", "bg_color", "bg_pattern", "bg_lum", "bg_waves", "bg_wave_speed", "bg_invert_half", "wireframe", "stats", "fps_invert"]
+            ["layout", "camera", "color", "color_by", "bg_color", "bg_pattern", "bg_lum", "bg_waves", "bg_wave_speed", "bg_invert_half", "bg_rotate", "wireframe", "stats", "fps_invert"]
         );
         for c in choices() {
             assert!(keys.contains(&c.key), "{} is a settings key", c.key);
@@ -2006,6 +2054,14 @@ mod tests {
         // out of range or off-step values from the INI snap to the slider
         let s = ScrSettings::from_lookup(lookup(&[("tune_orbit_period", "47"), ("tune_max_spin", "99"), ("tune_bg_sway", "x")]));
         assert_eq!(s.tuning, vec![("orbit_period", 45.0), ("max_spin", 8.0)]);
+        // Floor scroll Z from before the floor was the x, y plane reads as
+        // Floor scroll Y, negated (same motion); a saved Y wins; saving clears Z
+        let old = ScrSettings::from_lookup(lookup(&[("tune_bg_scroll_z", "0.3")]));
+        assert_eq!(old.tuning, vec![("bg_scroll_y", -0.3)]);
+        let both = ScrSettings::from_lookup(lookup(&[("tune_bg_scroll_z", "0.3"), ("tune_bg_scroll_y", "0.5")]));
+        assert_eq!(both.tuning, vec![("bg_scroll_y", 0.5)]);
+        assert!(old.to_pairs().iter().any(|(k, v)| *k == "tune_bg_scroll_z" && v.is_empty()));
+        assert!(old.to_pairs().iter().any(|(k, v)| *k == "tune_bg_scroll_y" && v == "-0.30"), "{:?}", old.to_pairs().iter().find(|p| p.0 == "tune_bg_scroll_y"));
         for t in TUNABLES {
             assert_eq!(t.value_at(0), t.min, "{}", t.key);
             assert!((t.value_at(t.steps()) - t.max).abs() < 1e-4, "{}", t.key);

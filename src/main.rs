@@ -262,8 +262,8 @@ struct Cli {
     /// Tile size in world units (a full-size solid is 2 across).
     #[arg(long, value_name = "FLOAT")]
     bg_scale: Option<f32>,
-    /// Constant pattern translation, world units/s, e.g. 0.5:0 or -0.2:0.3.
-    #[arg(long, value_name = "DX:DZ", allow_hyphen_values = true)]
+    /// Constant pattern translation across the floor (x, y), world units/s, e.g. 0.5:0 or -0.2:0.3.
+    #[arg(long, value_name = "DX:DY", allow_hyphen_values = true)]
     bg_scroll: Option<String>,
     /// Radius of a circular back-and-forth translation; 0 = off.
     #[arg(long, value_name = "FLOAT")]

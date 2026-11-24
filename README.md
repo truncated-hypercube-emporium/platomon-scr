@@ -66,7 +66,7 @@ platomon [OPTIONS]
 | `--bg-pattern` | `solid\|checker\|diamond\|brick\|triangles\|hex\|radial\|quasicrystal\|rain\|ocean\|julia\|carpet\|clouds\|polka` | `solid` |
 | `--bg-contrast` | `0..1`, tile tone spread around `--bg-lum` | 0.5 |
 | `--bg-scale` | tile size, world units (a full-size solid is 2 across) | 1.0 |
-| `--bg-scroll` | `DX:DZ` world units/s, e.g. `0.5:0` or `-0.2:0.3` | `0:0` |
+| `--bg-scroll` | `DX:DY` world units/s across the floor (the x, y plane; z is up, +y away from the camera's starting view), e.g. `0.5:0` or `-0.2:0.3` | `0:0` |
 | `--bg-sway` | radius of a circular back-and-forth translation; 0 = off | 0 |
 | `--bg-sway-period` | seconds per sway cycle | 10 |
 | `--bg-rotate` | `off\|cw\|ccw`, about the camera's focal point (seen from above) | `off` |
@@ -659,14 +659,15 @@ drop-downs and above its check boxes, opens the background's settings (the patte
 *Quasicrystal waves* and *Pattern flow* (the speed of every moving pattern: quasicrystal, rain,
 ocean, julia and clouds; Still holds them all; these four are part of the look, greyed out while
 Random start is on), then the sliders moved here from *Tuning*: floor contrast, tile size (0.3 to 25), sway and
-its period and floor turn period, and new sliders: floor scroll X and Z, and each pattern's own
+its period and floor turn period, and new sliders: floor scroll X and Y, and each pattern's own
 settings: *Radial sectors*; for rain *Ripple spacing*, *Drop life* and *Raindrops* (how many drops
 ripple at once, 1–48); for the ocean *Wind direction* and *Wave choppiness*; for julia *Julia shape*
 and *Julia detail*; *Carpet levels*; for clouds *Cloud octaves* and *Cloud roughness*; for polka
 *Dot size*, *Dot spacing* and *Dot variability* (0 = identical dots on an even triangular lattice, up to 1 = sizes
 from none to twice the dot size and dots moved up to half the spacing), plus an *Invert half* check
 box (part of the look, saved as `bg_invert_half`) that swaps light and dark on one side of a line
-through the floor's centre. **Only the
+through the floor's centre, and for every pattern but plain a *Floor turn* drop-down (Off,
+Clockwise, Anticlockwise; part of the look, saved as `bg_rotate`). **Only the
 settings the chosen *Background pattern* uses are shown** (the dialog's title names it): the plain
 floor shows just colour and luminosity, a still pattern has no flow, and only the quasicrystal shows
 its waves. With *Random start* on, the pattern is random, so every setting is shown. Settings
@@ -689,7 +690,9 @@ colour* to *Custom*, which both drop-downs also offer. The gradient is saved as
 sliders, saved as a plain key), then numeric values: orbit period and bob, focus zoom and glide,
 smallest and largest solid size, idle and fastest spin, and exposure. Moving a slider sets that value for
 every run (random look or not); *×* or *Reset all* returns it to auto (the random look's or the
-default value). Set values are saved as `tune_<name>` keys; the button shows how many are set.
+default value). With Random start off, the floor keeps the defaults its *Background options*
+sliders show on auto: it scrolls or sways only as those sliders are set, and turns only as
+*Floor turn* says. Set values are saved as `tune_<name>` keys; the button shows how many are set.
 
 **Preview.** *Preview* (beside *Tuning…*) shows the dialog's settings, saved or not, in a window
 half the screen's size, rendered at half resolution with the full-screen run's text size. A click
@@ -847,6 +850,7 @@ bg_waves=7             ; quasicrystal waves (Background options)
 bg_wave_speed=0.6      ; pattern flow, 0 = still (Background options)
 tune_bg_drops=12       ; rain: raindrops at once (Background options, only when set)
 bg_invert_half=off     ; polka: invert one side of a line through the centre (Background options)
+bg_rotate=off          ; floor turn: off | cw | ccw (Background options)
 tune_bg_dot_variability=0.5 ; polka: how much dot sizes and places vary, 0..1 (also tune_bg_dot_size, tune_bg_dot_spacing)
 wireframe=off          ; on | off
 stats=off              ; on | off

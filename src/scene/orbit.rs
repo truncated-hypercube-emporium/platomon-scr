@@ -237,7 +237,7 @@ impl Orbits {
                 a0 = a;
             }
             prev = Some(a);
-            let r = Mat3A::from_rotation_y(node) * Mat3A::from_rotation_x(tilt) * Mat3A::from_rotation_y(peri);
+            let r = Mat3A::from_rotation_z(node) * Mat3A::from_rotation_x(tilt) * Mat3A::from_rotation_z(peri);
             let o = Orbit {
                 a,
                 e,
@@ -245,7 +245,7 @@ impl Orbits {
                 // spread the starting points (golden angle) so solids don't line up
                 m: (k as f32 * 2.399_963 + PI * var * start).rem_euclid(TAU),
                 p: r * Vec3A::X,
-                q: r * Vec3A::NEG_Z,
+                q: r * Vec3A::Y,
             };
             reach = reach.max(o.apoapsis());
             // any point of an orbit tilted by `tilt` is at most r·sin(tilt) below the centre
@@ -256,7 +256,7 @@ impl Orbits {
         }
         let pull = (0..n).map(|i| (if i == reference { 1.0 } else { 0.0 }, 0.0)).collect();
         Self {
-            centre: Vec3A::new(0.0, height + clearance, 0.0),
+            centre: Vec3A::new(0.0, 0.0, height + clearance),
             orbits,
             pull,
             center: p.center,
@@ -357,7 +357,7 @@ mod tests {
                     assert!(r >= orb.a * (1.0 - orb.e) - 1e-3 && r <= orb.apoapsis() + 1e-3, "slot {i}: r {r}");
                     assert!(r >= 2.6 - 1e-3, "clear of the centre solid");
                 }
-                assert!(now.y >= 2.0 - 1e-3, "never below the clearance: {}", now.y);
+                assert!(now.z >= 2.0 - 1e-3, "never below the clearance: {}", now.z);
                 assert!((now - *prev).length() < 1.0, "no jumps");
                 *prev = now;
             }
@@ -370,7 +370,7 @@ mod tests {
         let tilts = |var: f32| {
             let p = OrbitParams { inclination: 30.0, variation: var, ..OrbitParams::default() };
             let o = Orbits::new(&order, &p, Some(0), 2.6, 2.7, ORBIT_STEP, 0.0, 9);
-            o.orbits.iter().flatten().map(|o| o.q.y.asin().to_degrees()).collect::<Vec<f32>>()
+            o.orbits.iter().flatten().map(|o| o.q.z.asin().to_degrees()).collect::<Vec<f32>>()
         };
         let same = tilts(0.0);
         assert!(same.iter().all(|t| (t - 30.0).abs() < 1e-3), "{same:?}");

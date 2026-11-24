@@ -44,7 +44,7 @@ const GRAZING_MIN: f32 = 0.02;
 /// away: the pixel's width there, stretched along the floor at grazing angles.
 #[inline(always)]
 pub fn footprint(t: f32, rd: Vec3A, pixel_angle: f32) -> f32 {
-    t * pixel_angle / (-rd.y).max(GRAZING_MIN)
+    t * pixel_angle / (-rd.z).max(GRAZING_MIN)
 }
 
 /// Extended floor: how much further out the ground is drawn.
@@ -69,7 +69,7 @@ pub fn far_ground_radiance(scene: &Scene, p: Vec3A, albedo: f32) -> f32 {
     let to = l.center - p;
     let d = to.length().max(l.radius * 1.001);
     let cos_max = (1.0 - (l.radius / d).powi(2)).max(0.0).sqrt();
-    let ndl = (to.y / d).max(0.0);
+    let ndl = (to.z / d).max(0.0);
     albedo * (l.emission * ndl * 2.0 * (1.0 - cos_max) + scene.sky * AMBIENT_OCCLUSION)
 }
 
@@ -78,13 +78,14 @@ const RAY_OFFSET: f32 = 2e-3;
 /// Rough sky-visibility factor for paths truncated at the last bounce.
 const AMBIENT_OCCLUSION: f32 = 0.5;
 
-/// Orthonormal basis around unit `n` (Duff et al. 2017).
+/// Orthonormal basis around unit `n` (Duff et al. 2017), pivoting on the
+/// −y axis (the frame the sampling tables were made in).
 #[inline(always)]
 pub fn onb(n: Vec3A) -> (Vec3A, Vec3A) {
-    let s = 1.0f32.copysign(n.z);
-    let a = -1.0 / (s + n.z);
-    let b = n.x * n.y * a;
-    (Vec3A::new(1.0 + s * n.x * n.x * a, s * b, -s * n.x), Vec3A::new(b, s + n.y * n.y * a, -n.y))
+    let s = 1.0f32.copysign(-n.y);
+    let a = -1.0 / (s - n.y);
+    let b = n.x * n.z * a;
+    (Vec3A::new(1.0 + s * n.x * n.x * a, s * n.x, s * b), Vec3A::new(b, n.z, s + n.z * n.z * a))
 }
 
 #[inline(always)]
@@ -107,7 +108,7 @@ fn sin_cos_table() -> &'static [(f32, f32)] {
     T.get_or_init(|| (0..LUT_N).map(|k| (TAU * (k as f32 + 0.5) / LUT_N as f32).sin_cos()).collect())
 }
 
-/// Cosine-weighted directions around +Y (the ground's normal), stratified
+/// Cosine-weighted directions around +Z (the ground's normal), stratified
 /// on a 64 × 64 grid of the two sample coordinates.
 fn ground_bounce_table() -> &'static [Vec3A] {
     static T: std::sync::OnceLock<Box<[Vec3A]>> = std::sync::OnceLock::new();
@@ -119,7 +120,7 @@ fn ground_bounce_table() -> &'static [Vec3A] {
                 let u2 = ((k % side) as f32 + 0.5) / side as f32;
                 let r = u1.sqrt();
                 let (s, c) = (TAU * u2).sin_cos();
-                Vec3A::new(r * c, (1.0 - u1).max(0.0).sqrt(), r * s).normalize()
+                Vec3A::new(r * c, -(r * s), (1.0 - u1).max(0.0).sqrt()).normalize()
             })
             .collect()
     })
@@ -131,7 +132,7 @@ fn lut_index(rng: &mut fastrand::Rng) -> usize {
     (rng.u32(..) >> (32 - LUT_BITS)) as usize
 }
 
-/// Cosine-weighted bounce off the ground (normal +Y), from the table.
+/// Cosine-weighted bounce off the ground (normal +Z), from the table.
 #[inline(always)]
 fn ground_bounce(rng: &mut fastrand::Rng) -> Vec3A {
     ground_bounce_table()[lut_index(rng)]
@@ -237,7 +238,7 @@ pub fn radiance_primary(
 
         // On the ground, only solids whose shadow can reach this point occlude.
         let occluders = match shadows {
-            Some(g) if h.id == GROUND => g.at(p.x, p.z),
+            Some(g) if h.id == GROUND => g.at(p.x, p.y),
             _ => ALL_SOLIDS,
         };
         acc += throughput * albedo * direct_light(scene, origin, n, rng, s, occluders);
@@ -274,10 +275,10 @@ mod tests {
         let ts = TraceSettings { bounces: 0, ..TraceSettings::default() };
         let mut rng = fastrand::Rng::with_seed(11);
         // a ground point well away from the solids: sampled direct light + sky term
-        for p in [Vec3A::new(30.0, 0.0, -25.0), Vec3A::new(-60.0, 0.0, 40.0)] {
-            let origin = p + Vec3A::Y * RAY_OFFSET;
+        for p in [Vec3A::new(30.0, 25.0, 0.0), Vec3A::new(-60.0, -40.0, 0.0)] {
+            let origin = p + Vec3A::Z * RAY_OFFSET;
             let n = 20_000;
-            let sampled: f32 = (0..n).map(|_| direct_light(&s, origin, Vec3A::Y, &mut rng, &ts, ALL_SOLIDS)).sum::<f32>() / n as f32;
+            let sampled: f32 = (0..n).map(|_| direct_light(&s, origin, Vec3A::Z, &mut rng, &ts, ALL_SOLIDS)).sum::<f32>() / n as f32;
             let exact = far_ground_radiance(&s, p, 1.0) - s.sky * AMBIENT_OCCLUSION;
             assert!((sampled - exact).abs() < 0.03 * exact.max(1e-3) + 1e-4, "{p:?}: sampled {sampled} vs closed form {exact}");
         }
@@ -293,23 +294,23 @@ mod tests {
         s.background = 0.0;
         let ts = TraceSettings { bounces: 0, ..TraceSettings::default() };
         let c = s.centroid;
-        let eye = Vec3A::new(c.x, 200.0, c.z);
+        let eye = Vec3A::new(c.x, c.y, 200.0);
         let mut rng = fastrand::Rng::with_seed(3);
-        let at = |r: f32| (Vec3A::new(c.x + r, 0.0, c.z) - eye).normalize();
+        let at = |r: f32| (Vec3A::new(c.x + r, c.y, 0.0) - eye).normalize();
         let mean = |rd: Vec3A, rng: &mut fastrand::Rng| (0..200).map(|_| radiance(&s, eye, rd, rng, &ts)).sum::<f32>() / 200.0;
         let inner = mean(at(30.0), &mut rng);
         let rim = mean(at(0.97 * ts.max_dist), &mut rng);
         assert!(inner > 0.01, "the floor is lit from far above: {inner}");
         assert!(rim < 0.3 * inner, "the rim fades to the background: {rim} vs {inner}");
         // the same distance seen edge-on covers far more floor
-        let down = footprint(10.0, -Vec3A::Y, 0.01);
-        let grazing = footprint(10.0, Vec3A::new(1.0, -0.05, 0.0).normalize(), 0.01);
+        let down = footprint(10.0, -Vec3A::Z, 0.01);
+        let grazing = footprint(10.0, Vec3A::new(1.0, 0.0, -0.05).normalize(), 0.01);
         assert!((down - 0.1).abs() < 1e-5 && grazing > 15.0 * down, "{down} {grazing}");
     }
 
     #[test]
     fn onb_is_orthonormal() {
-        for n in [Vec3A::Y, -Vec3A::Z, Vec3A::new(0.3, -0.5, 0.8).normalize(), Vec3A::Z] {
+        for n in [Vec3A::Z, Vec3A::Y, Vec3A::new(0.3, -0.8, -0.5).normalize(), -Vec3A::Y, -Vec3A::Z] {
             let (t, b) = onb(n);
             assert!(t.dot(n).abs() < 1e-5 && b.dot(n).abs() < 1e-5 && t.dot(b).abs() < 1e-5);
             assert!((t.length() - 1.0).abs() < 1e-5 && (b.length() - 1.0).abs() < 1e-5);
@@ -319,7 +320,7 @@ mod tests {
     #[test]
     fn hemisphere_samples_face_normal() {
         let mut rng = fastrand::Rng::with_seed(7);
-        let n = Vec3A::new(0.2, 0.9, -0.1).normalize();
+        let n = Vec3A::new(0.2, 0.1, 0.9).normalize();
         let mut mean_cos = 0.0;
         for _ in 0..20_000 {
             let d = cosine_hemisphere(n, &mut rng);

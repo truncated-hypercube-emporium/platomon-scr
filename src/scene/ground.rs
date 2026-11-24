@@ -1,6 +1,10 @@
-//! The background (ground plane at y = 0): luminosity, checkerboard-family
+//! The background (ground plane at z = 0): luminosity, checkerboard-family
 //! patterns, translation (scroll + circular sway) and rotation about the
 //! camera's focal point.
+//!
+//! The patterns are laid out in their own floor frame, (x, −y): across, and
+//! toward the camera's starting view, which is the frame they were designed
+//! in. [`floor_frame`] maps world points into it.
 
 use glam::{Vec2, Vec3A};
 use serde::{Deserialize, Serialize};
@@ -152,13 +156,19 @@ impl FromStr for Spin {
     }
 }
 
-/// Parse `DX:DZ` (also `DX,DZ`) into world units per second.
+/// Parse `DX:DY` (also `DX,DY`) into world units per second.
 pub fn parse_vec2(s: &str) -> Result<[f32; 2], String> {
     let (a, b) = s.split_once([':', ',']).ok_or_else(|| format!("expected DX:DZ, got '{s}'"))?;
     match (a.trim().parse::<f32>(), b.trim().parse::<f32>()) {
-        (Ok(x), Ok(z)) if x.is_finite() && z.is_finite() => Ok([x, z]),
-        _ => Err(format!("expected two numbers DX:DZ, got '{s}'")),
+        (Ok(x), Ok(y)) if x.is_finite() && y.is_finite() => Ok([x, y]),
+        _ => Err(format!("expected two numbers DX:DY, got '{s}'")),
     }
+}
+
+/// World floor point (x, y) in the patterns' own frame, (x, −y).
+#[inline(always)]
+pub fn floor_frame(x: f32, y: f32) -> Vec2 {
+    Vec2::new(x, -y)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -170,7 +180,7 @@ pub struct GroundParams {
     pub contrast: f32,
     /// Tile size, world units (a solid at full scale is 2 across).
     pub scale: f32,
-    /// Constant translation, world units/s (x, z).
+    /// Constant translation across the floor, world units/s (x, y).
     pub scroll: [f32; 2],
     /// Radius of a circular back-and-forth translation; 0 = none.
     pub sway: f32,
@@ -341,10 +351,11 @@ struct OceanWave {
     phase: f32,
 }
 
-/// Rotate (x, z) about the y axis, same convention as the camera orbit:
-/// positive angles turn +z toward +x (counter-clockwise seen from above).
+/// Rotate a point of the floor frame ([`floor_frame`]) about its origin,
+/// same convention as the camera orbit: positive angles turn the front (−y
+/// in the world) toward +x, counter-clockwise seen from above.
 #[inline(always)]
-pub fn rotate_xz(v: Vec2, angle: f32) -> Vec2 {
+pub fn rotate_floor(v: Vec2, angle: f32) -> Vec2 {
     let (s, c) = angle.sin_cos();
     Vec2::new(v.x * c + v.y * s, v.y * c - v.x * s)
 }
@@ -359,7 +370,7 @@ pub struct Ground {
     /// over its finest feature's size in tiles (smaller dots fade sooner).
     fade_rate: f32,
     pattern: Pattern,
-    /// Focal point on the ground (x, z): rotation centre.
+    /// Focal point on the ground in the floor frame: rotation centre.
     pivot: Vec2,
     scroll: Vec2,
     sway: f32,
@@ -400,7 +411,9 @@ pub struct Ground {
 }
 
 impl Ground {
+    /// `pivot`: the focal point on the floor, world (x, y).
     pub fn new(p: &GroundParams, pivot: Vec2) -> Self {
+        let pivot = floor_frame(pivot.x, pivot.y);
         let rot = match p.rotate {
             Spin::Off => 0.0,
             Spin::Ccw => TAU / p.rotate_period.max(0.1),
@@ -414,7 +427,7 @@ impl Ground {
             fade_rate: 1.0 / p.scale.max(1e-3),
             pattern: p.pattern,
             pivot,
-            scroll: Vec2::from(p.scroll),
+            scroll: floor_frame(p.scroll[0], p.scroll[1]),
             sway: p.sway.max(0.0),
             sway_omega: TAU / p.sway_period.max(0.1),
             rot_rate: rot,
@@ -542,11 +555,11 @@ impl Ground {
         self.travelled + Vec2::new(ph.sin(), ph.cos() - 1.0) * self.sway
     }
 
-    /// Pattern-space coordinates (tile units) of a world point on the ground.
+    /// Pattern-space coordinates (tile units) of world floor point (x, y).
     /// The pattern is rotated by `angle` about the pivot, then translated.
     #[inline]
-    pub fn pattern_coords(&self, x: f32, z: f32) -> Vec2 {
-        let v = Vec2::new(x, z) - self.pivot;
+    pub fn pattern_coords(&self, x: f32, y: f32) -> Vec2 {
+        let v = floor_frame(x, y) - self.pivot;
         let (s, c) = (self.frame_sin, self.frame_cos);
         let d = Vec2::new(v.x * c + v.y * s, v.y * c - v.x * s);
         (d - self.frame_offset) * self.inv_scale
@@ -564,19 +577,19 @@ impl Ground {
         if fade <= 0.0 {
             return self.base;
         }
-        let mut k = self.tone_at(self.pattern_coords(p.x, p.z));
-        if self.pattern == Pattern::Polka && self.shape.invert_half && self.on_inverted_half(p.x, p.z) {
+        let mut k = self.tone_at(self.pattern_coords(p.x, p.y));
+        if self.pattern == Pattern::Polka && self.shape.invert_half && self.on_inverted_half(p.x, p.y) {
             k = -k;
         }
         (self.base * (1.0 + self.contrast * fade * k)).clamp(0.0, 0.95)
     }
 
-    /// Whether world point (x, z) is on the inverted half: past the line
+    /// Whether world floor point (x, y) is on the inverted half: past the line
     /// through the focal point that turns with the pattern (it doesn't
     /// scroll or sway with it, so it stays through the centre).
     #[inline]
-    pub fn on_inverted_half(&self, x: f32, z: f32) -> bool {
-        let v = Vec2::new(x, z) - self.pivot;
+    pub fn on_inverted_half(&self, x: f32, y: f32) -> bool {
+        let v = floor_frame(x, y) - self.pivot;
         v.y * self.frame_cos - v.x * self.frame_sin < 0.0
     }
 
@@ -591,7 +604,7 @@ impl Ground {
             Pattern::Clouds => clouds(uv + self.frame_drift, self.shape.octaves, self.shape.roughness),
             Pattern::Carpet => carpet(uv, self.shape.carpet_levels),
             Pattern::Radial => radial(uv, self.shape.sectors),
-            Pattern::Polka => polka(uv, self.shape.dot_size, self.shape.dot_spacing, self.shape.dot_variability),
+            Pattern::Polka => polka_placed(uv, self.shape.dot_size, self.shape.dot_spacing, self.shape.dot_variability),
             p => tone(p, uv),
         }
     }
@@ -670,6 +683,14 @@ fn carpet(uv: Vec2, levels: u32) -> f32 {
         (u, v) = (u.div_euclid(3), v.div_euclid(3));
     }
     1.0
+}
+
+/// [`polka`] as laid on the floor: the lattice shifted half a spacing along
+/// the floor frame's second axis (world y), so the focal point sits between
+/// two dots rather than on one.
+#[inline]
+fn polka_placed(uv: Vec2, size: f32, spacing: f32, variability: f32) -> f32 {
+    polka(uv - Vec2::new(0.0, 0.5 * spacing), size, spacing, variability)
 }
 
 /// Polka dots in −1..=1: a dot (1) `size` tiles across on every point of a
@@ -845,7 +866,7 @@ pub fn tone(pattern: Pattern, uv: Vec2) -> f32 {
         Pattern::Carpet => carpet(uv, PatternShape::default().carpet_levels),
         Pattern::Polka => {
             let d = PatternShape::default();
-            polka(uv, d.dot_size, d.dot_spacing, d.dot_variability)
+            polka_placed(uv, d.dot_size, d.dot_spacing, d.dot_variability)
         }
         // the moving patterns as they start, with the default settings
         Pattern::Rain | Pattern::Ocean | Pattern::Julia | Pattern::Clouds => {
@@ -871,21 +892,21 @@ mod tests {
         assert!(!ground(GroundParams { lum: 0.0, ..Default::default() }).enabled);
         let g = ground(GroundParams::default());
         assert!(g.enabled);
-        assert_eq!(g.albedo(Vec3A::new(3.3, 0.0, -7.1), 0.03), 0.15, "solid = original look");
+        assert_eq!(g.albedo(Vec3A::new(3.3, 7.1, 0.0), 0.03), 0.15, "solid = original look");
     }
 
     #[test]
     fn checker_alternates_and_keeps_mean() {
         let g = ground(GroundParams { pattern: Pattern::Checker, contrast: 0.5, ..Default::default() });
-        let a = g.albedo(Vec3A::new(0.5, 0.0, 0.5), 0.0075);
-        let b = g.albedo(Vec3A::new(1.5, 0.0, 0.5), 0.0075);
-        let c = g.albedo(Vec3A::new(1.5, 0.0, 1.5), 0.0075);
+        let a = g.albedo(Vec3A::new(0.5, -0.5, 0.0), 0.0075);
+        let b = g.albedo(Vec3A::new(1.5, -0.5, 0.0), 0.0075);
+        let c = g.albedo(Vec3A::new(1.5, -1.5, 0.0), 0.0075);
         assert!(a > b && (a - c).abs() < 1e-6, "{a} {b} {c}");
         assert!(((a + b) / 2.0 - 0.15).abs() < 1e-3, "mean equals luminosity");
         // contrast 0 = uniform; far away fades to the mean
         let flat = ground(GroundParams { pattern: Pattern::Checker, contrast: 0.0, ..Default::default() });
-        assert_eq!(flat.albedo(Vec3A::new(0.5, 0.0, 0.5), 0.0075), 0.15);
-        assert_eq!(g.albedo(Vec3A::new(0.5, 0.0, 0.5), 1000.0), 0.15);
+        assert_eq!(flat.albedo(Vec3A::new(0.5, -0.5, 0.0), 0.0075), 0.15);
+        assert_eq!(g.albedo(Vec3A::new(0.5, -0.5, 0.0), 1000.0), 0.15);
     }
 
     #[test]
@@ -909,9 +930,9 @@ mod tests {
     #[test]
     fn scroll_and_sway_translate() {
         let mut g = ground(GroundParams { pattern: Pattern::Checker, scroll: [1.0, 0.0], ..Default::default() });
-        let before = g.pattern_coords(0.25, 0.25);
+        let before = g.pattern_coords(0.25, -0.25);
         g.advance(2.0);
-        let after = g.pattern_coords(0.25, 0.25);
+        let after = g.pattern_coords(0.25, -0.25);
         assert!((before - after - Vec2::new(2.0, 0.0)).length() < 1e-5, "pattern moved +2 in x");
 
         let mut s = ground(GroundParams { sway: 1.5, sway_period: 4.0, ..Default::default() });
@@ -924,12 +945,12 @@ mod tests {
 
     #[test]
     fn rotation_about_pivot_in_both_directions() {
-        let pivot = Vec2::new(2.0, -1.0);
+        let pivot = Vec2::new(2.0, 1.0);
         let p = |spin| GroundParams { rotate: spin, rotate_period: 8.0, ..Default::default() };
         let mut ccw = Ground::new(&p(Spin::Ccw), pivot);
         let mut cw = Ground::new(&p(Spin::Cw), pivot);
-        // a pattern feature at pivot + (0, 1) (toward +z)
-        let feature = ccw.pattern_coords(pivot.x, pivot.y + 1.0);
+        // a pattern feature at pivot − (0, 1) (toward −y, the front)
+        let feature = ccw.pattern_coords(pivot.x, pivot.y - 1.0);
         ccw.advance(2.0); // quarter turn
         cw.advance(2.0);
         // ccw carries it to +x of the pivot, cw to −x (same convention as the orbit camera)
@@ -955,7 +976,7 @@ mod tests {
                 assert!((-1.0..=1.0).contains(&v), "{n}: {v}");
                 seen = (seen.0.min(v), seen.1.max(v));
                 // n-fold symmetric: turning by π/n maps the waves onto themselves
-                let turned = rotate_xz(uv, std::f32::consts::PI / n as f32);
+                let turned = rotate_floor(uv, std::f32::consts::PI / n as f32);
                 assert!((quasicrystal(turned, d, 0.0) - v).abs() < 2e-3, "{n}-fold symmetry at {uv:?}");
             }
             assert!(seen.0 < -0.9 && seen.1 > 0.9, "{n}: full tone range {seen:?}");
@@ -966,7 +987,7 @@ mod tests {
         assert_eq!(wave_dirs(99, &mut dirs), WAVES_MAX as usize);
         // it flows over time; the tiled patterns stay put
         let p = |pattern| GroundParams { pattern, contrast: 1.0, scale: 1.0, ..Default::default() };
-        let pt = Vec3A::new(0.37, 0.0, -0.61);
+        let pt = Vec3A::new(0.37, 0.61, 0.0);
         let mut q = ground(p(Pattern::Quasicrystal));
         let mut c = ground(p(Pattern::Checker));
         let (q0, c0) = (q.albedo(pt, 0.0075), c.albedo(pt, 0.0075));
@@ -1062,6 +1083,12 @@ mod tests {
         }
         assert_eq!(polka(Vec2::new(0.5, h / 3.0), 0.5, 1.0, 0.0), -1.0, "triangle centre");
         assert_eq!(polka(Vec2::new(0.0, h), 0.5, 1.0, 0.0), -1.0, "not a square grid");
+        // on the floor the lattice starts half a spacing along y: no dot at
+        // the focal point, one half a spacing from it
+        for spacing in [1.0, 2.0] {
+            assert_eq!(polka_placed(Vec2::ZERO, 0.5, spacing, 0.0), -1.0, "focal point between dots ({spacing})");
+            assert_eq!(polka_placed(Vec2::new(0.0, 0.5 * spacing), 0.5, spacing, 0.0), 1.0, "dot half a spacing along y ({spacing})");
+        }
         assert_eq!(polka(Vec2::new(1.0, 2.0 * h), 0.5, 2.0, 0.0), 1.0, "spacing 2");
         assert_eq!(polka(Vec2::new(1.0, 2.0 * h / 3.0), 0.5, 2.0, 0.0), -1.0);
         // six nearest neighbours, all a spacing away
@@ -1089,26 +1116,28 @@ mod tests {
         // flipped; turning the pattern turns the line with it
         let shape = PatternShape { invert_half: true, ..PatternShape::default() };
         let params = GroundParams { pattern: Pattern::Polka, contrast: 1.0, shape, ..Default::default() };
-        let pivot = Vec2::new(0.25, -0.75);
+        let pivot = Vec2::new(0.25, 0.75);
         let plain = Ground::new(&GroundParams { shape: PatternShape::default(), ..params }, pivot);
         let split = Ground::new(&params, pivot);
-        let at = |g: &Ground, x: f32, z: f32| g.albedo(Vec3A::new(x, 0.0, z), 0.0075);
-        for (x, z) in [(2.3, 0.4), (-5.1, 3.3), (0.9, 7.2)] {
-            assert_eq!(at(&split, x, z), at(&plain, x, z), "this side as it was");
-            let (xm, zm) = (x, 2.0 * pivot.y - z);
-            assert!((at(&split, xm, zm) - at(&plain, xm, zm)).abs() > 0.05, "the other side inverted at {xm},{zm}");
+        let at = |g: &Ground, x: f32, y: f32| g.albedo(Vec3A::new(x, y, 0.0), 0.0075);
+        // the near half (toward −y, the camera's starting side) as it was,
+        // the far half inverted
+        for (x, y) in [(2.3, -0.4), (-5.1, -3.3), (0.9, -7.2)] {
+            assert_eq!(at(&split, x, y), at(&plain, x, y), "this side as it was");
+            let (xm, ym) = (x, 2.0 * pivot.y - y);
+            assert!((at(&split, xm, ym) - at(&plain, xm, ym)).abs() > 0.05, "the other side inverted at {xm},{ym}");
         }
         let mut turning = Ground::new(&GroundParams { rotate: Spin::Ccw, rotate_period: 8.0, ..params }, pivot);
-        assert!(turning.on_inverted_half(pivot.x, pivot.y - 1.0) && !turning.on_inverted_half(pivot.x - 1.0, pivot.y + 0.01));
+        assert!(turning.on_inverted_half(pivot.x, pivot.y + 1.0) && !turning.on_inverted_half(pivot.x - 1.0, pivot.y - 0.01));
         turning.advance(4.0); // half a turn
-        assert!(!turning.on_inverted_half(pivot.x, pivot.y - 1.0) && turning.on_inverted_half(pivot.x, pivot.y + 1.0));
+        assert!(!turning.on_inverted_half(pivot.x, pivot.y + 1.0) && turning.on_inverted_half(pivot.x, pivot.y - 1.0));
         // other patterns ignore it
         let checker = Ground::new(&GroundParams { pattern: Pattern::Checker, ..params }, pivot);
         let checker_plain = Ground::new(&GroundParams { pattern: Pattern::Checker, shape: PatternShape::default(), ..params }, pivot);
         assert_eq!(at(&checker, -3.3, 1.2), at(&checker_plain, -3.3, 1.2));
         // small dots fade out sooner than their tiles would
         let tiny = Ground::new(&GroundParams { shape: PatternShape { dot_size: 0.1, ..PatternShape::default() }, ..params }, pivot);
-        assert_eq!(tiny.albedo(Vec3A::new(0.5, 0.0, 0.5), 0.1), tiny.mean_albedo());
+        assert_eq!(tiny.albedo(Vec3A::new(0.5, -0.5, 0.0), 0.1), tiny.mean_albedo());
         let s = PatternShape { dot_size: 0.0, dot_spacing: 99.0, dot_variability: f32::NAN, ..PatternShape::default() }.sanitized();
         assert_eq!((s.dot_size, s.dot_spacing, s.dot_variability), (0.05, 8.0, 0.0));
     }

@@ -199,7 +199,7 @@ pub struct Config {
     pub bg_contrast: f32,
     /// Tile size, world units.
     pub bg_scale: f32,
-    /// Constant pattern translation [x, z], world units/s.
+    /// Constant pattern translation across the floor [x, y], world units/s.
     pub bg_scroll: [f32; 2],
     /// Radius of a circular back-and-forth translation; 0 = none.
     pub bg_sway: f32,
