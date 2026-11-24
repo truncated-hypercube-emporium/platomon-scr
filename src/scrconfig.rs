@@ -1846,6 +1846,27 @@ unsafe fn panel_take(h: HWND, p: Panel) {
     }
 }
 
+/// Reset all: dialog `p`'s sliders back to auto and its choices back to
+/// their defaults, in the working copy.
+fn reset_panel_edit(p: Panel) {
+    let defaults = ScrSettings::default().to_pairs();
+    // worked out before borrowing UI mutably: both read UI themselves
+    // (the floor pattern), and a nested borrow panics, which aborts the
+    // dialog's callback and the whole program
+    let tunables = shown_tunables(p);
+    let choices = shown_choices(p);
+    UI.with(|u| {
+        let mut u = u.borrow_mut();
+        u.tuning_edit.retain(|(key, _)| !tunables.iter().any(|t| t.key == *key));
+        for c in &choices {
+            u.panel_edit.retain(|(key, _)| *key != c.key);
+            if let Some((_, v)) = defaults.iter().find(|(k, _)| *k == c.key) {
+                u.panel_edit.push((c.key, v.clone()));
+            }
+        }
+    });
+}
+
 /// The custom ramp in the open dialog's working copy: (on, ramp).
 fn ramp_edit() -> (bool, String) {
     UI.with(|u| {
@@ -2065,17 +2086,7 @@ unsafe extern "system" fn tuning_dialog(h: HWND, msg: u32, w: usize, l: isize) -
                         1
                     }
                     ID_TUNE_RESET_ALL => {
-                        let defaults = ScrSettings::default().to_pairs();
-                        UI.with(|u| {
-                            let mut u = u.borrow_mut();
-                            u.tuning_edit.retain(|(key, _)| !list.iter().any(|t| t.key == *key));
-                            for c in shown_choices(p) {
-                                u.panel_edit.retain(|(key, _)| *key != c.key);
-                                if let Some((_, v)) = defaults.iter().find(|(k, _)| *k == c.key) {
-                                    u.panel_edit.push((c.key, v.clone()));
-                                }
-                            }
-                        });
+                        reset_panel_edit(p);
                         if p == Panel::Rendering {
                             // the custom ramp goes off; its text is kept for next time
                             set_ramp_edit(false, &ramp_edit().1);
@@ -2839,6 +2850,35 @@ mod tests {
     fn header(t: &[u32]) -> (u32, usize, i16) {
         let w: Vec<u16> = t.iter().flat_map(|d| [*d as u16, (*d >> 16) as u16]).collect();
         (w[0] as u32 | (w[1] as u32) << 16, w[4] as usize, w[8] as i16)
+    }
+
+    #[test]
+    fn reset_all_puts_every_panel_back_without_a_nested_borrow() {
+        let defaults = ScrSettings::default().to_pairs();
+        for p in [Panel::Tuning, Panel::Layout, Panel::Rendering, Panel::Background] {
+            let tunables = panel_tunables(p);
+            let choices = panel_choices(p);
+            UI.with(|u| {
+                let mut u = u.borrow_mut();
+                u.bg_pattern = Some(Pattern::Polka);
+                u.tuning_edit = tunables.iter().map(|t| (t.key, t.value_at(1))).collect();
+                u.tuning_edit.push(("not_on_this_panel", 1.0));
+                u.panel_edit = choices.iter().map(|c| (c.key, "changed".to_string())).collect();
+            });
+            reset_panel_edit(p); // panicked here (RefCell already borrowed) before the fix
+            let shown_t = shown_tunables(p);
+            let shown_c = shown_choices(p);
+            UI.with(|u| {
+                let u = u.borrow();
+                assert!(u.tuning_edit.iter().all(|(k, _)| !shown_t.iter().any(|t| t.key == *k)), "{p:?} sliders back to auto");
+                assert!(u.tuning_edit.iter().any(|(k, _)| *k == "not_on_this_panel"), "other dialogs' sliders kept");
+                for c in &shown_c {
+                    let v = u.panel_edit.iter().find(|(k, _)| *k == c.key).map(|(_, v)| v.as_str());
+                    assert_eq!(v, defaults.iter().find(|(k, _)| *k == c.key).map(|(_, v)| v.as_str()), "{p:?} {} to its default", c.key);
+                }
+            });
+        }
+        UI.with(|u| *u.borrow_mut() = Ui::default());
     }
 
     #[test]
