@@ -231,6 +231,12 @@ pub struct Config {
     pub bg_roughness: f32,
     /// Radial: sectors round the focal point.
     pub bg_sectors: u32,
+    /// Polka dots: size across and spacing (tiles), how much both vary
+    /// (0..=1), and one half of the floor inverted.
+    pub bg_dot_size: f32,
+    pub bg_dot_spacing: f32,
+    pub bg_dot_variability: f32,
+    pub bg_invert_half: bool,
 
     // --- animation ---
     pub min_scale: f32,
@@ -338,6 +344,10 @@ impl Default for Config {
             bg_octaves: PatternShape::default().octaves,
             bg_roughness: PatternShape::default().roughness,
             bg_sectors: PatternShape::default().sectors,
+            bg_dot_size: PatternShape::default().dot_size,
+            bg_dot_spacing: PatternShape::default().dot_spacing,
+            bg_dot_variability: PatternShape::default().dot_variability,
+            bg_invert_half: false,
             min_scale: 0.45,
             max_scale: 1.0,
             max_spin: 3.0,
@@ -471,6 +481,7 @@ impl Config {
         (self.bg_ripple, self.bg_drop_life, self.bg_wind, self.bg_chop) = (s.ripple, s.drop_life, s.wind, s.chop);
         (self.bg_julia_iter, self.bg_julia_shape, self.bg_carpet_levels) = (s.julia_iter, s.julia_shape, s.carpet_levels);
         (self.bg_octaves, self.bg_roughness, self.bg_sectors) = (s.octaves, s.roughness, s.sectors);
+        (self.bg_dot_size, self.bg_dot_spacing, self.bg_dot_variability) = (s.dot_size, s.dot_spacing, s.dot_variability);
         for v in [&mut self.orbit_radius, &mut self.orbit_height] {
             *v = v.filter(|x| x.is_finite()).map(|x| x.clamp(0.5, 500.0));
         }
@@ -543,6 +554,10 @@ impl Config {
             octaves: self.bg_octaves,
             roughness: self.bg_roughness,
             sectors: self.bg_sectors,
+            dot_size: self.bg_dot_size,
+            dot_spacing: self.bg_dot_spacing,
+            dot_variability: self.bg_dot_variability,
+            invert_half: self.bg_invert_half,
         }
     }
 

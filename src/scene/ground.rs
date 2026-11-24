@@ -52,10 +52,13 @@ pub enum Pattern {
     Carpet,
     /// Clouds (fractal noise): five octaves of value noise, drifting.
     Clouds,
+    /// Polka dots on a triangular lattice, their sizes and places varied at will;
+    /// optionally inverted on one side of a line through the centre.
+    Polka,
 }
 
 impl Pattern {
-    pub const ALL: [Pattern; 13] = [
+    pub const ALL: [Pattern; 14] = [
         Pattern::Solid,
         Pattern::Checker,
         Pattern::Diamond,
@@ -69,6 +72,7 @@ impl Pattern {
         Pattern::Julia,
         Pattern::Carpet,
         Pattern::Clouds,
+        Pattern::Polka,
     ];
 
     /// Moves by itself (its speed is the flow, `wave_speed`).
@@ -91,6 +95,7 @@ impl Pattern {
             Pattern::Julia => "julia",
             Pattern::Carpet => "carpet",
             Pattern::Clouds => "clouds",
+            Pattern::Polka => "polka",
         }
     }
 
@@ -109,6 +114,7 @@ impl Pattern {
             Pattern::Julia => "Julia set fractal, its constant drifting round a circle (--bg-wave-speed)",
             Pattern::Carpet => "Sierpinski carpet fractal: squares cut out at five scales",
             Pattern::Clouds => "fractal noise: five octaves of value noise, drifting (--bg-wave-speed)",
+            Pattern::Polka => "polka dots, sizes and places varied at will, one half optionally inverted (--bg-dot-*, --bg-invert-half)",
         }
     }
 }
@@ -209,6 +215,14 @@ pub struct PatternShape {
     pub roughness: f32,
     /// Radial: sectors round the focal point.
     pub sectors: u32,
+    /// Polka dots: each dot's size across and the distance between
+    /// neighbouring dots, tiles; how much both vary from dot to dot (0..=1);
+    /// and whether one half of the floor (one side of a line through the
+    /// centre) is inverted, dark dots on light.
+    pub dot_size: f32,
+    pub dot_spacing: f32,
+    pub dot_variability: f32,
+    pub invert_half: bool,
 }
 
 impl Default for PatternShape {
@@ -224,6 +238,10 @@ impl Default for PatternShape {
             octaves: 5,
             roughness: 0.5,
             sectors: 12,
+            dot_size: 0.5,
+            dot_spacing: 1.0,
+            dot_variability: 0.0,
+            invert_half: false,
         }
     }
 }
@@ -244,6 +262,10 @@ impl PatternShape {
             octaves: self.octaves.clamp(1, 10),
             roughness: f(self.roughness, d.roughness, 0.1, 0.9),
             sectors: self.sectors.clamp(2, 64),
+            dot_size: f(self.dot_size, d.dot_size, 0.05, 4.0),
+            dot_spacing: f(self.dot_spacing, d.dot_spacing, 0.25, 8.0),
+            dot_variability: f(self.dot_variability, d.dot_variability, 0.0, 1.0),
+            invert_half: self.invert_half,
         }
     }
 }
@@ -333,6 +355,9 @@ pub struct Ground {
     base: f32,
     contrast: f32,
     inv_scale: f32,
+    /// How fast the pattern fades to its mean with distance: `inv_scale`
+    /// over its finest feature's size in tiles (smaller dots fade sooner).
+    fade_rate: f32,
     pattern: Pattern,
     /// Focal point on the ground (x, z): rotation centre.
     pivot: Vec2,
@@ -386,6 +411,7 @@ impl Ground {
             base: albedo_for_lum(p.lum),
             contrast: p.contrast.clamp(0.0, 1.0),
             inv_scale: 1.0 / p.scale.max(1e-3),
+            fade_rate: 1.0 / p.scale.max(1e-3),
             pattern: p.pattern,
             pivot,
             scroll: Vec2::from(p.scroll),
@@ -413,6 +439,9 @@ impl Ground {
             frame_drift: Vec2::ZERO,
             shape: p.shape.sanitized(),
         };
+        if g.pattern == Pattern::Polka {
+            g.fade_rate /= g.shape.dot_size.min(g.shape.dot_spacing).min(1.0);
+        }
         g.n_waves = wave_dirs(p.waves, &mut g.wave_dirs);
         // raindrops at every stage of their lives, so it starts mid-shower
         let n = p.drops.clamp(DROPS_MIN, DROPS_MAX) as usize;
@@ -531,12 +560,24 @@ impl Ground {
         if self.pattern == Pattern::Solid || self.contrast <= 0.0 {
             return self.base;
         }
-        let fade = (1.0 - 1.5 * footprint * self.inv_scale).clamp(0.0, 1.0);
+        let fade = (1.0 - 1.5 * footprint * self.fade_rate).clamp(0.0, 1.0);
         if fade <= 0.0 {
             return self.base;
         }
-        let k = self.tone_at(self.pattern_coords(p.x, p.z));
+        let mut k = self.tone_at(self.pattern_coords(p.x, p.z));
+        if self.pattern == Pattern::Polka && self.shape.invert_half && self.on_inverted_half(p.x, p.z) {
+            k = -k;
+        }
         (self.base * (1.0 + self.contrast * fade * k)).clamp(0.0, 0.95)
+    }
+
+    /// Whether world point (x, z) is on the inverted half: past the line
+    /// through the focal point that turns with the pattern (it doesn't
+    /// scroll or sway with it, so it stays through the centre).
+    #[inline]
+    pub fn on_inverted_half(&self, x: f32, z: f32) -> bool {
+        let v = Vec2::new(x, z) - self.pivot;
+        v.y * self.frame_cos - v.x * self.frame_sin < 0.0
     }
 
     /// The pattern's tone in −1..=1 at `uv` (tile units) this frame.
@@ -550,6 +591,7 @@ impl Ground {
             Pattern::Clouds => clouds(uv + self.frame_drift, self.shape.octaves, self.shape.roughness),
             Pattern::Carpet => carpet(uv, self.shape.carpet_levels),
             Pattern::Radial => radial(uv, self.shape.sectors),
+            Pattern::Polka => polka(uv, self.shape.dot_size, self.shape.dot_spacing, self.shape.dot_variability),
             p => tone(p, uv),
         }
     }
@@ -630,6 +672,48 @@ fn carpet(uv: Vec2, levels: u32) -> f32 {
     1.0
 }
 
+/// Polka dots in −1..=1: a dot (1) `size` tiles across on every point of a
+/// triangular lattice `spacing` tiles apart (rows `spacing`·√3/2 apart,
+/// every other row shifted half a spacing: each dot has six nearest
+/// neighbours), on −1 between them. `variability` (0..=1) spreads both:
+/// each dot's size varies from 0 up to twice `size`, and it moves off its
+/// lattice point by up to half the spacing each way, so its neighbours
+/// range from touching to twice as far.
+#[inline]
+fn polka(uv: Vec2, size: f32, spacing: f32, variability: f32) -> f32 {
+    const ROW: f32 = 0.866_025_4; // √3/2
+    let g = uv / spacing;
+    let r = 0.5 * size / spacing;
+    // lattice coordinates: g = i·(1, 0) + j·(½, √3/2)
+    let j = g.y / ROW;
+    let i = g.x - 0.5 * j;
+    let (i0, j0) = (i.floor() as i32, j.floor() as i32);
+    // how far a dot can reach: its largest size plus its largest move.
+    // Within half a spacing of a dot, that dot is the nearest lattice
+    // point, a corner of the cell (i0, j0)..(i0+1, j0+1) the point is in;
+    // further, rows are √3/2 apart, so look that many rows round it
+    let far = r * (1.0 + variability) + 0.71 * variability;
+    let reach = if far <= 0.5 { 0 } else { ((far / ROW).ceil() as i32).min(2) };
+    for dj in -reach..=reach + 1 {
+        for di in -reach..=reach + 1 {
+            let (x, y) = (i0.wrapping_add(di), j0.wrapping_add(dj));
+            let mut c = Vec2::new(x as f32 + 0.5 * y as f32, y as f32 * ROW);
+            let mut rad = r;
+            if variability > 0.0 {
+                rad *= 1.0 + variability * (2.0 * hash2(x, y) - 1.0);
+                let jitter = Vec2::new(
+                    hash2(y.wrapping_add(7919), x.wrapping_sub(3571)),
+                    hash2(x.wrapping_mul(3).wrapping_add(11), y.wrapping_mul(5).wrapping_sub(7)),
+                );
+                c += variability * (jitter - 0.5);
+            }
+            if (g - c).length_squared() < rad * rad {
+                return 1.0;
+            }
+        }
+    }
+    -1.0
+}
 /// A lattice point's random value in 0..=1.
 #[inline(always)]
 fn hash2(x: i32, y: i32) -> f32 {
@@ -759,6 +843,10 @@ pub fn tone(pattern: Pattern, uv: Vec2) -> f32 {
             quasicrystal(uv, &dirs[..n], 0.0)
         }
         Pattern::Carpet => carpet(uv, PatternShape::default().carpet_levels),
+        Pattern::Polka => {
+            let d = PatternShape::default();
+            polka(uv, d.dot_size, d.dot_spacing, d.dot_variability)
+        }
         // the moving patterns as they start, with the default settings
         Pattern::Rain | Pattern::Ocean | Pattern::Julia | Pattern::Clouds => {
             Ground::new(&GroundParams { pattern, ..GroundParams::default() }, Vec2::ZERO).tone_at(uv)
@@ -950,6 +1038,9 @@ mod tests {
             (Pattern::Clouds, PatternShape { octaves: 2, ..d }),
             (Pattern::Clouds, PatternShape { roughness: 0.8, ..d }),
             (Pattern::Radial, PatternShape { sectors: 6, ..d }),
+            (Pattern::Polka, PatternShape { dot_size: 0.8, ..d }),
+            (Pattern::Polka, PatternShape { dot_spacing: 1.7, ..d }),
+            (Pattern::Polka, PatternShape { dot_variability: 0.6, ..d }),
         ] {
             assert_ne!(tones(pattern, d), tones(pattern, changed), "{pattern:?} {changed:?}");
             // and the default settings are the static tone's
@@ -959,6 +1050,67 @@ mod tests {
         }
         let wild = PatternShape { ripple: f32::NAN, wind: 400.0, julia_iter: 0, sectors: 999, ..d }.sanitized();
         assert_eq!((wild.ripple, wild.wind, wild.julia_iter, wild.sectors), (d.ripple, 40.0, 4, 64));
+    }
+
+    #[test]
+    fn polka_dots_sit_on_a_triangular_lattice_vary_and_invert_one_half() {
+        let h = 3f32.sqrt() / 2.0;
+        // a dot on every lattice point: rows h apart, every other one
+        // shifted half a spacing; gaps at the triangles' centres
+        for (x, y) in [(0.0, 0.0), (1.0, 0.0), (0.5, h), (-0.5, h), (3.0, -2.0 * h), (2.5, -3.0 * h)] {
+            assert_eq!(polka(Vec2::new(x, y), 0.5, 1.0, 0.0), 1.0, "dot at {x},{y}");
+        }
+        assert_eq!(polka(Vec2::new(0.5, h / 3.0), 0.5, 1.0, 0.0), -1.0, "triangle centre");
+        assert_eq!(polka(Vec2::new(0.0, h), 0.5, 1.0, 0.0), -1.0, "not a square grid");
+        assert_eq!(polka(Vec2::new(1.0, 2.0 * h), 0.5, 2.0, 0.0), 1.0, "spacing 2");
+        assert_eq!(polka(Vec2::new(1.0, 2.0 * h / 3.0), 0.5, 2.0, 0.0), -1.0);
+        // six nearest neighbours, all a spacing away
+        let near = (-3..=3)
+            .flat_map(|a| (-3..=3).map(move |b| Vec2::new(a as f32 + 0.5 * b as f32, b as f32 * h)))
+            .filter(|p| (p.length() - 1.0).abs() < 1e-4)
+            .filter(|p| polka(*p, 0.2, 1.0, 0.0) > 0.0)
+            .count();
+        assert_eq!(near, 6);
+        // dots wide enough to reach the triangles' centres merge into one field
+        assert_eq!(polka(Vec2::new(0.5, h / 3.0), 1.6, 1.0, 0.0), 1.0);
+        // variability spreads sizes and places: coverage per cell differs,
+        // and dots leave their grid points
+        let cover = |var: f32, cell: i32| {
+            (0..400).filter(|i| polka(Vec2::new(cell as f32 + (i % 20) as f32 / 20.0 + 0.025, (i / 20) as f32 / 20.0 + 0.025), 0.6, 1.0, var) > 0.0).count()
+        };
+        let even: Vec<usize> = (0..12).map(|c| cover(0.0, c * 2)).collect();
+        assert!(even.windows(2).all(|w| w[0] == w[1]), "all alike: {even:?}");
+        let varied: Vec<usize> = (0..12).map(|c| cover(1.0, c * 2)).collect();
+        let (lo, hi) = (varied.iter().min().unwrap(), varied.iter().max().unwrap());
+        assert!(hi - lo > 40, "sizes spread: {varied:?}");
+        let off_centre = (0..40).filter(|c| polka(Vec2::new(*c as f32 * 3.0, 0.0), 0.2, 1.0, 1.0) < 0.0).count();
+        assert!(off_centre > 5, "dots leave their grid points ({off_centre})");
+        // invert half: one side of the line through the focal point is
+        // flipped; turning the pattern turns the line with it
+        let shape = PatternShape { invert_half: true, ..PatternShape::default() };
+        let params = GroundParams { pattern: Pattern::Polka, contrast: 1.0, shape, ..Default::default() };
+        let pivot = Vec2::new(0.25, -0.75);
+        let plain = Ground::new(&GroundParams { shape: PatternShape::default(), ..params }, pivot);
+        let split = Ground::new(&params, pivot);
+        let at = |g: &Ground, x: f32, z: f32| g.albedo(Vec3A::new(x, 0.0, z), 0.0075);
+        for (x, z) in [(2.3, 0.4), (-5.1, 3.3), (0.9, 7.2)] {
+            assert_eq!(at(&split, x, z), at(&plain, x, z), "this side as it was");
+            let (xm, zm) = (x, 2.0 * pivot.y - z);
+            assert!((at(&split, xm, zm) - at(&plain, xm, zm)).abs() > 0.05, "the other side inverted at {xm},{zm}");
+        }
+        let mut turning = Ground::new(&GroundParams { rotate: Spin::Ccw, rotate_period: 8.0, ..params }, pivot);
+        assert!(turning.on_inverted_half(pivot.x, pivot.y - 1.0) && !turning.on_inverted_half(pivot.x - 1.0, pivot.y + 0.01));
+        turning.advance(4.0); // half a turn
+        assert!(!turning.on_inverted_half(pivot.x, pivot.y - 1.0) && turning.on_inverted_half(pivot.x, pivot.y + 1.0));
+        // other patterns ignore it
+        let checker = Ground::new(&GroundParams { pattern: Pattern::Checker, ..params }, pivot);
+        let checker_plain = Ground::new(&GroundParams { pattern: Pattern::Checker, shape: PatternShape::default(), ..params }, pivot);
+        assert_eq!(at(&checker, -3.3, 1.2), at(&checker_plain, -3.3, 1.2));
+        // small dots fade out sooner than their tiles would
+        let tiny = Ground::new(&GroundParams { shape: PatternShape { dot_size: 0.1, ..PatternShape::default() }, ..params }, pivot);
+        assert_eq!(tiny.albedo(Vec3A::new(0.5, 0.0, 0.5), 0.1), tiny.mean_albedo());
+        let s = PatternShape { dot_size: 0.0, dot_spacing: 99.0, dot_variability: f32::NAN, ..PatternShape::default() }.sanitized();
+        assert_eq!((s.dot_size, s.dot_spacing, s.dot_variability), (0.05, 8.0, 0.0));
     }
 
     #[test]

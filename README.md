@@ -63,7 +63,7 @@ platomon [OPTIONS]
 | `--seed` | `U64`, makes `random` repeatable | random |
 | **Background** | | |
 | `--bg-lum` | `0..10`: 5 = original, **0 = no background surface** | 5 |
-| `--bg-pattern` | `solid\|checker\|diamond\|brick\|triangles\|hex\|radial\|quasicrystal\|rain\|ocean\|julia\|carpet\|clouds` | `solid` |
+| `--bg-pattern` | `solid\|checker\|diamond\|brick\|triangles\|hex\|radial\|quasicrystal\|rain\|ocean\|julia\|carpet\|clouds\|polka` | `solid` |
 | `--bg-contrast` | `0..1`, tile tone spread around `--bg-lum` | 0.5 |
 | `--bg-scale` | tile size, world units (a full-size solid is 2 across) | 1.0 |
 | `--bg-scroll` | `DX:DZ` world units/s, e.g. `0.5:0` or `-0.2:0.3` | `0:0` |
@@ -80,6 +80,9 @@ platomon [OPTIONS]
 | `--bg-carpet-levels` | carpet: sizes of square cut out | 5 |
 | `--bg-octaves`, `--bg-roughness` | clouds: noise octaves; each finer octave's strength | 5, 0.5 |
 | `--bg-sectors` | radial: sectors round the focal point | 12 |
+| `--bg-dot-size`, `--bg-dot-spacing` | polka: each dot's size across and the distance between neighbouring dots, tiles | 0.5, 1 |
+| `--bg-dot-variability` | polka: how much dot sizes and places vary, 0..1 (sizes from none to twice `--bg-dot-size`, each dot moved off its lattice point by up to half the spacing) | 0 |
+| `--bg-invert-half` | polka: swap light and dark on one side of a line through the centre (the line turns with the floor, but doesn't scroll or sway) | off |
 | **Overlays** | | |
 | `--legend` | flag: corner panel with a wireframe of each solid and its metric | off |
 | `--legend-size` | `1..5` font size: 1–2 terminal text, 3–5 block letters (1–3 cells per font pixel); icons grow with it | 2 |
@@ -300,6 +303,7 @@ each other. With `--bg-pattern solid` (the default) motion has nothing visible t
 | `julia` | the Julia set fractal (4 tiles per unit), in bands by how fast points escape, its constant drifting slowly round a circle of radius 0.7885 so the set keeps changing shape |
 | `carpet` | the Sierpinski carpet fractal: squares cut out at five scales, the smallest a third of a tile |
 | `clouds` | fractal (Brownian) noise: five octaves of value noise, each twice as fine and half as strong, drifting |
+| `polka` | polka dots `--bg-dot-size` across on a triangular lattice `--bg-dot-spacing` apart (rows offset half a spacing, each dot with six equidistant neighbours); `--bg-dot-variability` spreads both (random sizes, dots nudged off the lattice); `--bg-invert-half` inverts one half of the floor, dark dots on light. Dots much smaller than a tile fade to the floor's mean tone sooner with distance, so they don't flicker |
 
 ### Legend and wireframe
 
@@ -658,7 +662,11 @@ Random start is on), then the sliders moved here from *Tuning*: floor contrast, 
 its period and floor turn period, and new sliders: floor scroll X and Z, and each pattern's own
 settings: *Radial sectors*; for rain *Ripple spacing*, *Drop life* and *Raindrops* (how many drops
 ripple at once, 1–48); for the ocean *Wind direction* and *Wave choppiness*; for julia *Julia shape*
-and *Julia detail*; *Carpet levels*; for clouds *Cloud octaves* and *Cloud roughness*. **Only the
+and *Julia detail*; *Carpet levels*; for clouds *Cloud octaves* and *Cloud roughness*; for polka
+*Dot size*, *Dot spacing* and *Dot variability* (0 = identical dots on an even triangular lattice, up to 1 = sizes
+from none to twice the dot size and dots moved up to half the spacing), plus an *Invert half* check
+box (part of the look, saved as `bg_invert_half`) that swaps light and dark on one side of a line
+through the floor's centre. **Only the
 settings the chosen *Background pattern* uses are shown** (the dialog's title names it): the plain
 floor shows just colour and luminosity, a still pattern has no flow, and only the quasicrystal shows
 its waves. With *Random start* on, the pattern is random, so every setting is shown. Settings
@@ -833,11 +841,13 @@ custom_gradient=#0b1d3a:#2f6db5:#7ad3e8:#f4f1c9 ; the Custom colour dialog's gra
 color_by=lum           ; lum | load | spin | sound
 bg_color=auto          ; auto | off | match | custom | a gradient preset (background, by brightness)
 colors=16              ; 16 | 32 | 64 | 128 (palette size; always applies)
-bg_pattern=checker     ; solid | checker | diamond | brick | triangles | hex | radial | quasicrystal | rain | ocean | julia | carpet | clouds
+bg_pattern=checker     ; solid | checker | diamond | brick | triangles | hex | radial | quasicrystal | rain | ocean | julia | carpet | clouds | polka
 bg_lum=2               ; 0..10 (Background options)
 bg_waves=7             ; quasicrystal waves (Background options)
 bg_wave_speed=0.6      ; pattern flow, 0 = still (Background options)
 tune_bg_drops=12       ; rain: raindrops at once (Background options, only when set)
+bg_invert_half=off     ; polka: invert one side of a line through the centre (Background options)
+tune_bg_dot_variability=0.5 ; polka: how much dot sizes and places vary, 0..1 (also tune_bg_dot_size, tune_bg_dot_spacing)
 wireframe=off          ; on | off
 stats=off              ; on | off
 fps_invert=off         ; on | off

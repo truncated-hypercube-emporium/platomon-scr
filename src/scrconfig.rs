@@ -2933,7 +2933,12 @@ mod tests {
             k.extend(shown_tunables(Panel::Background).iter().map(|t| t.key));
             // the dialog is built from the same rows
             let (_, n) = panel_template(Panel::Background);
-            let rows: usize = shown_choices(Panel::Background).iter().map(|c| if kind(c) == Kind::Combo { 2 } else { 3 }).sum();
+            let rows: usize = shown_choices(Panel::Background).iter().map(|c| match kind(c) {
+                    Kind::Combo => 2,
+                    Kind::Slider => 3,
+                    Kind::Toggle => 1,
+                })
+                .sum();
             assert_eq!(n, 1 + rows + shown_tunables(Panel::Background).len() * 4 + 3, "{pat:?}");
             k
         };
@@ -2949,6 +2954,12 @@ mod tests {
         assert!(!checker.contains(&"bg_wave_speed"), "a still pattern has no flow");
         assert!(keys(Some(Pattern::Radial)).contains(&"bg_sectors"));
         assert!(keys(Some(Pattern::Ocean)).contains(&"bg_chop"));
+        let polka = keys(Some(Pattern::Polka));
+        for k in ["bg_dot_size", "bg_dot_spacing", "bg_dot_variability", "bg_invert_half", "bg_contrast", "bg_scale"] {
+            assert!(polka.contains(&k), "polka: {k}");
+        }
+        assert!(!polka.contains(&"bg_wave_speed") && !keys(Some(Pattern::Checker)).contains(&"bg_dot_size"));
+        assert_eq!(kind(&screensaver::choices().into_iter().find(|c| c.key == "bg_invert_half").unwrap()), Kind::Toggle);
         // every pattern's setting is shown for some pattern, and all with a random look
         let all = keys(None);
         assert_eq!(all.len(), panel_choices(Panel::Background).len() + panel_tunables(Panel::Background).len());

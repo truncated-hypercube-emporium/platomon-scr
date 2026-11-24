@@ -317,6 +317,18 @@ struct Cli {
     /// Radial background: sectors round the focal point (default 12).
     #[arg(long, value_name = "N")]
     bg_sectors: Option<u32>,
+    /// Polka background: each dot's size across, tiles (default 0.5).
+    #[arg(long, value_name = "TILES")]
+    bg_dot_size: Option<f32>,
+    /// Polka background: distance between neighbouring dots, tiles (default 1).
+    #[arg(long, value_name = "TILES")]
+    bg_dot_spacing: Option<f32>,
+    /// Polka background: how much dot sizes and places vary, 0..1 (default 0).
+    #[arg(long, value_name = "FLOAT")]
+    bg_dot_variability: Option<f32>,
+    /// Polka background: invert the dots on one side of a line through the centre.
+    #[arg(long)]
+    bg_invert_half: bool,
 }
 
 fn fail(msg: impl std::fmt::Display) -> ! {
@@ -331,6 +343,7 @@ fn apply_cli(cfg: &mut Config, cli: &Cli) -> Result<(), String> {
     set!(spp, bounces, fps_min, fps_max, ramp, char_aspect, aspect, aspect_mode, camera, orbit_period, orbit_dir, orbit_bob);
     set!(bg_lum, bg_pattern, bg_contrast, bg_scale, bg_sway, bg_sway_period, bg_rotate, bg_rotate_period, bg_waves, bg_wave_speed, bg_drops);
     set!(bg_ripple, bg_drop_life, bg_wind, bg_chop, bg_julia_iter, bg_julia_shape, bg_carpet_levels, bg_octaves, bg_roughness, bg_sectors);
+    set!(bg_dot_size, bg_dot_spacing, bg_dot_variability);
     set!(legend_size, legend_opacity, legend_pos, tag_place);
     set!(color, color_by, bg_color, layout, ordering, spacing, focus_zoom, focus_tau);
     set!(distance_scale, orbit_center, orbit_velocity, orbit_inclination, orbit_eccentricity, orbit_variation);
@@ -348,6 +361,9 @@ fn apply_cli(cfg: &mut Config, cli: &Cli) -> Result<(), String> {
     }
     if cli.tag_fixed_length {
         cfg.tag_fixed_len = true;
+    }
+    if cli.bg_invert_half {
+        cfg.bg_invert_half = true;
     }
     if cli.far_ground {
         cfg.far_ground = true;

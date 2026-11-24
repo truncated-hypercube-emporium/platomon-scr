@@ -123,6 +123,10 @@ pub fn randomize(rng: &mut fastrand::Rng, d: &Display) -> Config {
     c.bg_drops = rng.u32(6..=24);
     c.bg_wind = (range(rng, 0.0, 360.0) / 5.0).floor() * 5.0;
     c.bg_julia_shape = (range(rng, 0.72, 0.82) * 200.0).round() / 200.0;
+    c.bg_dot_spacing = round2(range(rng, 0.8, 1.6));
+    c.bg_dot_size = round2(c.bg_dot_spacing * range(rng, 0.3, 0.8));
+    c.bg_dot_variability = if rng.bool() { 0.0 } else { round2(range(rng, 0.2, 0.8)) };
+    c.bg_invert_half = rng.u8(0..4) == 0;
 
     // colour
     if rng.u8(0..10) >= 3 {
@@ -510,6 +514,8 @@ pub struct ScrSettings {
     pub bg_waves: u32,
     /// Quasicrystal background: wave phase speed, radians/s (0 = still).
     pub bg_wave_speed: f32,
+    /// Polka floor: inverted on one side of a line through the centre.
+    pub bg_invert_half: bool,
     pub wireframe: bool,
     pub stats: bool,
     pub fps_invert: bool,
@@ -601,6 +607,7 @@ impl Default for ScrSettings {
             bg_lum: 2,
             bg_waves: crate::scene::ground::WAVES_DEFAULT,
             bg_wave_speed: crate::scene::ground::WAVE_SPEED_DEFAULT,
+            bg_invert_half: false,
             wireframe: false,
             stats: false,
             fps_invert: false,
@@ -723,7 +730,7 @@ macro_rules! tunable {
 /// Every numeric setting set with a slider, in the Tuning, Layout and
 /// Rendering dialogs ([`Tunable::panel`]). A set value applies every run
 /// (random look or not); unset ones keep the random or default value.
-pub const TUNABLES: [Tunable; 37] = [
+pub const TUNABLES: [Tunable; 40] = [
     tunable!(Tuning, "orbit_period", "Orbit period (s)", 15.0, 180.0, 5.0, "Seconds per camera orbit (orbit, tilt and resonance cameras). Tilt also takes one period per rise or fall."),
     tunable!(Tuning, "orbit_bob", "Orbit bob", 0.0, 1.0, 0.05, "How far the orbiting camera rises and falls twice per turn, in world units."),
     tunable!(Tuning, "focus_zoom", "Focus zoom", 0.0, 1.0, 0.05, "Focus camera: 0 only turns toward the busiest solid, 1 comes in to a close-up."),
@@ -746,6 +753,9 @@ pub const TUNABLES: [Tunable; 37] = [
     tunable!(Background, "bg_carpet_levels", "Carpet levels", 1.0, 6.0, 1.0, "Carpet floor: how many sizes of square are cut out, each 3 times the last."),
     tunable!(Background, "bg_octaves", "Cloud octaves", 1.0, 8.0, 1.0, "Clouds floor: layers of noise, each twice as fine; more is more detailed."),
     tunable!(Background, "bg_roughness", "Cloud roughness", 0.3, 0.8, 0.05, "Clouds floor: how strong each finer layer is; higher is rougher and grainier, lower is softer."),
+    tunable!(Background, "bg_dot_size", "Dot size", 0.05, 3.0, 0.05, "Polka floor: how wide each dot is, in tiles (as wide as the spacing or more and they run together)."),
+    tunable!(Background, "bg_dot_spacing", "Dot spacing", 0.25, 4.0, 0.05, "Polka floor: the distance between neighbouring dots, in tiles."),
+    tunable!(Background, "bg_dot_variability", "Dot variability", 0.0, 1.0, 0.05, "Polka floor: how much the dots differ. 0 = every dot the same size on an even triangular lattice (each dot with six neighbours); higher spreads both: sizes from none to twice the dot size, and each dot moved off its place by up to half the spacing."),
     tunable!(Tuning, "min_scale", "Smallest solid size", 0.2, 1.0, 0.05, "Size of a solid whose metric is idle, as a share of full size."),
     tunable!(Tuning, "max_scale", "Largest solid size", 0.5, 1.5, 0.05, "Size of a solid whose metric is at full load."),
     tunable!(Tuning, "idle_spin", "Idle spin (rad/s)", 0.0, 1.0, 0.05, "How fast a solid spins when its metric is idle."),
@@ -778,6 +788,7 @@ pub fn bg_applies(key: &str, p: Option<Pattern>) -> bool {
         "bg_carpet_levels" => p == Pattern::Carpet,
         "bg_octaves" | "bg_roughness" => p == Pattern::Clouds,
         "bg_sectors" => p == Pattern::Radial,
+        "bg_dot_size" | "bg_dot_spacing" | "bg_dot_variability" | "bg_invert_half" => p == Pattern::Polka,
         // contrast, tile size, scroll, sway, turning: any pattern but plain
         _ => p != Pattern::Solid,
     }
@@ -808,6 +819,9 @@ pub fn set_tunable(c: &mut Config, key: &str, v: f32) {
         "bg_carpet_levels" => c.bg_carpet_levels = v.round().max(1.0) as u32,
         "bg_octaves" => c.bg_octaves = v.round().max(1.0) as u32,
         "bg_roughness" => c.bg_roughness = v,
+        "bg_dot_size" => c.bg_dot_size = v,
+        "bg_dot_spacing" => c.bg_dot_spacing = v,
+        "bg_dot_variability" => c.bg_dot_variability = v,
         "min_scale" => c.min_scale = v,
         "max_scale" => c.max_scale = v,
         "idle_spin" => c.idle_spin = v,
@@ -864,6 +878,9 @@ pub fn get_tunable(c: &Config, key: &str) -> f32 {
         "bg_carpet_levels" => c.bg_carpet_levels as f32,
         "bg_octaves" => c.bg_octaves as f32,
         "bg_roughness" => c.bg_roughness,
+        "bg_dot_size" => c.bg_dot_size,
+        "bg_dot_spacing" => c.bg_dot_spacing,
+        "bg_dot_variability" => c.bg_dot_variability,
         "min_scale" => c.min_scale,
         "max_scale" => c.max_scale,
         "idle_spin" => c.idle_spin,
@@ -898,9 +915,10 @@ pub fn help(key: &str) -> &'static str {
         "custom_color" => "Make a colour gradient of your own: 2 to 8 colours, picked or typed, or generated (random, harmonies, a single hue's shades) or started from a preset, and use it for the solids and/or the background.",
         "color_by" => "What picks each solid's colour. Brightness: how lit the cell is. Load: the solid's metric. Spin: its spin speed and direction seen from the camera. Sound: the loudness of its own frequency band (bass on simple solids, treble on complex ones).",
         "bg_color" => "Colouring of the floor and sky, separate from the solids. Auto: by brightness when the solids are. Off: uncoloured. Match: the solids' gradient by brightness. Or a gradient of its own.",
-        "bg_pattern" => "The floor's pattern. Quasicrystal: a flowing, never-repeating wave pattern. Rain: raindrops landing at random, each sending out spreading rings of ripples. Ocean: wind-driven waves, the long ones faster and taller. Julia: a Julia set fractal slowly changing shape. Carpet: the Sierpinski carpet fractal. Clouds: drifting fractal noise. Their settings are in Background options.",
-        "bg_options" => "Background options: the floor's colour, brightness, pattern contrast and tile size, sway and turning, and the moving patterns' flow, quasicrystal waves and raindrops.",
+        "bg_pattern" => "The floor's pattern. Quasicrystal: a flowing, never-repeating wave pattern. Rain: raindrops landing at random, each sending out spreading rings of ripples. Ocean: wind-driven waves, the long ones faster and taller. Julia: a Julia set fractal slowly changing shape. Carpet: the Sierpinski carpet fractal. Clouds: drifting fractal noise. Polka: dots on a triangular lattice, optionally varied and half inverted. Their settings are in Background options.",
+        "bg_options" => "Background options: the floor's colour, brightness, pattern contrast and tile size, sway and turning, and the moving patterns' flow, quasicrystal waves, raindrops and polka dots.",
         "bg_lum" => "Floor brightness, 0 (no floor) to 10.",
+        "bg_invert_half" => "Polka floor: swap light and dark on one side of a line through the centre of the floor (the line turns when the floor turns).",
         "bg_waves" => "Quasicrystal floor: the number of plane waves, which sets its rotational symmetry (7 = sevenfold).",
         "bg_wave_speed" => "How fast the moving floor patterns flow: the quasicrystal's waves, the raindrops' ripples, the ocean's waves, the Julia set's drift and the clouds. Still holds them all.",
         "wireframe" => "Draw the edges of every solid over its shading.",
@@ -1232,6 +1250,7 @@ pub fn choices() -> Vec<Choice> {
         bg_look("bg_lum", "Background luminosity", lums),
         bg_look("bg_waves", "Quasicrystal waves", waves),
         bg_look("bg_wave_speed", "Pattern flow", speeds),
+        bg_look("bg_invert_half", "Invert half", on_off()),
         look("wireframe", "Wireframe overlay", on_off()),
         look("stats", "Stats bar", on_off()),
         look("fps_invert", "Inverted frame rate", on_off()),
@@ -1352,6 +1371,7 @@ impl ScrSettings {
             ("bg_lum", self.bg_lum.to_string()),
             ("bg_waves", self.bg_waves.to_string()),
             ("bg_wave_speed", self.bg_wave_speed.to_string()),
+            ("bg_invert_half", on_off(self.bg_invert_half)),
             ("wireframe", on_off(self.wireframe)),
             ("stats", on_off(self.stats)),
             ("fps_invert", on_off(self.fps_invert)),
@@ -1426,6 +1446,7 @@ impl ScrSettings {
                 .and_then(|v| v.parse::<f32>().ok())
                 .filter(|v| v.is_finite() && (-20.0..=20.0).contains(v))
                 .unwrap_or(d.bg_wave_speed),
+            bg_invert_half: flag("bg_invert_half", d.bg_invert_half),
             custom_gradient: get(CUSTOM_GRADIENT_KEY).and_then(|v| parse_gradient(&v)).unwrap_or(d.custom_gradient.clone()),
             wireframe: flag("wireframe", d.wireframe),
             stats: flag("stats", d.stats),
@@ -1513,6 +1534,7 @@ impl ScrSettings {
         c.bg_lum = self.bg_lum as f32;
         c.bg_waves = self.bg_waves;
         c.bg_wave_speed = self.bg_wave_speed;
+        c.bg_invert_half = self.bg_invert_half;
         c.wireframe = self.wireframe;
         c.show_stats = self.stats;
         c.fps_invert = self.fps_invert;
@@ -1805,6 +1827,7 @@ mod tests {
             bg_lum: 0,
             bg_waves: 5,
             bg_wave_speed: 0.0,
+            bg_invert_half: true,
             wireframe: true,
             stats: false,
             fps_invert: true,
@@ -1951,7 +1974,7 @@ mod tests {
         let looks: Vec<&str> = choices().iter().filter(|c| c.look).map(|c| c.key).collect();
         assert_eq!(
             looks,
-            ["layout", "camera", "color", "color_by", "bg_color", "bg_pattern", "bg_lum", "bg_waves", "bg_wave_speed", "wireframe", "stats", "fps_invert"]
+            ["layout", "camera", "color", "color_by", "bg_color", "bg_pattern", "bg_lum", "bg_waves", "bg_wave_speed", "bg_invert_half", "wireframe", "stats", "fps_invert"]
         );
         for c in choices() {
             assert!(keys.contains(&c.key), "{} is a settings key", c.key);
