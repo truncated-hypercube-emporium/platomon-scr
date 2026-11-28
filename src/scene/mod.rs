@@ -12,9 +12,10 @@ use std::f32::consts::{PI, TAU};
 
 use crate::metrics::Channel;
 pub use camera::{Camera, CameraParams, CameraRig};
-pub use ground::{Ground, GroundParams};
+pub use ground::{Ground, GroundParams, GroundShade, Pattern, PatternShape};
 pub use orbit::{OrbitCenter, OrbitParams, Orbits};
 use sdf::{Polyhedron, SolidKind, inverse_rotation};
+pub use sdf::MAX_AXES;
 
 /// Circumradius of every solid at scale 1.
 pub const BASE_RADIUS: f32 = 1.0;
@@ -378,6 +379,17 @@ pub struct Arrangement {
     /// The orbit layout's reference slot for a metric centre (CPU, RAM...);
     /// `None` = the first place.
     pub center_slot: Option<usize>,
+    /// Minimum floor distance: the solids float high enough that even their
+    /// largest halo clears the floor. Off, they rest just above it (the
+    /// solids never touch it, but a large halo can dip into it).
+    pub halo_clearance: bool,
+}
+
+/// How far below a solid's centre the lowest thing to keep off the floor
+/// reaches, in radii, and the gap it keeps: the largest halo, or (without
+/// the minimum floor distance) the solid itself.
+fn floor_reach(halo_clearance: bool) -> (f32, f32) {
+    if halo_clearance { (HALO_REACH_MAX, FLOAT_GAP) } else { (1.0, HOVER) }
 }
 
 impl Default for Arrangement {
@@ -390,6 +402,7 @@ impl Default for Arrangement {
             seed: 0,
             orbit: OrbitParams::default(),
             center_slot: None,
+            halo_clearance: true,
         }
     }
 }
@@ -478,6 +491,8 @@ pub struct Scene {
     /// Rings: `ring_pos` is a ground point and solids rest on it. Sphere:
     /// `ring_pos` is the solid's centre.
     grounded: bool,
+    /// [`Arrangement::halo_clearance`].
+    halo_clearance: bool,
     /// Slot the focus camera is on, and a challenger waiting out `FOCUS_HOLD`.
     focus: Option<usize>,
     challenger: Option<(usize, f32)>,
@@ -509,7 +524,8 @@ impl Scene {
         let order = placement_order(&kinds, arr.ordering, arr.seed);
         let rings: Vec<Option<u32>> = order.iter().map(|&i| slots[i].ring).collect();
         let max_r = BASE_RADIUS * anim.max_scale.max(anim.min_scale);
-        let float_z = max_r * HALO_REACH_MAX + FLOAT_GAP;
+        let (reach_k, gap) = floor_reach(arr.halo_clearance);
+        let float_z = max_r * reach_k + gap;
         let k_dist = clamp_distance_scale(arr.distance_scale);
         // Orbits: the centre is raised so the lowest point of any orbit
         // keeps the largest halo clear of the ground.
@@ -529,7 +545,7 @@ impl Scene {
             k => distance_factor(k, 2.0 * o.reach),
         });
         if let (Some(o), Some(g)) = (&mut orbits, orbit_grow) {
-            o.centre.z += max_r * (g - 1.0).max(0.0) * HALO_REACH_MAX;
+            o.centre.z += max_r * (g - 1.0).max(0.0) * reach_k;
         }
         let (placed, placed_index, centroid) = match layout {
             Layout::Orbit => {
@@ -559,7 +575,7 @@ impl Scene {
         let size_factor = nearest_factors(k_dist, &ring_pos);
         let grow = orbit_grow.unwrap_or_else(|| size_factor.iter().copied().fold(0.0, f32::max)).max(DISTANCE_FACTOR.0);
         let max_r = max_r * grow;
-        let float_z = max_r * HALO_REACH_MAX + FLOAT_GAP;
+        let float_z = max_r * reach_k + gap;
         // (orbiting solids reach their apoapsis, wherever they start)
         let reach = orbits.as_ref().map_or(0.0, |o| o.reach);
         let extent =
@@ -574,8 +590,8 @@ impl Scene {
             Layout::Orbit => {}
             Layout::Rings | Layout::Line => centroid.z += float_z - (max_r + HOVER),
             Layout::Sphere | Layout::Stack => {
-                let low = ring_pos.iter().map(|p| p.z).fold(f32::INFINITY, f32::min) - max_r * HALO_REACH_MAX;
-                let lift = (FLOAT_GAP - low).max(0.0);
+                let low = ring_pos.iter().map(|p| p.z).fold(f32::INFINITY, f32::min) - max_r * reach_k;
+                let lift = (gap - low).max(0.0);
                 for p in &mut ring_pos {
                     p.z += lift;
                 }
@@ -632,6 +648,7 @@ impl Scene {
             slab_top: 2.0 * BASE_RADIUS + HOVER,
             max_radius: max_r,
             grounded,
+            halo_clearance: arr.halo_clearance,
             focus: None,
             challenger: None,
             orbits,
@@ -663,10 +680,13 @@ impl Scene {
         let inst = &mut self.solids[i];
         inst.scale = r;
         inst.inv_scale = 1.0 / r;
-        inst.center = if self.grounded {
+        inst.center = if self.grounded && self.halo_clearance {
             // Float at a fixed height whatever the size, high enough that the
             // largest halo never dips into the ground.
             self.ring_pos[i] + Vec3A::new(0.0, 0.0, float_z)
+        } else if self.grounded {
+            // rest just above the ground at whatever size
+            self.ring_pos[i] + Vec3A::new(0.0, 0.0, r + HOVER)
         } else {
             self.ring_pos[i]
         };
@@ -676,13 +696,22 @@ impl Scene {
     /// place, size and spin carry on.
     pub fn set_kind(&mut self, i: usize, kind: SolidKind) {
         if let Some(s) = self.solids.get_mut(i).filter(|s| s.poly.kind() != kind) {
-            s.poly = Polyhedron::new(kind);
+            s.poly = Polyhedron::new(kind).with_curvature(s.poly.curvature());
         }
     }
 
-    /// Rings: the height every solid's centre floats at.
+    /// Set solid `i`'s curvature, -10 (dished faces) to +10 (a sphere).
+    pub fn set_curvature(&mut self, i: usize, c: f32) {
+        if let Some(s) = self.solids.get_mut(i) {
+            s.poly.set_curvature(c);
+        }
+    }
+
+    /// Rings: the height every solid's centre floats at (without the
+    /// minimum floor distance, a full-size solid's, resting on the floor).
     pub fn float_z(&self) -> f32 {
-        self.max_radius * HALO_REACH_MAX + FLOAT_GAP
+        let (k, gap) = floor_reach(self.halo_clearance);
+        self.max_radius * k + gap
     }
 
     /// Where solid `i`'s centre is when it is at full size (rings float at
@@ -970,6 +999,37 @@ mod tests {
         assert!((s.solids[4].scale - anim.min_scale).abs() < 1e-6);
         let dyaw = (s.angles[4].1 - before.1).rem_euclid(TAU);
         assert!((dyaw - anim.idle_spin).abs() < 1e-5);
+    }
+
+    #[test]
+    fn minimum_floor_distance_can_be_turned_off() {
+        let anim = AnimParams::default();
+        let slots: Vec<SlotLayout> = DEFAULT_SOLIDS.iter().map(|&solid| SlotLayout { solid, ring: None }).collect();
+        for layout in Layout::ALL {
+            let build = |halo_clearance, level| {
+                let arr = Arrangement { layout, halo_clearance, seed: 3, ..Arrangement::default() };
+                let mut s = Scene::arranged(&slots, &anim, &CameraParams::default(), &arr);
+                s.update(&[Channel { available: true, level, spin_y: 0.0, spin_x: 0.0, activity: level }; 5], &anim, 0.1);
+                s
+            };
+            let lowest = |s: &Scene, reach: f32| s.solids.iter().map(|i| i.center.z - i.scale * reach).fold(f32::MAX, f32::min);
+            for level in [0.0, 1.0] {
+                let on = build(true, level);
+                let off = build(false, level);
+                // on: the largest halo (of the largest solid) clears the floor
+                assert!(on.solids.iter().all(|i| i.center.z - on.max_radius * HALO_REACH_MAX >= FLOAT_GAP - 1e-3), "{layout:?} on");
+                // off: the solids themselves still never touch it, and sit lower
+                assert!(lowest(&off, 1.0) >= HOVER - 1e-3, "{layout:?} off: {}", lowest(&off, 1.0));
+                assert!(lowest(&off, 1.0) <= lowest(&on, 1.0) + 1e-4, "{layout:?}: off is no higher");
+            }
+            if layout == Layout::Rings {
+                // off, idle solids rest on the floor instead of hanging in the air
+                let off = build(false, 0.0);
+                assert!((lowest(&off, 1.0) - HOVER).abs() < 1e-4);
+                assert!(lowest(&build(true, 0.0), 1.0) > 1.0, "on: idle solids float well clear");
+                assert!((off.full_size_center(0).z - (off.max_radius + HOVER)).abs() < 1e-4);
+            }
+        }
     }
 
     #[test]

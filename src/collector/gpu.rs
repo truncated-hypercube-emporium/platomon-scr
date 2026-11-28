@@ -11,6 +11,17 @@ pub struct GpuSample {
     pub util: f32,
     /// Memory-controller utilisation, 0..=100, if the backend provides it.
     pub mem_util: Option<f32>,
+    /// Core temperature, °C.
+    pub temp: Option<f32>,
+    /// Core clock now and the most it can reach, MHz.
+    pub clock: Option<f32>,
+    pub clock_max: Option<f32>,
+}
+
+impl GpuSample {
+    fn util(util: f32, mem_util: Option<f32>) -> Self {
+        Self { util, mem_util, temp: None, clock: None, clock_max: None }
+    }
 }
 
 enum Backend {
@@ -100,9 +111,13 @@ impl GpuSampler {
                 for i in 0..*count {
                     let Ok(dev) = nvml.device_by_index(i) else { continue };
                     let Ok(u) = dev.utilization_rates() else { continue };
+                    use nvml_wrapper::enum_wrappers::device::{Clock, TemperatureSensor};
                     let s = GpuSample {
                         util: (u.gpu as f32).clamp(0.0, 100.0),
                         mem_util: Some((u.memory as f32).clamp(0.0, 100.0)),
+                        temp: dev.temperature(TemperatureSensor::Gpu).ok().map(|t| t as f32),
+                        clock: dev.clock_info(Clock::Graphics).ok().filter(|&c| c > 0).map(|c| c as f32),
+                        clock_max: dev.max_clock_info(Clock::Graphics).ok().filter(|&c| c > 0).map(|c| c as f32),
                     };
                     if best.is_none_or(|b| s.util > b.util) {
                         best = Some(s);
@@ -117,7 +132,7 @@ impl GpuSampler {
                     let Some(util) = read_pct(p) else { continue };
                     let mem_util = p.parent().and_then(|d| read_pct(&d.join("mem_busy_percent")));
                     if best.is_none_or(|b| util > b.util) {
-                        best = Some(GpuSample { util, mem_util });
+                        best = Some(GpuSample::util(util, mem_util));
                     }
                 }
                 best
@@ -129,7 +144,7 @@ impl GpuSampler {
                     .filter(|u| u.is_finite())
                     .map(|u| u.clamp(0.0, 100.0))
                     .reduce(f32::max)
-                    .map(|util| GpuSample { util, mem_util: None })
+                    .map(|util| GpuSample::util(util, None))
             }
             Backend::None => None,
         }

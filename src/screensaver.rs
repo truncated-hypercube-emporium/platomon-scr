@@ -31,7 +31,7 @@ pub const RENDER_BUDGET: f32 = 0.15;
 pub const FONT_MIN: i16 = 8;
 pub const FONT_MAX: i16 = 40;
 /// Smallest font after the density factor, pixels (low enough that every
-/// rendering resolution up to Industrial Boiler, 6x, still differs).
+/// rendering resolution up to Boiler mode, 6x, still differs).
 pub const FONT_FLOOR: i16 = 2;
 /// Width / height of a Consolas cell (only used to plan; the real value is
 /// measured once the font is set).
@@ -271,7 +271,7 @@ pub fn plan(d: &Display, seed: u64, s: &ScrSettings) -> Result<Plan, String> {
 }
 
 /// Manual rendering resolution: rows of text on the screen at Standard
-/// (each step adds as many again: Double = 120, Industrial Boiler = 360).
+/// (each step adds as many again: Double = 120, Boiler mode = 360).
 pub const MANUAL_ROWS: u32 = 60;
 
 /// The font for a manual rendering resolution: the display's height over
@@ -335,12 +335,15 @@ pub fn plan_config(d: &Display, seed: u64, s: &ScrSettings) -> Config {
     config.colors = s.colors;
     config.auto_distance = s.auto_distance;
     config.far_ground = s.far_ground;
+    config.floor_clearance = s.floor_clearance;
     config.tag_fixed_len = s.tag_fixed;
     config.tag_place = s.tag_place;
     config.halo_color = s.halo_color;
     config.ordering = s.ordering;
     config.orbit_center = s.orbit_center;
     config.adaptive_quality = s.adaptive;
+    config.gpu = s.space_heater;
+    config.gpu_pixels = s.space_heater && s.space_heater_pixels;
     if !s.random {
         // a chosen look keeps its floor as the dialog shows it: Background
         // sliders on auto at their defaults (not the random roll's scroll,
@@ -535,6 +538,9 @@ pub struct ScrSettings {
     pub solids: Vec<Binding>,
     /// Delta inputs measure the change over this many seconds.
     pub delta_period: u32,
+    /// The Metrics dialog's Split CPU: each solid the whole CPU drives
+    /// becomes one per logical core.
+    pub split_cpu: bool,
     /// Frame-rate cap; `None` = the display's refresh rate.
     pub fps_cap: Option<u32>,
     /// Rendering CPU budget, percent of wall time at full frame rate, for the
@@ -575,10 +581,16 @@ pub struct ScrSettings {
     pub orbit_center: OrbitCenter,
     /// Adaptive quality: drop samples, then bounces, when frames run late.
     pub adaptive: bool,
+    /// Space heater: render on the GPU when there is one (Vulkan 1.1).
+    pub space_heater: bool,
+    /// Space heater: draw discrete pixels at the display's resolution.
+    pub space_heater_pixels: bool,
     /// Dynamic camera distance: move in and out to keep every solid in frame.
     pub auto_distance: bool,
     /// Extended floor: the ground plane drawn 8x further out.
     pub far_ground: bool,
+    /// Minimum floor distance: solids float so their largest halo clears the floor.
+    pub floor_clearance: bool,
     /// Fixed tag length: leader lines keep one length.
     pub tag_fixed: bool,
     /// Solid tags: each solid's metric floats at a fixed place on screen,
@@ -624,6 +636,7 @@ impl Default for ScrSettings {
             fps_invert: false,
             solids: default_solids(),
             delta_period: DELTA_PERIOD_DEFAULT as u32,
+            split_cpu: false,
             fps_cap: None,
             budget_pct: (RENDER_BUDGET * 100.0).round() as u8,
             overdrive: false,
@@ -640,8 +653,11 @@ impl Default for ScrSettings {
             ordering: Ordering::Listed,
             orbit_center: OrbitCenter::Cpu,
             adaptive: true,
+            space_heater: false,
+            space_heater_pixels: false,
             auto_distance: false,
             far_ground: false,
+            floor_clearance: true,
             tag_fixed: false,
             tags: true,
             tag_color: crate::color::TagColor::Complement,
@@ -925,6 +941,7 @@ pub fn help(key: &str) -> &'static str {
         "orbit_center" => "Orbit layout: the solid the others orbit. CPU, RAM, Network or Disk: that metric's solid. Size: whichever solid is largest at the moment. Spin: whichever spins fastest. A new centre glides in smoothly.",
         "ordering" => "Which solid takes which place: in metric order, from the simplest solid (fewest edges) to the most complex, the reverse, or shuffled. The first place is the inner ring's front, the inner shell, the line's left end or the stack's bottom.",
         "adaptive" => "When frames run late, render with fewer samples, then fewer bounces, and step back up when there is time again.",
+        "renderer" => "What draws the picture. CPU: characters, path traced on the processor. Space heater: the graphics card traces it (Vulkan 1.1; a Radeon HD 7850 or newer will do), as characters (the text sent back to be drawn), or as discrete pixels: one ray per pixel of the screen, coloured and shown by the card itself, in the same colours (3.7 million rays a frame at 2560 x 1440, so expect it to work hard; the sound halo is drawn on them too; tags and the wireframe are not yet). The card covers the solids and every floor; PCs without Vulkan render on the CPU as characters. Discrete pixels are at the screen's own resolution whatever the rendering resolution, which sizes only the text. The text size still comes from the CPU speed test unless Manual is ticked.",
         "camera" => "Static: a fixed overview. Orbit: circles the solids. Focus: glides toward the busiest solid. Tilt: orbits while rising from 20 to 80 degrees and back, pausing half an orbit at each end. Resonance: orbits with three 20-degree rises and falls per turn.",
         "color" => "The colour gradient, or Off for plain monochrome text. Custom: the gradient made in the Custom colour dialog.",
         "custom_color" => "Make a colour gradient of your own: 2 to 8 colours, picked or typed, or generated (random, harmonies, a single hue's shades) or started from a preset, and use it for the solids and/or the background.",
@@ -943,7 +960,13 @@ pub fn help(key: &str) -> &'static str {
         "metrics" => "Choose up to 12 solids and what drives each one's size, spin, colour and complexity (its shape), as a metric's value or its change over a period. Applies every run, random look or not.",
         "metric_on" => "Show this solid. Unticked rows are left out.",
         "metric_shape" => "The solid's shape. Auto: the random look's shape for its metric (or that metric's own). With a complexity input, the shape it starts from at rest.",
-        "metric_size" => "What sets the solid's size: small when idle, full size at full load. Off: always the smallest size.",
+        "metric_size" => "What sets the solid's size: small when idle, full size at full load. Off: always the smallest size. \
+            Temperatures read 30 to 95 \u{b0}C; clocks against the highest they reach; voltages across the range seen since the start. \
+            NVIDIA and AMD graphics cards report their own temperature and clock (AMD also its voltage). On Windows the CPU's temperature and voltage \
+            need LibreHardwareMonitor or OpenHardwareMonitor running; without it the CPU temperature is the hottest ACPI thermal zone, where Windows has one.",
+        "metric_curvature" => "The solid's curvature, -10 to +10: 0 is the flat-faced solid; toward +10 its faces bulge out until it is a sphere through its corners; toward -10 each face is dished in through its corners, pinching the edges (hyperboloid-like). With a curvature input, the curvature it reaches at the input's full load.",
+        "metric_curvature_input" => "What sets how far the solid curves: flat when idle, the slider's curvature at full load (any metric: CPU, GPU, temperatures, clocks, voltages...). Off: the slider's curvature all the time. Changes show in a running preview.",
+        "split_cpu" => "Split the CPU into its cores: every solid driven by the whole CPU becomes one solid per logical core (CPU0, CPU1, ...), alike in everything else. Up to 32 solids in all.",
         "metric_spin" => "What sets how fast the solid spins (rx/read on one axis and tx/write on the other for network and disks). Off: the idle spin.",
         "metric_colour" => "What sets the solid's colour when Colour by is Load. Off: the start of the gradient.",
         "metric_complexity" => "What changes the solid's shape: idle stays at its own shape, more load steps up through solids with more edges, to the most complex at full load. Off: the shape never changes.",
@@ -953,7 +976,7 @@ pub fn help(key: &str) -> &'static str {
         "budget" => "Share of CPU time the rendering may use; the text size is chosen so it fits.",
         "overdrive" => "Ignore the CPU budget: rendering takes all the CPU time it wants (the text is sized for the whole CPU at the full frame rate, and frames render back to back). Expect full CPU load, heat and fan noise.",
         "density" => "Space heating value",
-        "density_manual" => "Manual: the text size comes from the rendering resolution alone (Standard = 60 rows of text, Double = 120, ... Industrial Boiler = 360), not from the speed test and CPU budget. Expect more CPU load at high resolutions.",
+        "density_manual" => "Manual: the text size comes from the rendering resolution alone (Standard = 60 rows of text, Double = 120, ... Boiler mode = 360), not from the speed test and CPU budget. Expect more CPU load at high resolutions.",
         "levels" => "How many glyphs from dark to bright: 8, 16 or 32 (a custom character ramp, in the Rendering dialog, takes their place).",
         "custom_ramp" => "Draw with a character ramp of your own instead of the luminosity levels' 8, 16 or 32 glyphs. It is saved with the other settings, on or off.",
         "ramp" => "The glyphs from darkest to brightest, 2 or more; start with a space for black. Each cell takes the glyph whose place in this string matches its brightness.",
@@ -962,6 +985,7 @@ pub fn help(key: &str) -> &'static str {
         "halo_swing" => "How far the sound halo grows and shrinks around 1.2x the solid's size: +-10%, +-30% or +-60% of its radius.",
         "halo_color" => "Colour of the sound halo (with a colour gradient on). Under: whatever it passes over. Solid: its own solid's colour. Size: quiet halos at the gradient's start, loud ones at its end. Bass: the bass level, which also sets its brightness.",
         "halo_bands" => "On: each solid's halo follows its own frequency band, simple solids the bass and complex ones the treble. Off: every halo follows the overall level.",
+        "floor_clearance" => "Keep the solids off the floor so nothing clips into it: they float high enough that even the largest sound halo clears the floor (the camera aims higher with them). Off, they rest just above the floor at any size: lower and grounded, but a big halo can dip into the floor.",
         "far_ground" => "Draw the floor 8 times further out, toward the horizon. Past the normal distance it is shaded cheaply (averaged pattern, exact lighting, no sampling), so it costs little.",
         "tag_fixed" => "For tags beside, below or trailing their solids. On: placed for each solid's current size, so the leader line keeps one length as it grows and shrinks. Off: placed for the solid at full size, so tags hold still.",
         "tag_place" => "Circle: on a circle 80% of the picture's height across, each gliding round to the point nearest its solid. Beside: next to each solid, toward the picture's nearest corner. Fixed corner: stacked in the corner on its solid's side. Below: centred under each solid. Trailing: behind each solid as it moves.",
@@ -996,7 +1020,7 @@ pub const WAVE_SPEEDS: [(&str, &str); 5] =
     [("0", "Still"), ("0.3", "Slow"), ("0.6", "Medium"), ("1.2", "Fast"), ("2.4", "Very fast")];
 /// Largest burn-in drift from the centred position, pixels per axis.
 pub const SHIFT_RADIUS_MAX: u8 = 25;
-/// Highest rendering resolution (Industrial Boiler: 6x the characters per axis).
+/// Highest rendering resolution (Boiler mode: 6x the characters per axis).
 pub const DENSITY_MAX: u8 = 6;
 
 fn on_off(v: bool) -> String {
@@ -1154,6 +1178,8 @@ pub const SOLID_KEYS: [&str; MAX_SOLIDS] =
     ["solid1", "solid2", "solid3", "solid4", "solid5", "solid6", "solid7", "solid8", "solid9", "solid10", "solid11", "solid12"];
 /// INI key of the delta inputs' period, seconds.
 pub const DELTA_PERIOD_KEY: &str = "delta_period";
+/// INI key of the Metrics dialog's Split CPU.
+pub const SPLIT_CPU_KEY: &str = "split_cpu";
 
 /// The solids before any are chosen: one each for CPU, RAM, disk, network
 /// and GPU, each metric driving its solid's size, spin and colour.
@@ -1238,6 +1264,12 @@ pub fn choices() -> Vec<Choice> {
             ],
         ),
         in_panel(Panel::Layout, "orbit_center", "Orbit centre", OrbitCenter::ALL.iter().map(|c| opt(c.id(), c.label())).collect()),
+        in_panel(
+            Panel::Rendering,
+            "renderer",
+            "Renderer",
+            vec![opt("cpu", "CPU: characters"), opt("gpu", "GPU: Space heater, characters"), opt("pixels", "Pixels: Space heater, discrete pixels")],
+        ),
         in_panel(Panel::Rendering, "adaptive", "Adaptive quality", on_off()),
         look(
             "camera",
@@ -1284,7 +1316,7 @@ pub fn choices() -> Vec<Choice> {
                 opt("4", "Quadruple"),
                 opt("5", "Quintuple"),
                 // a no-break space keeps both words in the drop-down
-                opt("6", "Industrial\u{a0}Boiler"),
+                opt("6", "Boiler\u{a0}mode"),
             ],
         ),
         always("density_manual", "Manual", on_off()),
@@ -1317,6 +1349,7 @@ pub fn choices() -> Vec<Choice> {
         ),
         always("auto_distance", "Dynamic camera distance", on_off()),
         styled("far_ground", "Extended floor distance", on_off()),
+        styled("floor_clearance", "Minimum floor distance", on_off()),
         styled("tag_fixed", "Fixed tag length", on_off()),
         styled("tags", "Tags", on_off()),
         styled(
@@ -1413,8 +1446,10 @@ impl ScrSettings {
             ("ordering", self.ordering.id().into()),
             ("orbit_center", self.orbit_center.id().into()),
             ("adaptive", on_off(self.adaptive)),
+            ("renderer", self.renderer_id().into()),
             ("auto_distance", on_off(self.auto_distance)),
             ("far_ground", on_off(self.far_ground)),
+            ("floor_clearance", on_off(self.floor_clearance)),
             ("tag_fixed", on_off(self.tag_fixed)),
             ("tags", on_off(self.tags)),
             ("tag_color", self.tag_color.id()),
@@ -1431,6 +1466,7 @@ impl ScrSettings {
             v.push((key, self.solids.get(k).map(Binding::text).unwrap_or_default()));
         }
         v.push((DELTA_PERIOD_KEY, self.delta_period.to_string()));
+        v.push((SPLIT_CPU_KEY, on_off(self.split_cpu)));
         v
     }
 
@@ -1482,6 +1518,7 @@ impl ScrSettings {
             delta_period: num(DELTA_PERIOD_KEY)
                 .filter(|p| (DELTA_PERIOD_RANGE.0 as u32..=DELTA_PERIOD_RANGE.1 as u32).contains(p))
                 .unwrap_or(d.delta_period),
+            split_cpu: flag(SPLIT_CPU_KEY, d.split_cpu),
             fps_cap: match val("fps_cap").as_deref() {
                 None | Some("display") => None,
                 Some(v) => v.parse::<u32>().ok().filter(|f| (30..=240).contains(f)).or(d.fps_cap),
@@ -1514,8 +1551,20 @@ impl ScrSettings {
             ordering: val("ordering").and_then(|v| v.parse().ok()).unwrap_or(d.ordering),
             orbit_center: val("orbit_center").and_then(|v| v.parse().ok()).unwrap_or(d.orbit_center),
             adaptive: flag("adaptive", d.adaptive),
+            // (renderer=; before it, two switches: space_heater, space_heater_pixels)
+            space_heater: match val("renderer").as_deref() {
+                Some("gpu" | "pixels") => true,
+                Some(_) => false,
+                None => flag("space_heater", d.space_heater),
+            },
+            space_heater_pixels: match val("renderer").as_deref() {
+                Some("pixels") => true,
+                Some(_) => false,
+                None => flag("space_heater_pixels", d.space_heater_pixels),
+            },
             auto_distance: flag("auto_distance", d.auto_distance),
             far_ground: flag("far_ground", d.far_ground),
+            floor_clearance: flag("floor_clearance", d.floor_clearance),
             tag_fixed: flag("tag_fixed", d.tag_fixed),
             tags: flag("tags", d.tags),
             tag_color: val("tag_color").and_then(|v| v.parse().ok()).unwrap_or(d.tag_color),
@@ -1544,6 +1593,15 @@ impl ScrSettings {
 
     /// The solids (always), and unless the look is random, the chosen look
     /// in place of the random one.
+    /// The Renderer drop-down's value: `cpu`, `gpu` or `pixels`.
+    pub fn renderer_id(&self) -> &'static str {
+        match (self.space_heater, self.space_heater_pixels) {
+            (false, _) => "cpu",
+            (true, false) => "gpu",
+            (true, true) => "pixels",
+        }
+    }
+
     pub fn apply(&self, c: &mut Config) {
         self.apply_solids(c);
         if self.random {
@@ -1589,6 +1647,7 @@ impl ScrSettings {
             })
             .collect();
         c.delta_period = self.delta_period as f32;
+        c.split_cpu = self.split_cpu;
     }
 }
 
@@ -1772,7 +1831,7 @@ mod tests {
         assert_eq!(px2, 10);
         assert_eq!((cols2, rows2), (465, 144));
         assert_eq!(apply_density(&WQHD, FONT_MIN, 2).0, 4);
-        assert_eq!(apply_density(&WQHD, 18, 6).0, 3, "Industrial Boiler: a sixth of the height");
+        assert_eq!(apply_density(&WQHD, 18, 6).0, 3, "Boiler mode: a sixth of the height");
         assert_eq!(apply_density(&WQHD, 5, 6).0, FONT_FLOOR, "never below the floor");
         // the plan uses it: density 2 ⇒ half the font (or the floor) of the
         // budget size from the plan's own speed test (two separate speed
@@ -1884,6 +1943,7 @@ mod tests {
                 Binding::parse("auto|off|off|off|delta:disk-dev:C:\\").unwrap(),
             ],
             delta_period: 45,
+            split_cpu: true,
             fps_cap: Some(60),
             budget_pct: 25,
             overdrive: true,
@@ -1902,8 +1962,11 @@ mod tests {
             ordering: Ordering::Complex,
             orbit_center: OrbitCenter::Spin,
             adaptive: false,
+            space_heater: true,
+            space_heater_pixels: true,
             auto_distance: true,
             far_ground: true,
+            floor_clearance: false,
             tag_fixed: true,
             tags: false,
             tag_color: crate::color::TagColor::Theme,
@@ -2054,6 +2117,23 @@ mod tests {
         // out of range or off-step values from the INI snap to the slider
         let s = ScrSettings::from_lookup(lookup(&[("tune_orbit_period", "47"), ("tune_max_spin", "99"), ("tune_bg_sway", "x")]));
         assert_eq!(s.tuning, vec![("orbit_period", 45.0), ("max_spin", 8.0)]);
+        // the Renderer drop-down, and the two switches it replaced
+        for (pairs, want) in [
+            (&[("renderer", "pixels")][..], ("pixels", true, true)),
+            (&[("renderer", "gpu")][..], ("gpu", true, false)),
+            (&[("renderer", "cpu"), ("space_heater", "on")][..], ("cpu", false, false)),
+            (&[("space_heater", "on"), ("space_heater_pixels", "on")][..], ("pixels", true, true)),
+            (&[("space_heater", "on")][..], ("gpu", true, false)),
+            (&[][..], ("cpu", false, false)),
+        ] {
+            let s = ScrSettings::from_lookup(lookup(pairs));
+            assert_eq!((s.renderer_id(), s.space_heater, s.space_heater_pixels), want, "{pairs:?}");
+            assert!(s.to_pairs().iter().any(|(k, v)| *k == "renderer" && v == want.0), "saved as renderer=");
+            let mut c = Config::default();
+            plan_config(&WQHD, 1, &s).clone_into(&mut c);
+            assert_eq!((c.gpu, c.gpu_pixels), (want.1, want.2));
+        }
+        assert!(choices().iter().any(|c| c.key == "renderer" && c.panel == Some(Panel::Rendering) && c.options.len() == 3));
         // Floor scroll Z from before the floor was the x, y plane reads as
         // Floor scroll Y, negated (same motion); a saved Y wins; saving clears Z
         let old = ScrSettings::from_lookup(lookup(&[("tune_bg_scroll_z", "0.3")]));

@@ -39,7 +39,7 @@ struct Frame {
 
 impl Frame {
     fn view(&self) -> FrameView<'_> {
-        FrameView { radiance: &self.radiance, depth: &self.depth, ids: &self.ids, proj: self.proj }
+        FrameView { radiance: &self.radiance, lum: None, glyphs: None, depth: &self.depth, ids: &self.ids, proj: self.proj }
     }
 }
 

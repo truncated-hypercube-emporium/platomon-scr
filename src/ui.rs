@@ -12,6 +12,8 @@ pub enum Action {
     ToggleLegend,
     ToggleWireframe,
     ToggleTags,
+    /// F1: the debug panel.
+    ToggleDebug,
     Resize(u16, u16),
 }
 
@@ -29,6 +31,7 @@ pub fn map_event(ev: &Event) -> Action {
                 KeyCode::Char('l') | KeyCode::Char('L') if *kind == KeyEventKind::Press => Action::ToggleLegend,
                 KeyCode::Char('w') | KeyCode::Char('W') if *kind == KeyEventKind::Press => Action::ToggleWireframe,
                 KeyCode::Char('t') | KeyCode::Char('T') if *kind == KeyEventKind::Press => Action::ToggleTags,
+                KeyCode::F(1) if *kind == KeyEventKind::Press => Action::ToggleDebug,
                 _ => Action::None,
             }
         }
@@ -101,6 +104,38 @@ fn rate(v: Option<f64>) -> String {
     v.map_or_else(|| "n/a".to_string(), |r| format!("{:.1}", r))
 }
 
+/// The CPU's label: `CPU`, or `CPU3` for one core.
+fn cpu_label(r: &Reading) -> String {
+    format!("CPU{}", r.name.as_deref().unwrap_or(""))
+}
+
+/// A sensor's value: `64°C`, `4.20 GHz`, `1.21 V` (`compact`: `64C`, `4.2G`, `1.21V`).
+fn sensor(r: &Reading, compact: bool) -> String {
+    let Some(v) = r.value else { return "n/a".into() };
+    match (r.kind, compact) {
+        (MetricKind::CpuTemp | MetricKind::GpuTemp, false) => format!("{v:.0}\u{b0}C"),
+        (MetricKind::CpuTemp | MetricKind::GpuTemp, true) => format!("{v:.0}C"),
+        (MetricKind::CpuFreq | MetricKind::GpuFreq, false) => format!("{:.2} GHz", v / 1000.0),
+        (MetricKind::CpuFreq | MetricKind::GpuFreq, true) => format!("{:.1}G", v / 1000.0),
+        (_, false) => format!("{v:.2} V"),
+        (_, true) => format!("{v:.2}V"),
+    }
+}
+
+/// A sensor's label: `CPU`/`GPU` and what it measures.
+fn sensor_label(k: MetricKind, compact: bool) -> &'static str {
+    match (k, compact) {
+        (MetricKind::CpuTemp, _) => "CPU T",
+        (MetricKind::GpuTemp, _) => "GPU T",
+        (MetricKind::CpuFreq, _) => "CPU",
+        (MetricKind::GpuFreq, _) => "GPU",
+        (MetricKind::CpuVolt, false) => "CPU Vcore",
+        (MetricKind::GpuVolt, false) => "GPU Vcore",
+        (MetricKind::CpuVolt, true) => "CPU",
+        _ => "GPU",
+    }
+}
+
 /// One stats-bar segment.
 pub fn segment(r: &Reading) -> String {
     let name = || r.name.clone().unwrap_or_else(|| "auto".into());
@@ -109,13 +144,15 @@ pub fn segment(r: &Reading) -> String {
         _ => format!("{label} n/a"),
     };
     match r.kind {
-        MetricKind::Cpu => format!("CPU {}", pct(r.pct)),
+        k if k.is_sensor() => format!("{} {}", sensor_label(k, false), sensor(r, false)),
+        MetricKind::Cpu => format!("{} {}", cpu_label(r), pct(r.pct)),
         MetricKind::Ram => format!("RAM {}", pct(r.pct)),
         MetricKind::Gpu => format!("GPU {}", pct(r.pct)),
         MetricKind::Disk => pair("DSK".into(), "r", "w"),
         MetricKind::Net => pair("NET".into(), "↓", "↑"),
         MetricKind::Nic => pair(format!("NIC {}", name()), "↓", "↑"),
         MetricKind::DiskDev => pair(format!("DEV {}", name()), "r", "w"),
+        _ => String::new(),
     }
 }
 
@@ -128,13 +165,15 @@ pub fn short_label(r: &Reading) -> String {
     };
     let name = || r.name.as_deref().unwrap_or("auto").chars().take(10).collect::<String>();
     match r.kind {
-        MetricKind::Cpu => format!("CPU {}", pct(r.pct)),
+        k if k.is_sensor() => format!("{} {}", sensor_label(k, true), sensor(r, true)),
+        MetricKind::Cpu => format!("{} {}", cpu_label(r), pct(r.pct)),
         MetricKind::Ram => format!("RAM {}", pct(r.pct)),
         MetricKind::Gpu => format!("GPU {}", pct(r.pct)),
         MetricKind::Disk => format!("DSK {}", total()),
         MetricKind::Net => format!("NET {}", total()),
         MetricKind::Nic => format!("NIC {} {}", name(), total()),
         MetricKind::DiskDev => format!("DEV {} {}", name(), total()),
+        _ => String::new(),
     }
 }
 
@@ -191,6 +230,8 @@ mod tests {
         assert_eq!(map_event(&key(KeyCode::Char('l'), KeyModifiers::NONE, p)), Action::ToggleLegend);
         assert_eq!(map_event(&key(KeyCode::Char('W'), KeyModifiers::SHIFT, p)), Action::ToggleWireframe);
         assert_eq!(map_event(&key(KeyCode::Char('t'), KeyModifiers::NONE, p)), Action::ToggleTags);
+        assert_eq!(map_event(&key(KeyCode::F(1), KeyModifiers::NONE, p)), Action::ToggleDebug);
+        assert_eq!(map_event(&key(KeyCode::F(1), KeyModifiers::NONE, KeyEventKind::Repeat)), Action::None, "held F1 doesn't flicker");
     }
 
     #[test]
@@ -222,7 +263,22 @@ mod tests {
     }
 
     fn rd(kind: MetricKind, pct: Option<f32>, a: Option<f64>, b: Option<f64>, name: Option<&str>) -> Reading {
-        Reading { kind, name: name.map(String::from), pct, a, b }
+        Reading { kind, name: name.map(String::from), pct, a, b, value: None }
+    }
+
+    #[test]
+    fn sensor_and_core_labels() {
+        use MetricKind::*;
+        let v = |kind, value| Reading { value, ..Reading::empty(kind) };
+        assert_eq!(segment(&rd(Cpu, Some(37.0), None, None, Some("3"))), "CPU3 37%");
+        assert_eq!(segment(&v(CpuTemp, Some(64.4))), "CPU T 64\u{b0}C");
+        assert_eq!(segment(&v(CpuFreq, Some(4213.0))), "CPU 4.21 GHz");
+        assert_eq!(segment(&v(GpuVolt, Some(0.95))), "GPU Vcore 0.95 V");
+        assert_eq!(segment(&v(GpuTemp, None)), "GPU T n/a");
+        assert_eq!(short_label(&v(CpuTemp, Some(64.4))), "CPU T 64C");
+        assert_eq!(short_label(&v(GpuFreq, Some(1785.0))), "GPU 1.8G");
+        assert_eq!(short_label(&v(CpuVolt, Some(1.214))), "CPU 1.21V");
+        assert_eq!(short_label(&rd(Cpu, Some(5.0), None, None, Some("11"))), "CPU11 5%");
     }
 
     #[test]

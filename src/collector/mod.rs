@@ -2,6 +2,7 @@
 //! the latest immutable [`RawMetrics`] snapshot.
 
 pub mod gpu;
+pub mod sensors;
 pub mod system;
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -53,6 +54,10 @@ pub struct RawMetrics {
     pub gpu_util: Option<f32>,
     /// 0..=100
     pub gpu_mem_util: Option<f32>,
+    /// Each logical core's utilisation, 0..=100 (empty when unavailable).
+    pub cpu_cores: Vec<f32>,
+    /// Temperatures, clocks and voltages.
+    pub sensors: sensors::SensorSample,
     /// Per disk (empty when unavailable).
     pub disks: Vec<IoSample>,
     /// Per network adapter, loopback excluded (empty when unavailable).
@@ -112,6 +117,7 @@ fn run(shared: Shared, stop: Arc<AtomicBool>, gpu_backend: Arc<Mutex<&'static st
     if let Ok(mut g) = gpu_backend.lock() {
         *g = gpu.as_ref().map_or("none", |g| g.backend_name());
     }
+    let mut sensors = catch_unwind(sensors::SensorSampler::new).ok();
 
     let mut seq = 0u64;
     let mut last = Instant::now();
@@ -124,16 +130,22 @@ fn run(shared: Shared, stop: Arc<AtomicBool>, gpu_backend: Arc<Mutex<&'static st
 
         let sampled = catch_unwind(AssertUnwindSafe(|| {
             let mut m = sys.sample(elapsed);
-            if let Some(g) = gpu.as_mut().and_then(|g| g.sample()) {
+            let g = gpu.as_mut().and_then(|g| g.sample());
+            if let Some(g) = g {
                 m.gpu_util = Some(g.util);
                 m.gpu_mem_util = g.mem_util;
+            }
+            if let Some(s) = sensors.as_mut() {
+                m.sensors = merge_sensors(s.sample(), g, &m);
             }
             m
         }));
         let mut m = match sampled {
             Ok(m) => m,
             Err(_) => {
-                gpu = None; // a backend that panicked once is not trusted again
+                // a backend that panicked once is not trusted again
+                gpu = None;
+                sensors = None;
                 RawMetrics { elapsed, ..RawMetrics::default() }
             }
         };
@@ -151,9 +163,31 @@ fn run(shared: Shared, stop: Arc<AtomicBool>, gpu_backend: Arc<Mutex<&'static st
     }
 }
 
+/// The sensors' readings, with the GPU backend's (NVML: more direct than a
+/// hardware monitor's) for the GPU and the system sampler's CPU clock
+/// where the sensors have none.
+fn merge_sensors(s: sensors::SensorSample, g: Option<gpu::GpuSample>, m: &RawMetrics) -> sensors::SensorSample {
+    let mut out = s.or(m.sensors);
+    if let Some(g) = g {
+        out.gpu_temp = g.temp.or(out.gpu_temp);
+        out.gpu_clock = g.clock.or(out.gpu_clock);
+        out.gpu_clock_max = g.clock_max.or(out.gpu_clock_max);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gpu_backend_readings_win_for_the_gpu() {
+        let s = sensors::SensorSample { gpu_temp: Some(40.0), gpu_volt: Some(0.9), cpu_temp: Some(50.0), ..Default::default() };
+        let g = gpu::GpuSample { util: 1.0, mem_util: None, temp: Some(45.0), clock: Some(1500.0), clock_max: None };
+        let m = RawMetrics { sensors: sensors::SensorSample { cpu_clock: Some(3000.0), ..Default::default() }, ..Default::default() };
+        let r = merge_sensors(s, Some(g), &m);
+        assert_eq!((r.gpu_temp, r.gpu_clock, r.gpu_volt, r.cpu_temp, r.cpu_clock), (Some(45.0), Some(1500.0), Some(0.9), Some(50.0), Some(3000.0)));
+    }
 
     #[test]
     fn io_sample_matching() {

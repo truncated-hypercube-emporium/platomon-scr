@@ -18,6 +18,7 @@
 
 #![allow(non_snake_case, clippy::upper_case_acronyms)]
 
+use crate::drive::INPUTS;
 use std::cell::RefCell;
 use std::path::PathBuf;
 
@@ -400,6 +401,12 @@ const ID_MET_IN: i32 = 2840;
 const ID_MET_DELTA: i32 = 2900;
 const ID_MET_PERIOD: i32 = 2960;
 const ID_MET_DEFAULTS: i32 = 2961;
+const ID_MET_SPLIT: i32 = 2962;
+/// Row `k`'s curvature slider (0..=20 for -10..=10) and its value.
+const ID_MET_CURVE: i32 = 3300;
+const ID_MET_CURVE_VAL: i32 = 3320;
+/// Inputs per row of the Metrics dialog (ids `ID_MET_IN + k * INS + d`).
+const INS: i32 = INPUTS as i32;
 const CBN_SELCHANGE: usize = 1;
 const CB_SETDROPPEDWIDTH: u32 = 0x0160;
 const SS_ENDELLIPSIS: u32 = 0x4000;
@@ -738,6 +745,7 @@ fn panel_keys() -> Vec<&'static str> {
     // the Metrics dialog's solids and delta period
     keys.extend(screensaver::SOLID_KEYS);
     keys.push(screensaver::DELTA_PERIOD_KEY);
+    keys.push(screensaver::SPLIT_CPU_KEY);
     // the Custom colour dialog's gradient
     keys.push(screensaver::CUSTOM_GRADIENT_KEY);
     keys
@@ -1274,10 +1282,11 @@ fn tuning_label(h: HWND) {
         // SAFETY: control id from our template.
         unsafe { SetDlgItemTextW(h, id, wide(&text).as_ptr()) };
     }
-    // the Metrics button: how many solids
-    let n = metrics_edit_from(&UI.with(|u| u.borrow().panel_values.clone())).0.len();
+    // the Metrics button: how many solids (and whether the CPU is split)
+    let e = metrics_edit_from(&UI.with(|u| u.borrow().panel_values.clone()));
+    let text = format!("M&etrics ({}{})", e.solids.len(), if e.split_cpu { ", cores" } else { "" });
     // SAFETY: control id from our template.
-    unsafe { SetDlgItemTextW(h, ID_METRICS, wide(&format!("M&etrics ({n})")).as_ptr()) };
+    unsafe { SetDlgItemTextW(h, ID_METRICS, wide(&text).as_ptr()) };
 }
 
 /// Roll random values into every setting of the Appearance group and into
@@ -2525,7 +2534,7 @@ fn pattern_name(p: Pattern) -> String {
 const METRICS_TEXT: &str = "M&etrics...";
 
 /// The metrics every input drop-down offers: (key, shown text); `off` first.
-const METRIC_CHOICES: [(&str, &str); 8] = [
+const METRIC_CHOICES: [(&str, &str); 14] = [
     ("off", "Off"),
     ("cpu", "CPU"),
     ("ram", "RAM"),
@@ -2534,6 +2543,12 @@ const METRIC_CHOICES: [(&str, &str); 8] = [
     ("gpu", "GPU"),
     ("nic", "Adapter"),
     ("disk-dev", "Disk dev"),
+    ("cpu-temp", "CPU temp"),
+    ("gpu-temp", "GPU temp"),
+    ("cpu-freq", "CPU freq"),
+    ("gpu-freq", "GPU freq"),
+    ("cpu-volt", "CPU volts"),
+    ("gpu-volt", "GPU volts"),
 ];
 
 /// Metrics dialog layout, dialog units: the rows' top and pitch, each
@@ -2542,17 +2557,34 @@ const MET_TOP: i16 = 44;
 const MET_ROW: i16 = 15;
 const MET_IN_X: i16 = 136;
 const MET_IN_W: i16 = 78;
-const MET_W: i16 = MET_IN_X + 4 * MET_IN_W + 6;
+/// The curvature column: slider, its value, then its input and Δ box.
+const MET_CURVE_X: i16 = MET_IN_X + 4 * MET_IN_W;
+const MET_CURVE_IN_X: i16 = MET_CURVE_X + 84;
+const MET_W: i16 = MET_CURVE_IN_X + MET_IN_W + 6;
 
-/// The solids and delta period in the settings `values` (as the main
-/// dialog keeps them): its solid keys in order, unparsable ones skipped.
-fn metrics_edit_from(values: &[(&'static str, String)]) -> (Vec<Binding>, u32) {
-    let s = settings_from(&values.iter().map(|(k, v)| (k.to_string(), v.clone())).collect::<Vec<_>>());
-    (s.solids, s.delta_period)
+/// What the Metrics dialog edits: the solids, the delta period and Split CPU.
+#[derive(Debug, Clone, PartialEq)]
+struct MetricsEdit {
+    solids: Vec<Binding>,
+    period: u32,
+    split_cpu: bool,
 }
 
-/// The Metrics dialog: per row a check box, the shape, and four inputs
-/// each with its Δ box; the delta period and Defaults below.
+impl MetricsEdit {
+    fn of(s: &ScrSettings) -> Self {
+        Self { solids: s.solids.clone(), period: s.delta_period, split_cpu: s.split_cpu }
+    }
+}
+
+/// The Metrics dialog's settings in the settings `values` (as the main
+/// dialog keeps them): its solid keys in order, unparsable ones skipped.
+fn metrics_edit_from(values: &[(&'static str, String)]) -> MetricsEdit {
+    MetricsEdit::of(&settings_from(&values.iter().map(|(k, v)| (k.to_string(), v.clone())).collect::<Vec<_>>()))
+}
+
+/// The Metrics dialog: per row a check box, the shape, four inputs each
+/// with its Δ box, and the curvature slider with its input and Δ box; the
+/// delta period, Defaults and Split CPU below.
 fn metrics_template() -> (Vec<u32>, usize) {
     let rows = screensaver::MAX_SOLIDS as i16;
     let cy = MET_TOP + rows * MET_ROW + 46;
@@ -2562,24 +2594,32 @@ fn metrics_template() -> (Vec<u32>, usize) {
         (8, 6, MET_W - 16, 20),
         ID_STATIC,
         STATIC,
-        "Up to 12 solids, each with the metrics that drive its size, spin, colour (with Colour by set to Load) and complexity (its shape). \
-         Tick \u{394} to use a metric's change over the delta period instead of its value.",
+        "Up to 12 solids, each with the metrics that drive its size, spin, colour (with Colour by set to Load) and complexity (its shape), \
+         and its curvature: -10 dishes the faces in (hyperboloid-like), +10 rounds it into a sphere. With a curvature input the solid is flat when \
+         the input is idle and reaches the slider's curvature at full load. Tick \u{394} to use a metric's change over the delta period instead of its value.",
     );
     let hy = MET_TOP - 12;
     t.item(0, (8, hy, 26, 10), ID_STATIC, STATIC, "Solid");
     t.item(0, (36, hy, 96, 10), ID_STATIC, STATIC, "Shape");
-    for (d, drive) in Drive::ALL.iter().enumerate() {
+    for (d, drive) in Drive::ALL[..4].iter().enumerate() {
         t.item(0, (MET_IN_X + d as i16 * MET_IN_W, hy, 58, 10), ID_STATIC, STATIC, drive.label());
         t.item(0, (MET_IN_X + d as i16 * MET_IN_W + 60, hy, 14, 10), ID_STATIC, STATIC, "\u{394}");
     }
+    t.item(0, (MET_CURVE_X, hy, 82, 10), ID_STATIC, STATIC, "Curvature (-10 to +10)");
+    t.item(0, (MET_CURVE_IN_X, hy, 58, 10), ID_STATIC, STATIC, "Curvature by");
+    t.item(0, (MET_CURVE_IN_X + 60, hy, 14, 10), ID_STATIC, STATIC, "\u{394}");
     for k in 0..rows {
         let y = MET_TOP + k * MET_ROW;
         let k32 = k as i32;
         t.item(BS_AUTOCHECKBOX | WS_TABSTOP | WS_GROUP, (8, y + 1, 26, 10), (ID_MET_ON + k32) as u16, BUTTON, &(k + 1).to_string());
         t.item(CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, (36, y, 96, 200), (ID_MET_SHAPE + k32) as u16, COMBOBOX, "");
-        for d in 0..4 {
-            let x = MET_IN_X + d as i16 * MET_IN_W;
-            let i = k32 * 4 + d;
+        for d in 0..INS {
+            let x = if d < 4 { MET_IN_X + d as i16 * MET_IN_W } else { MET_CURVE_IN_X };
+            let i = k32 * INS + d;
+            if d == 4 {
+                t.slider(TBS_NOTICKS, (MET_CURVE_X, y, 64, 12), ID_MET_CURVE + k32);
+                t.item(0, (MET_CURVE_X + 66, y + 2, 16, 10), (ID_MET_CURVE_VAL + k32) as u16, STATIC, "0");
+            }
             t.item(CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, (x, y, 58, 160), (ID_MET_IN + i) as u16, COMBOBOX, "");
             t.item(BS_AUTOCHECKBOX | WS_TABSTOP, (x + 60, y + 1, 14, 10), (ID_MET_DELTA + i) as u16, BUTTON, "");
         }
@@ -2596,6 +2636,7 @@ fn metrics_template() -> (Vec<u32>, usize) {
     );
     let by = cy - 20;
     t.item(BS_PUSHBUTTON | WS_TABSTOP, (8, by, 60, 14), ID_MET_DEFAULTS as u16, BUTTON, "&Defaults");
+    t.item(BS_AUTOCHECKBOX | WS_TABSTOP, (76, by + 2, 110, 10), ID_MET_SPLIT as u16, BUTTON, "&Split CPU into cores");
     t.item(BS_DEFPUSHBUTTON | WS_TABSTOP, (MET_W - 122, by, 55, 14), IDOK as u16, BUTTON, "OK");
     t.item(BS_PUSHBUTTON | WS_TABSTOP, (MET_W - 62, by, 55, 14), IDCANCEL as u16, BUTTON, "Cancel");
     let n = t.count();
@@ -2639,9 +2680,10 @@ fn metric_text(key: &str) -> String {
     }
 }
 
-/// Show `solids` and `period` in the open Metrics dialog (unused rows
-/// unticked, ready with CPU on size, spin and colour).
-unsafe fn metrics_fill(h: HWND, solids: &[Binding], period: u32) {
+/// Show `e` in the open Metrics dialog (unused rows unticked, ready with
+/// CPU on size, spin and colour).
+unsafe fn metrics_fill(h: HWND, e: &MetricsEdit) {
+    let (solids, period) = (&e.solids, e.period);
     let opts = UI.with(|u| u.borrow().metric_opts.clone());
     let spare = Binding::parse("auto|cpu").expect("built-in binding");
     // SAFETY: control ids from the metrics template.
@@ -2652,16 +2694,42 @@ unsafe fn metrics_fill(h: HWND, solids: &[Binding], period: u32) {
             CheckDlgButton(h, ID_MET_ON + k32, (k < solids.len()) as u32);
             let shape = b.solid.and_then(|s| SolidKind::ALL.iter().position(|x| *x == s)).map_or(0, |i| i + 1);
             SendDlgItemMessageW(h, ID_MET_SHAPE + k32, CB_SETCURSEL, shape, 0);
+            set_curve(h, k32, b.curvature);
             for (d, input) in b.inputs.iter().enumerate() {
-                let i = k32 * 4 + d as i32;
+                let i = k32 * INS + d as i32;
                 let key = input.metric.as_ref().map_or_else(|| "off".to_string(), |m| m.key());
                 SendDlgItemMessageW(h, ID_MET_IN + i, CB_SETCURSEL, opts.iter().position(|o| *o == key).unwrap_or(0), 0);
                 CheckDlgButton(h, ID_MET_DELTA + i, input.delta as u32);
             }
         }
         SetDlgItemInt(h, ID_MET_PERIOD, period, 0);
+        CheckDlgButton(h, ID_MET_SPLIT, e.split_cpu as u32);
         metrics_enable(h);
     }
+}
+
+/// The curvature sliders' half range (0..=20 for -10..=10).
+const CURVE_MAX: isize = 10;
+
+/// Show `c` on row `k`'s curvature slider and its value.
+unsafe fn set_curve(h: HWND, k: i32, c: f32) {
+    let pos = (c.round() as isize).clamp(-CURVE_MAX, CURVE_MAX) + CURVE_MAX;
+    // SAFETY: control ids from the metrics template.
+    unsafe {
+        SendDlgItemMessageW(h, ID_MET_CURVE + k, TBM_SETPOS, 1, pos);
+        SetDlgItemTextW(h, ID_MET_CURVE_VAL + k, wide(&curve_label(pos - CURVE_MAX)).as_ptr());
+    }
+}
+
+/// Row `k`'s curvature slider's value.
+unsafe fn get_curve(h: HWND, k: i32) -> f32 {
+    // SAFETY: a control id from the metrics template.
+    (unsafe { SendDlgItemMessageW(h, ID_MET_CURVE + k, TBM_GETPOS, 0, 0) }.clamp(0, 2 * CURVE_MAX) - CURVE_MAX) as f32
+}
+
+/// A curvature slider's value as shown beside it: `+4`, `0`, `-10`.
+fn curve_label(v: isize) -> String {
+    if v > 0 { format!("+{v}") } else { v.to_string() }
 }
 
 /// Grey out unticked rows, and Δ boxes whose input is off.
@@ -2671,8 +2739,10 @@ unsafe fn metrics_enable(h: HWND) {
         for k in 0..screensaver::MAX_SOLIDS as i32 {
             let on = IsDlgButtonChecked(h, ID_MET_ON + k) == 1;
             EnableWindow(GetDlgItem(h, ID_MET_SHAPE + k), on as i32);
-            for d in 0..4 {
-                let i = k * 4 + d;
+            EnableWindow(GetDlgItem(h, ID_MET_CURVE + k), on as i32);
+            EnableWindow(GetDlgItem(h, ID_MET_CURVE_VAL + k), on as i32);
+            for d in 0..INS {
+                let i = k * INS + d;
                 EnableWindow(GetDlgItem(h, ID_MET_IN + i), on as i32);
                 let set = SendDlgItemMessageW(h, ID_MET_IN + i, CB_GETCURSEL, 0, 0) > 0;
                 EnableWindow(GetDlgItem(h, ID_MET_DELTA + i), (on && set) as i32);
@@ -2681,8 +2751,9 @@ unsafe fn metrics_enable(h: HWND) {
     }
 }
 
-/// The ticked rows as solids, or why they can't be used.
-unsafe fn metrics_take(h: HWND) -> Result<(Vec<Binding>, u32), String> {
+/// The ticked rows as solids (with the period and Split CPU), or why they
+/// can't be used.
+unsafe fn metrics_take(h: HWND) -> Result<MetricsEdit, String> {
     let opts = UI.with(|u| u.borrow().metric_opts.clone());
     let mut solids = Vec::new();
     // SAFETY: control ids from the metrics template; `ok` is a valid out pointer.
@@ -2693,9 +2764,9 @@ unsafe fn metrics_take(h: HWND) -> Result<(Vec<Binding>, u32), String> {
             }
             let shape = SendDlgItemMessageW(h, ID_MET_SHAPE + k, CB_GETCURSEL, 0, 0);
             let solid = (shape > 0).then(|| SolidKind::ALL.get(shape as usize - 1).copied()).flatten();
-            let mut inputs: [Input; 4] = Default::default();
+            let mut inputs: [Input; INPUTS] = Default::default();
             for (d, input) in inputs.iter_mut().enumerate() {
-                let i = k * 4 + d as i32;
+                let i = k * INS + d as i32;
                 let sel = SendDlgItemMessageW(h, ID_MET_IN + i, CB_GETCURSEL, 0, 0).max(0) as usize;
                 let key = opts.get(sel).map_or("off", String::as_str);
                 let delta = key != "off" && IsDlgButtonChecked(h, ID_MET_DELTA + i) == 1;
@@ -2705,7 +2776,7 @@ unsafe fn metrics_take(h: HWND) -> Result<(Vec<Binding>, u32), String> {
             if inputs.iter().all(|i| i.metric.is_none()) {
                 return Err(format!("Solid {} has every input off: give it at least one metric, or untick it.", k + 1));
             }
-            solids.push(Binding { solid, inputs });
+            solids.push(Binding { solid, inputs, curvature: get_curve(h, k) });
         }
         if solids.is_empty() {
             return Err("Tick at least one solid.".into());
@@ -2716,19 +2787,19 @@ unsafe fn metrics_take(h: HWND) -> Result<(Vec<Binding>, u32), String> {
         if ok == 0 || !(lo..=hi).contains(&period) {
             return Err(format!("The \u{394} period must be a whole number of seconds from {lo} to {hi}."));
         }
-        Ok((solids, period))
+        Ok(MetricsEdit { solids, period, split_cpu: IsDlgButtonChecked(h, ID_MET_SPLIT) == 1 })
     }
 }
 
 /// # Safety
 /// Called by the dialog manager with a valid dialog window handle.
-unsafe extern "system" fn metrics_dialog(h: HWND, msg: u32, w: usize, _l: isize) -> isize {
+unsafe extern "system" fn metrics_dialog(h: HWND, msg: u32, w: usize, l: isize) -> isize {
     // SAFETY (whole fn): `h` is our dialog; control ids come from our template.
     unsafe {
         match msg {
             WM_INITDIALOG => {
-                let (solids, period) = metrics_edit_from(&UI.with(|u| u.borrow().panel_values.clone()));
-                let opts = metric_options(&solids);
+                let edit = metrics_edit_from(&UI.with(|u| u.borrow().panel_values.clone()));
+                let opts = metric_options(&edit.solids);
                 for k in 0..screensaver::MAX_SOLIDS as i32 {
                     let shape = ID_MET_SHAPE + k;
                     SendDlgItemMessageW(h, shape, CB_ADDSTRING, 0, wide("Auto").as_ptr() as isize);
@@ -2736,8 +2807,9 @@ unsafe extern "system" fn metrics_dialog(h: HWND, msg: u32, w: usize, _l: isize)
                         SendDlgItemMessageW(h, shape, CB_ADDSTRING, 0, wide(&shape_name(s)).as_ptr() as isize);
                     }
                     SendDlgItemMessageW(h, shape, CB_SETDROPPEDWIDTH, 200, 0);
-                    for d in 0..4 {
-                        let id = ID_MET_IN + k * 4 + d;
+                    SendDlgItemMessageW(h, ID_MET_CURVE + k, TBM_SETRANGE, 1, (2 * CURVE_MAX) << 16);
+                    for d in 0..INS {
+                        let id = ID_MET_IN + k * INS + d;
                         for o in &opts {
                             SendDlgItemMessageW(h, id, CB_ADDSTRING, 0, wide(&metric_text(o)).as_ptr() as isize);
                         }
@@ -2745,37 +2817,51 @@ unsafe extern "system" fn metrics_dialog(h: HWND, msg: u32, w: usize, _l: isize)
                     }
                 }
                 UI.with(|u| u.borrow_mut().metric_opts = opts);
-                metrics_fill(h, &solids, period);
+                metrics_fill(h, &edit);
                 let mut tips: Vec<(i32, String)> = Vec::new();
                 for k in 0..screensaver::MAX_SOLIDS as i32 {
                     tips.push((ID_MET_ON + k, help("metric_on").into()));
                     tips.push((ID_MET_SHAPE + k, help("metric_shape").into()));
-                    for (d, key) in ["metric_size", "metric_spin", "metric_colour", "metric_complexity"].iter().enumerate() {
-                        let i = k * 4 + d as i32;
+                    tips.push((ID_MET_CURVE + k, help("metric_curvature").into()));
+                    for (d, key) in ["metric_size", "metric_spin", "metric_colour", "metric_complexity", "metric_curvature_input"].iter().enumerate() {
+                        let i = k * INS + d as i32;
                         tips.push((ID_MET_IN + i, help(key).into()));
                         tips.push((ID_MET_DELTA + i, help("metric_delta").into()));
                     }
                 }
                 tips.push((ID_MET_PERIOD, help("delta_period").into()));
+                tips.push((ID_MET_SPLIT, help("split_cpu").into()));
                 tips.push((ID_MET_DEFAULTS, "Back to the five standard solids: CPU, RAM, disk, network and GPU, each driving its own size, spin and colour.".into()));
                 tips.push((IDOK, "Keep these solids (saved with OK in the main dialog).".into()));
                 tips.push((IDCANCEL, "Discard changes to the solids.".into()));
                 add_tips(h, &tips);
                 1
             }
+            WM_HSCROLL => {
+                // a curvature slider moved: show its value
+                let k = GetDlgCtrlID(l as HWND) - ID_MET_CURVE;
+                if (0..screensaver::MAX_SOLIDS as i32).contains(&k) {
+                    set_curve(h, k, get_curve(h, k));
+                }
+                0
+            }
             WM_COMMAND => {
                 let (id, code) = ((w & 0xFFFF) as i32, (w >> 16) & 0xFFFF);
                 match id {
                     IDOK => {
                         match metrics_take(h) {
-                            Ok((solids, period)) => {
+                            Ok(e) => {
                                 UI.with(|u| {
                                     let mut u = u.borrow_mut();
-                                    u.panel_values.retain(|(k, _)| !screensaver::SOLID_KEYS.contains(k) && *k != screensaver::DELTA_PERIOD_KEY);
-                                    for (key, b) in screensaver::SOLID_KEYS.iter().zip(&solids) {
+                                    let mine = |k: &str| {
+                                        screensaver::SOLID_KEYS.contains(&k) || k == screensaver::DELTA_PERIOD_KEY || k == screensaver::SPLIT_CPU_KEY
+                                    };
+                                    u.panel_values.retain(|(k, _)| !mine(k));
+                                    for (key, b) in screensaver::SOLID_KEYS.iter().zip(&e.solids) {
                                         u.panel_values.push((key, b.text()));
                                     }
-                                    u.panel_values.push((screensaver::DELTA_PERIOD_KEY, period.to_string()));
+                                    u.panel_values.push((screensaver::DELTA_PERIOD_KEY, e.period.to_string()));
+                                    u.panel_values.push((screensaver::SPLIT_CPU_KEY, if e.split_cpu { "on" } else { "off" }.into()));
                                 });
                                 EndDialog(h, 1);
                             }
@@ -2790,15 +2876,14 @@ unsafe extern "system" fn metrics_dialog(h: HWND, msg: u32, w: usize, _l: isize)
                         1
                     }
                     ID_MET_DEFAULTS => {
-                        let d = ScrSettings::default();
-                        metrics_fill(h, &d.solids, d.delta_period);
+                        metrics_fill(h, &MetricsEdit::of(&ScrSettings::default()));
                         1
                     }
                     _ if (ID_MET_ON..ID_MET_ON + screensaver::MAX_SOLIDS as i32).contains(&id) && code == BN_CLICKED => {
                         metrics_enable(h);
                         1
                     }
-                    _ if (ID_MET_IN..ID_MET_IN + 4 * screensaver::MAX_SOLIDS as i32).contains(&id) && code == CBN_SELCHANGE => {
+                    _ if (ID_MET_IN..ID_MET_IN + INS * screensaver::MAX_SOLIDS as i32).contains(&id) && code == CBN_SELCHANGE => {
                         metrics_enable(h);
                         1
                     }
@@ -2911,11 +2996,24 @@ mod tests {
         assert!(cy > 80, "height {cy}");
         // the Metrics dialog: intro, 2 + 4 x 2 headers, per row a box, a
         // shape and 4 x (input, delta), the period's label, edit and note,
-        // Defaults, OK, Cancel
+        // Defaults, Split CPU, OK, Cancel
         let (met, n) = metrics_template();
         let (_, items, cy) = header(&met);
         assert_eq!(items, n);
-        assert_eq!(n, 1 + 10 + screensaver::MAX_SOLIDS * 10 + 3 + 3);
+        // (plus the curvature column: 3 headers; per row a slider, its value,
+        // and a fifth input and Δ box)
+        assert_eq!(n, 1 + 13 + screensaver::MAX_SOLIDS * 14 + 3 + 4);
+        assert_eq!((curve_label(4), curve_label(0), curve_label(-10)), ("+4".to_string(), "0".to_string(), "-10".to_string()));
+        assert!(ID_MET_IN + INS * screensaver::MAX_SOLIDS as i32 <= ID_MET_DELTA, "input ids don't run into the Δ boxes");
+        assert!(ID_MET_DELTA + INS * screensaver::MAX_SOLIDS as i32 <= ID_MET_PERIOD);
+        assert_eq!(metric_text("cpu:3"), "CPU 3");
+        assert_eq!(metric_text("gpu-volt"), "GPU volts");
+        for (k, _) in &METRIC_CHOICES[1..] {
+            assert!(crate::metrics::MetricSpec::parse(k).is_ok(), "{k}");
+        }
+        let values = vec![(screensaver::SPLIT_CPU_KEY, "on".to_string())];
+        assert!(metrics_edit_from(&values).split_cpu);
+        assert!(panel_keys().contains(&screensaver::SPLIT_CPU_KEY), "kept with the other Metrics settings");
         assert!(cy > 200 && cy < 400, "height {cy}");
         assert_eq!(metric_text("nic:Ethernet 2"), "Adapter Ethernet 2");
         assert_eq!(metric_text("disk-dev"), "Disk dev");
@@ -2959,7 +3057,7 @@ mod tests {
             let labels: Vec<String> = c.options.iter().map(|(_, l)| shown(l)).collect();
             let uniq: std::collections::HashSet<&String> = labels.iter().collect();
             assert_eq!(uniq.len(), labels.len(), "{}: shown labels stay distinct: {labels:?}", c.key);
-            // (the rendering resolutions' drop-down is wide enough for "Industrial Boiler")
+            // (the rendering resolutions' drop-down is wide enough for "Boiler mode")
             let most = if c.key == "density" { 17 } else { 14 };
             assert!(labels.iter().all(|l| l.chars().count() <= most), "{}: {labels:?}", c.key);
         }

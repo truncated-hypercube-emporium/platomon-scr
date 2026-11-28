@@ -4,7 +4,7 @@ A terminal system monitor: one path-traced polyhedron per metric, rendered in mo
 concentric rings. Each solid's scale and spin follow its metric; the frame rate (5–150 fps) follows
 total activity.
 
-Keys: `s` toggles the stats bar, `l` the legend, `w` the wireframe overlay; `q` / `Esc` / `Ctrl-C` quit.
+Keys: `s` toggles the stats bar, `l` the legend, `w` the wireframe overlay, `t` the tags, `F1` the debug panel over the left half of the picture (the command line, version and build features, frame rate against its target, render, compose and write times with their peaks, the quality governor's level and load, the renderer in use, CPU or GPU, and the scene and look options); `q` / `Esc` / `Ctrl-C` quit. In the screensaver (and its preview), `F1` shows the same panel over the left half of the screen, in a font of its own (a sixtieth of the screen's height, never smaller than the text, so it stays readable over fine text and at high resolutions), with the CPU budget, text size and draw and present times, instead of ending it; any other key still ends it.
 
 ## Launch parameters
 
@@ -26,8 +26,10 @@ platomon [OPTIONS]
 | `--show` | `METRIC[,METRIC…]`, max 16 | `cpu,ram,disk,net,gpu` |
 | `--solid` | `METRIC=SOLID`, repeatable | built-in mapping |
 | `--ring` | `METRIC=N`, repeatable (0 = innermost ring or shell) | automatic |
-| `--bind` | `SHAPE\|SIZE\|SPIN\|COLOUR\|COMPLEXITY`, repeatable, max 12: one solid with its own inputs, replacing `--show` (see *Per-solid inputs*) | off |
+| `--bind` | `SHAPE\|SIZE\|SPIN\|COLOUR\|COMPLEXITY[\|CURVATURE]`, repeatable, max 12: one solid with its own inputs, replacing `--show` (see *Per-solid inputs*) | off |
 | `--delta-period` | seconds a `delta:` input measures the change over, 1–600 | `10` |
+| `--curvature` | -10..10: the curvature of every solid that sets none of its own (-10 dished faces, hyperboloid-like; 0 flat; 10 spherical) | `0` |
+| `--split-cpu` | one solid per logical core for each solid the whole CPU drives (32 solids at most) | off |
 | `--layout` | `rings` (on the ground), `sphere` (concentric spherical shells), `line` (one evenly spaced row), `stack` (one above another in the centre) or `orbit` (one solid in the centre, the others orbiting it) | `rings` |
 | `--ordering` | which solid takes which place: `listed` (metric order), `simple` (simplest first), `complex` (most complex first) or `random` | `listed` |
 | `--spacing` | neighbour spacing as a multiple of the standard, 0.25–4 (orbits: 10% × this of their radius apart) | `1` |
@@ -44,11 +46,13 @@ platomon [OPTIONS]
 | `--fps-invert` | flag: idle runs at `--fps-max`, full load at `--fps-min` | off |
 | `--ramp` | `STR`, darkest first (any length ≥ 2) | `" .,:;-~=+*ox#%&@"` (16 levels) |
 | `--char-aspect` | cell width ÷ height | 0.5 |
+| `--gpu` | flag: **Space heater**, render on the GPU through Vulkan 1.1 (builds with `--features gpu`); every floor pattern (PCs without Vulkan render on the CPU); `--snapshot` says on stderr which device rendered it and how long it took | off |
 | **Display ratio** | | |
 | `--aspect` | `fill`, preset or `W:H` | `fill` |
 | `--aspect-mode` | `letterbox\|crop` | `letterbox` |
 | **Camera** | | |
 | `--camera` | `static\|orbit\|focus\|tilt\|resonance` (focus: glide toward the busiest solid; tilt: orbit while rising 20–80° and back; resonance: orbit with three 20° waves per turn) | `static` |
+| `--no-floor-clearance` | flag: solids rest just above the floor instead of floating so their largest halo clears it | off |
 | `--far-ground` | flag: extended floor, drawn 8x further out toward the horizon; past the normal distance it is shaded in closed form (averaged pattern, exact light, no sampling), about +0–0.4 ms per frame | off |
 | `--tag-fixed-length` | flag (beside, below and trailing tags): tag leader lines keep one length, following each solid as it grows and shrinks, and only lengthen to keep a tag off another solid | off |
 | `--tag-place` | where tags go: `circle` (round the picture's centre, nearest each solid), `beside`, `corner` (stacked in the corners), `below` or `trailing` (behind moving solids) | `circle` |
@@ -123,7 +127,9 @@ the orbit carries on, then travels back. It starts on its way up at the overview
 
 Solids float above the floor at a fixed height (rings) or with the whole sphere lifted, so that
 even the largest sound halo (1.8x a solid's radius, the ±60% swing) stays clear of it; the camera
-aims correspondingly higher. `--far-ground` draws the floor 8x further out, filling the band of sky
+aims correspondingly higher. This is the *minimum floor distance* (on by default; `--no-floor-clearance`,
+`floor_clearance=off` or the setting in the Appearance group turn it off): off, the solids rest just
+above the floor at any size (they never touch it, but a large halo can dip into it). `--far-ground` draws the floor 8x further out, filling the band of sky
 that wide layouts and low camera angles otherwise show at the horizon. Out there the pattern has
 already faded to its mean tone and no solid's shadow reaches, so instead of sampling the light,
 tracing shadow rays and bouncing, each far floor point gets the light's direct contribution in
@@ -323,28 +329,45 @@ another solid, are hidden.
 
 | Metric | Scale | Spin | Default solid |
 |---|---|---|---|
-| `cpu` | utilisation (minus platomon's own) | utilisation | icosahedron |
+| `cpu[:N]` | utilisation (minus platomon's own); `cpu:N` one logical core | utilisation | icosahedron |
 | `ram` | used ÷ total | rate of change | cube |
 | `disk` | all disks, read+write | Y = read, X = write | octahedron |
 | `net` | all adapters, rx+tx | Y = rx, X = tx | tetrahedron |
 | `gpu` | busiest GPU's utilisation | memory-controller util, else utilisation | dodecahedron |
 | `nic[:NAME]` | one adapter, rx+tx | Y = rx, X = tx | rhombic-dodecahedron |
 | `disk-dev[:NAME]` | one disk/volume, read+write | Y = read, X = write | truncated-cube |
+| `cpu-temp`, `gpu-temp` | temperature, 30 °C → 0 to 95 °C → 1 | temperature | truncated-tetrahedron, truncated-dodecahedron |
+| `cpu-freq`, `gpu-freq` | clock ÷ the most it reaches (the CPU's nominal clock, the GPU's rated maximum, else 1 GHz, raised by any higher clock seen) | clock | cuboctahedron, icosidodecahedron |
+| `cpu-volt`, `gpu-volt` | core voltage across the range seen since the start (at least 0.25 V wide) | voltage | truncated-octahedron, rhombic-triacontahedron |
 
 `nic` and `disk-dev` without a name follow the busiest instance and can appear several times with
 different names. `platomon --list sensors` shows the names this machine has. Disks also match by
 mount point, e.g. `disk-dev:C:\` or `disk-dev:/home`.
 
-Every metric here works on Linux, macOS and Windows with any GPU vendor. Metrics that some operating
-systems or vendors can't provide were left out: temperatures, CPU frequency (Windows reports a fixed
-base clock), and GPU clocks/PCIe throughput (NVIDIA only). When a metric is unavailable on a
+The first seven work on Linux, macOS and Windows with any GPU vendor. The temperatures, clocks and
+voltages depend on what the machine reports:
+
+| | Windows | Linux |
+|---|---|---|
+| CPU temperature | LibreHardwareMonitor / OpenHardwareMonitor (package temperature) while it runs, else the hottest ACPI thermal zone (many desktops have none) | thermal zones, `k10temp` / `coretemp` |
+| CPU clock | PDH: nominal clock × *% Processor Performance* (so boost shows) | the cores' mean clock |
+| CPU voltage | LibreHardwareMonitor / OpenHardwareMonitor only (the CPU's core voltage, else the motherboard's Vcore) | hwmon `Vcore` |
+| GPU temperature, clock | NVIDIA: NVML. AMD: the driver's ADL (Overdrive 8 on Navi and later, 5/6 on older GCN such as the HD 7000s). Else the hardware monitor | `amdgpu` hwmon |
+| GPU voltage | AMD: ADL. Else the hardware monitor (NVIDIA reports none) | `amdgpu` hwmon |
+
+`platomon --list sensors` prints what this machine gives. When a metric is unavailable on a
 particular machine, its solid sits at minimum scale with idle spin and the stats bar shows `n/a`.
+
+**Split CPU** (`--split-cpu`, `split_cpu=on`, the Metrics dialog's *Split CPU into cores*): every
+solid driven by the whole CPU becomes one solid per logical core (`cpu:0`, `cpu:1`, ...), alike in
+shape and in its other inputs; their tags read `CPU0 12%`, `CPU1 40%`. Platomon's own share comes off
+each core alike. At most 32 solids in all: with more cores than fit, the first cores that do.
 
 ### Per-solid inputs
 
 Normally each solid's metric drives its size, spin and colour. With `--bind` (or `bindings = [...]`
 in the config file, or the screensaver's *Metrics* dialog) each solid gets its own inputs instead,
-written `SHAPE|SIZE|SPIN|COLOUR|COMPLEXITY`:
+written `SHAPE|SIZE|SPIN|COLOUR|COMPLEXITY[|CURVATURE]`:
 
 - `SHAPE`: a solid id, or `auto` (the metric's own solid while it is free, else the first free one).
 - Each input: a metric (`cpu`, `nic:Ethernet`, ...), `delta:METRIC`, or `off`. Missing spin and
@@ -354,6 +377,15 @@ written `SHAPE|SIZE|SPIN|COLOUR|COMPLEXITY`:
 - **Complexity** changes the solid's shape: at rest it is `SHAPE` (the tetrahedron for `auto`), and
   more load steps it up through solids with more edges, to the most complex at full load. It only
   steps once the input is well past the middle between two shapes, so it does not flicker.
+- **Curvature** (the optional sixth field) bends the solid's faces, from -10 to +10. 0 is the
+  flat-faced solid. Toward +10 the faces bulge out until, at +10, it is the sphere through its
+  corners. Toward -10 each face is dished in by a sphere through its corners, so the faces cave in
+  and the edges pinch into concave arcs (hyperboloid-like); at -10 a dish is 60% of the way to the
+  centre (or 80% of the face's corner radius, whichever is less). `VALUE` alone is fixed;
+  `VALUE@INPUT` (`-8@cpu-temp`, `10@delta:gpu`) is flat while the input is idle and reaches
+  `VALUE` at full load, following it every frame. `--curvature` sets it for every solid that sets
+  none of its own. Both stay true distance bounds, so curved solids march, shadow and render on
+  the GPU like flat ones; a dished solid costs about twice a flat one to trace.
 - **`delta:`** uses how much the metric changed over the delta period (`--delta-period`, 10 s by
   default) instead of its value: the difference from the value that long ago, scaled to the largest
   change lately (which fades by 2% a second, never below 5% of the range). A steady load reads as 0,
@@ -364,6 +396,7 @@ the orbit centre and the activity weight follow a solid's size input (else its f
 
 ```powershell
 platomon --bind "auto|cpu" --bind "cube|ram|delta:ram|ram" --bind "auto|delta:net|net|delta:net|cpu" --delta-period 30
+platomon --bind "auto|cpu|cpu|cpu|off|10@cpu" --bind "cube|gpu|gpu|gpu|off|-8@gpu-temp" --curvature 4
 ```
 
 ### Solids
@@ -612,7 +645,7 @@ and pattern flow (all greyed out while Random start is on). The **Randomize** bu
 random values into every *Appearance* setting, every *Background options* setting and every *Tuning* slider now, and turns Random
 start off so they are kept (saved with OK or *Apply*). The rest of *Appearance* always applies,
 Random start or not (Randomize still rolls it): halo colour, tag colour, *Tag positions*, *Tag size*, sound halo, halo bounce by frequency,
-extended floor distance, *Tags*, *Fixed tag length* and *Random font*. The *Performance & Features* group always applies too: the frame-rate cap (the
+extended floor distance, the minimum floor distance, *Tags*, *Fixed tag length* and *Random font*. The *Performance & Features* group always applies too: the frame-rate cap (the
 display's refresh rate by default), the CPU budget used to size the text, the *Rendering resolution*
 with its *Manual* box, the number of luminosity levels, the palette size and dynamic camera distance, with
 the OLED burn-in shift (on/off, frame interval, range) nested at its bottom. On/off settings are
@@ -629,8 +662,9 @@ doubles or halves the gaps, from a quarter to four times; orbits are 10% of thei
 *Distance scaling* (−2 to 2, centred on 0 = off; see *Line and stack layouts* above), *Orbit velocity*, *Orbital inclination*, *Orbital eccentricity* and *Orbital variation* (see *Orbit
 layout* above; the orbit settings only matter with the Orbit layout, and a random look rolls its own
 orbit sliders unless they are set). *Rendering…* (in the frame-rate cap's row) opens the rendering
-settings: samples per cell, light bounces, march steps and render distance (auto: the screensaver's
-own 1 sample and 1 bounce), adaptive quality and the **character ramp**: its *Custom ramp…* button
+settings: first the *Renderer* drop-down (CPU, or Space heater on the GPU as characters or as
+discrete pixels; below), then samples per cell, light bounces, march steps and render distance (auto:
+the screensaver's own 1 sample and 1 bounce), adaptive quality and the **character ramp**: its *Custom ramp…* button
 opens the *Character ramp* dialog, where *Use this custom ramp* swaps the luminosity levels' 8, 16 or
 32 glyphs for a string of your own, darkest first (2 to 96 characters, no tabs; start with a space
 for black). *Start from* fills in the 8, 16 or 32-level ramp to edit, and the line under the string
@@ -643,14 +677,18 @@ same way (`tune_spacing_exp`, `tune_distance_scale`, `tune_orbit_velocity`, `tun
 **Metrics.** *Metrics…* (between *Layout…* and *Preview*; it shows how many solids there are)
 replaces the former *Extra metrics* drop-down. Its dialog has a row for each of up to 12 solids:
 a check box to use the row, the *Shape* (Auto or one of the 15 solids), and drop-downs for what
-drives its *Size*, *Spin*, *Colour* and *Complexity*: Off, CPU, RAM, Disk, Network, GPU, Adapter
-(the busiest network adapter) or Disk dev (the busiest disk), plus any named adapter or disk the
-settings already use. The **Δ** box beside each input uses the metric's change over the *Δ period*
+drives its *Size*, *Spin*, *Colour* and *Complexity*, and a *Curvature* slider (-10 to +10, its value beside it)
+with the drop-down that scales it (*Curvature by*: Off holds the slider's curvature, a metric takes the solid
+from flat at idle to the slider's curvature at full load). The drop-downs offer Off, CPU, RAM, Disk, Network, GPU, Adapter
+(the busiest network adapter), Disk dev (the busiest disk), CPU temp, GPU temp, CPU freq, GPU freq,
+CPU volts or GPU volts, plus any named adapter, disk or core the settings already use. *Split CPU
+into cores* (beside *Defaults*) turns each solid the whole CPU drives into one per logical core;
+the button then reads *Metrics (5, cores)*. The **Δ** box beside each input uses the metric's change over the *Δ period*
 (seconds, 1–600, below the rows) instead of its value; see *Per-solid inputs* above. *Defaults*
 brings back the five standard solids (CPU, RAM, disk, network and GPU, each driving its own size,
 spin and colour). The solids apply every run, Random start or not; an *Auto* shape takes the random
 look's solid for its metric while that is free. They are saved as `solid1`..`solid12`
-(`SHAPE|SIZE|SPIN|COLOUR|COMPLEXITY`, unused ones unset) and `delta_period`; settings from before the
+(`SHAPE|SIZE|SPIN|COLOUR|COMPLEXITY[|CURVATURE]`, unused ones unset) and `delta_period`; settings from before the
 dialog turn `extras=nic|disk|both` into the five standard solids plus an adapter and/or a disk.
 
 **Background options.** The *Background options…* button, in the *Appearance* group under its
@@ -721,13 +759,37 @@ The log itself is `config-log.ini`.
 **Defaults.** Defaults saved earlier with the (now removed) *Set as default* button stay in
 `configuration.log`, and a first run with no settings file still starts from them.
 
+**Space heater.** The Rendering dialog's *Renderer* drop-down picks what draws the picture: *CPU:
+characters*, *GPU: Space heater, characters* or *Pixels: Space heater, discrete pixels* (INI
+`renderer=cpu|gpu|pixels`; the older `space_heater` and `space_heater_pixels` keys are still read).
+On the GPU it renders on the graphics card: a
+Vulkan 1.1 compute shader (anything from a Radeon HD 7850, GCN 1.0, up) traces one character cell
+per invocation and sends back the text stream, each cell's glyph, solid, luminance and depth; the
+CPU only adds the halos, tags and wireframe and draws the window. On an RX 5700 XT a Boiler-mode
+frame (1280 × 360 cells) takes about 5 ms against about 25 ms on all 16 threads of an i7-5960X.
+The GPU covers the solids and every floor pattern, the animated ones included; PCs without Vulkan
+1.1 render on the CPU as before. The text is still
+sized by the CPU speed test, so tick *Manual* to use the extra speed for finer text
+(`last-run-frames.txt` says how many frames the GPU drew). *Discrete pixels* goes further: one ray
+per pixel of the display at any rendering resolution, drawn as discrete pixels instead of
+characters, each the colour its glyph's ink would have scaled by its brightness, so the colour
+settings still apply. The GPU colours the pixels itself and presents
+them straight to the window through a Vulkan swapchain, so the picture never crosses to the CPU and
+back: in a 1280 × 720 preview a frame costs about 3 ms, against about 15 ms when the pixels were read
+back, coloured by the CPU and drawn with GDI. The stats bar and the F1 panel are drawn by the CPU and
+handed to the GPU to lay over the picture. Full screen at 2560 × 1440 (3.7 million rays a frame) it
+runs at about 70 fps on an RX 5700 XT: the CPU budget only counts CPU work, not the time spent
+waiting for the GPU. Discrete pixels look like a conventionally rendered scene at the display's
+native resolution, whatever the rendering resolution (which sizes only the text) and whichever floor;
+the sound halo is drawn by the GPU too: each solid's halo edges as anti-aliased lines (wider on bigger screens) in the *Halo colour* chosen, hidden behind nearer surfaces like the text halo, and redrawn over the last traced picture between full frames at the display's refresh rate. Tags and the wireframe are not drawn on pixels yet.
+
 **Rendering resolution.** The text is first sized so rendering fits the CPU budget, then divided:
 Standard keeps the budget-sized text, Double (the default) halves its height, and Triple,
-Quadruple, Quintuple and Industrial Boiler divide it by 3, 4, 5 and 6, never below 2 px. N times the
-characters per axis costs about N² times the budget's rendering: Industrial Boiler is about 36x
+Quadruple, Quintuple and Boiler mode divide it by 3, 4, 5 and 6, never below 2 px. N times the
+characters per axis costs about N² times the budget's rendering: Boiler mode is about 36x
 (INI `density=1`..`6`). The **Manual** box beside it turns the automatic sizing off: the text size
 then comes from the rendering resolution alone, 60 rows of text per step (Standard = 60 rows on the
-screen, Double = 120, ... Industrial Boiler = 360; 2 to 40 px), whatever the speed test and CPU
+screen, Double = 120, ... Boiler mode = 360; 2 to 40 px), whatever the speed test and CPU
 budget say (INI `density_manual=on`). Expect more CPU load at the higher steps.
 
 **Overdrive.** The check box beside the CPU budget slider ignores the budget: the text is sized for
@@ -838,6 +900,7 @@ layout=rings           ; rings | sphere | line | stack | orbit
 ordering=listed        ; listed | simple | complex | random
 orbit_center=cpu       ; orbit layout's centre: cpu | ram | net | disk | size | spin
 adaptive=on            ; adaptive quality
+renderer=cpu           ; cpu | gpu (Space heater, characters) | pixels (Space heater, discrete pixels)
 camera=orbit           ; static | orbit | focus | tilt | resonance
 color=inferno          ; off | inferno | viridis | ... (see --list gradients) | custom
 custom_gradient=#0b1d3a:#2f6db5:#7ad3e8:#f4f1c9 ; the Custom colour dialog's gradient, 2-8 colours
@@ -855,13 +918,15 @@ tune_bg_dot_variability=0.5 ; polka: how much dot sizes and places vary, 0..1 (a
 wireframe=off          ; on | off
 stats=off              ; on | off
 fps_invert=off         ; on | off
-solid1=auto|cpu|cpu|cpu|off ; Metrics dialog: SHAPE|SIZE|SPIN|COLOUR|COMPLEXITY, up to solid12
+solid1=auto|cpu|cpu|cpu|off ; Metrics dialog: SHAPE|SIZE|SPIN|COLOUR|COMPLEXITY[|CURVATURE], up to solid12
+solid3=auto|gpu|gpu|gpu|off|-6@cpu-temp ; curvature -10..10, fixed or VALUE@INPUT
 solid2=cube|ram|delta:ram|ram|off ; delta:METRIC = its change over delta_period
 delta_period=10        ; seconds, 1..600
+split_cpu=off          ; on: one solid per logical core for each solid the whole CPU drives
 fps_cap=display        ; or 30..240
 budget=15              ; percent
 overdrive=off          ; on = ignore the budget and use all the CPU time rendering wants
-density=2              ; 1 = standard | 2 = double ... 6 = industrial boiler
+density=2              ; 1 = standard | 2 = double ... 6 = boiler mode
 density_manual=off     ; on = size the text from the density alone (60 rows per step)
 levels=16              ; 8 | 16 | 32 (older auto -> 16, 10 -> 8)
 custom_ramp=off        ; on = draw with the ramp below instead of the levels' ramp
@@ -875,6 +940,7 @@ tag_color=complement   ; complement | theme | white | #RRGGBB (lifted to stay re
 tag_text=auto          ; auto (line, or block letters 1x-3x under 10 px) | line | blocks | blocks2 | blocks3 | blocks4
 auto_distance=off      ; dynamic camera distance (keep every solid in frame)
 far_ground=off         ; extended floor distance
+floor_clearance=on     ; minimum floor distance: solids float so their largest halo clears the floor
 tag_fixed=off          ; beside/below/trailing tags: on = placed for the current size (fixed leader length)
 tag_place=circle       ; circle | beside | corner | below | trailing
 tag_font_random=off    ; on = a random block-letter font each run

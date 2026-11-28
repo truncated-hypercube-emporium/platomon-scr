@@ -11,6 +11,8 @@ default = ["nvidia"]
 nvidia = ["dep:nvml-wrapper"]
 # Windows screensaver (platomon.scr). Build it with scripts/build-scr.ps1.
 screensaver = []
+# Space heater: render on the GPU through Vulkan (compute shader compiled to SPIR-V at build time).
+gpu = ["dep:ash", "dep:naga"]
 
 [[bin]]
 name = "platomon"
@@ -27,6 +29,7 @@ path = "src/bin/platomon-config.rs"
 required-features = ["screensaver"]
 
 [dependencies]
+ash = { version = "0.38.0", optional = true }
 clap = { version = "4.6.8", features = ["derive"] }
 crossterm = "0.29.0"
 dirs = "7.0.0"
@@ -54,3 +57,6 @@ codegen-units = 1
 opt-level = 3
 lto = "thin"
 codegen-units = 1
+
+[build-dependencies]
+naga = { version = "30.0.2", features = ["wgsl-in", "spv-out"], optional = true }

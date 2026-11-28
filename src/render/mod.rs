@@ -56,6 +56,12 @@ impl Projection {
         Self { cam, k, half_w: w as f32 * 0.5, half_h: h as f32 * 0.5, aspect }
     }
 
+    /// (k, half width, half height, cell aspect): [`Projection::ray`]'s
+    /// terms, for the GPU renderer.
+    pub fn shader_params(&self) -> [f32; 4] {
+        [self.k, self.half_w, self.half_h, self.aspect]
+    }
+
     /// The angle a pixel spans, radians (its taller side: cells are taller
     /// than wide), for [`TraceSettings::pixel_angle`].
     pub fn pixel_angle(&self) -> f32 {
@@ -91,6 +97,11 @@ pub const NO_HIT: u8 = u8::MAX - 1;
 /// id of the first surface the centre ray hit (`INFINITY` / [`NO_HIT`] if none).
 pub struct FrameView<'a> {
     pub radiance: &'a [f32],
+    /// Display luminance 0..=1 per cell, when the renderer tone-mapped it
+    /// already (the GPU's text stream; `radiance` is then empty).
+    pub lum: Option<&'a [f32]>,
+    /// The ramp level of each cell's glyph, from the same renderer as `lum`.
+    pub glyphs: Option<&'a [u8]>,
     pub depth: &'a [f32],
     pub ids: &'a [u8],
     pub proj: Projection,
@@ -172,7 +183,226 @@ impl Renderer {
 
     /// The last rendered frame with its G-buffer.
     pub fn view(&self) -> Option<FrameView<'_>> {
-        Some(FrameView { radiance: &self.buf, depth: &self.depth, ids: &self.ids, proj: self.proj? })
+        Some(FrameView { radiance: &self.buf, lum: None, glyphs: None, depth: &self.depth, ids: &self.ids, proj: self.proj? })
+    }
+}
+
+/// The renderer a frame loop uses: the GPU (Space heater, with the `gpu`
+/// feature) when it is wanted, present and covers the scene; the CPU
+/// otherwise, frame by frame. A GPU that fails a frame is dropped for good.
+pub struct AnyRenderer {
+    cpu: Renderer,
+    #[cfg(feature = "gpu")]
+    gpu: Option<crate::gpu::GpuRenderer>,
+    /// Why the GPU isn't in use (wanted, but none, or failed).
+    gpu_problem: Option<String>,
+    /// Why discrete pixels last couldn't be presented straight to the window.
+    present_problem: Option<String>,
+    on_gpu: bool,
+    /// Render on the GPU (Space heater on). The GPU itself can stay open
+    /// with it off, still presenting to a window it took.
+    use_gpu: bool,
+}
+
+impl AnyRenderer {
+    /// `want_gpu`: try the GPU (Space heater).
+    pub fn new(want_gpu: bool) -> Self {
+        let mut r = Self {
+            cpu: Renderer::new(),
+            #[cfg(feature = "gpu")]
+            gpu: None,
+            gpu_problem: None,
+            present_problem: None,
+            on_gpu: false,
+            use_gpu: false,
+        };
+        r.set_want_gpu(want_gpu);
+        r
+    }
+
+    /// Turn the GPU renderer on or off (a preview's settings changed). On
+    /// opens the GPU if it isn't yet; off keeps it open, so a window it
+    /// presents to stays its own (Windows wouldn't show GDI's drawing in it
+    /// again), but renders on the CPU.
+    pub fn set_want_gpu(&mut self, want_gpu: bool) {
+        self.use_gpu = want_gpu;
+        #[cfg(feature = "gpu")]
+        let open = self.gpu.is_some();
+        #[cfg(not(feature = "gpu"))]
+        let open = false;
+        let r = self;
+        if want_gpu && !open {
+            #[cfg(feature = "gpu")]
+            match crate::gpu::GpuRenderer::new() {
+                Ok(g) => r.gpu = Some(g),
+                Err(e) => r.gpu_problem = Some(e),
+            }
+            #[cfg(not(feature = "gpu"))]
+            {
+                r.gpu_problem = Some("this build has no GPU renderer (build with --features gpu)".into());
+            }
+        }
+    }
+
+    /// The GPU in use, if any.
+    pub fn gpu_name(&self) -> Option<&str> {
+        #[cfg(feature = "gpu")]
+        return self.gpu.as_ref().filter(|_| self.use_gpu).map(|g| g.name.as_str());
+        #[cfg(not(feature = "gpu"))]
+        None
+    }
+
+    /// Why a wanted GPU isn't in use.
+    pub fn gpu_problem(&self) -> Option<&str> {
+        self.gpu_problem.as_deref()
+    }
+
+    /// Whether the GPU is in use and covers `scene` (the next frame would
+    /// come from it).
+    pub fn can_gpu(&self, scene: &Scene) -> bool {
+        #[cfg(feature = "gpu")]
+        return self.use_gpu && self.gpu.is_some() && crate::gpu::supports(scene);
+        #[cfg(not(feature = "gpu"))]
+        {
+            let _ = scene;
+            false
+        }
+    }
+
+    /// Discrete pixels straight to the window (attached first with
+    /// [`AnyRenderer::attach_window`]): what `shown` says (the scene traced
+    /// on the GPU, coloured by `palette` there and shifted by `shift`
+    /// pixels; the last traced picture again with the halo redrawn; or a
+    /// frame the CPU drew), with `halo` over the pixels and `overlays`
+    /// (what the CPU drew: at most two rectangles of screen pixels) on top.
+    /// `false` (nothing shown) when the GPU can't.
+    #[cfg(feature = "gpu")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn present_window(
+        &mut self,
+        shown: crate::gpu::Shown<'_>,
+        rs: &RenderSettings,
+        exposure: f32,
+        palette: &crate::overlay::PixelPalette,
+        shift: (i32, i32),
+        overlays: &[crate::gpu::Overlay<'_>],
+        halo: Option<&crate::overlay::HaloLines>,
+    ) -> bool {
+        let traced = matches!(shown, crate::gpu::Shown::Traced(_));
+        if traced {
+            self.on_gpu = false;
+        }
+        let use_gpu = self.use_gpu;
+        let ok = |s: &crate::gpu::Shown<'_>| match s {
+            crate::gpu::Shown::Traced(scene) => use_gpu && crate::gpu::supports(scene),
+            _ => true,
+        };
+        let Some(g) = self.gpu.as_mut().filter(|g| g.presenting_to().is_some() && ok(&shown)) else {
+            return false;
+        };
+        match g.present(shown, rs, exposure, palette, shift, overlays, halo) {
+            Ok(()) => {
+                if traced {
+                    self.on_gpu = true;
+                }
+                self.present_problem = None;
+                true
+            }
+            Err(e) => {
+                self.present_problem = Some(e);
+                g.detach();
+                false
+            }
+        }
+    }
+
+    /// Take over window `hwnd` for [`AnyRenderer::present_window`] ahead of
+    /// the frame (making the swapchain takes a while the first time, which
+    /// shouldn't count as rendering). `false` if the GPU can't present.
+    pub fn attach_window(&mut self, scene: &Scene, hwnd: isize, hinstance: isize, (w, h): (u32, u32)) -> bool {
+        #[cfg(all(feature = "gpu", windows))]
+        if let Some(g) = self.gpu.as_mut().filter(|g| self.use_gpu && g.can_present() && crate::gpu::supports(scene)) {
+            return match g.attach(hwnd, hinstance, w, h) {
+                Ok(()) => true,
+                Err(e) => {
+                    self.present_problem = Some(e);
+                    false
+                }
+            };
+        }
+        let _ = (scene, hwnd, hinstance, w, h);
+        false
+    }
+
+    /// Hand the window back from the GPU (no-op if it doesn't have it).
+    /// `true` if it did: the window's picture must be drawn again.
+    pub fn release_window(&mut self) -> bool {
+        #[cfg(feature = "gpu")]
+        if let Some(g) = self.gpu.as_mut()
+            && g.presenting_to().is_some()
+        {
+            g.detach();
+            return true;
+        }
+        false
+    }
+
+    /// Whether the GPU presents to a window right now.
+    pub fn presenting(&self) -> bool {
+        #[cfg(feature = "gpu")]
+        return self.gpu.as_ref().is_some_and(|g| g.presenting_to().is_some());
+        #[cfg(not(feature = "gpu"))]
+        false
+    }
+
+    /// Why discrete pixels last couldn't go straight to the window.
+    pub fn present_problem(&self) -> Option<&str> {
+        self.present_problem.as_deref()
+    }
+
+    /// Seconds the last frame waited for the GPU (0 for a CPU frame): idle
+    /// CPU time, for pacing by a CPU budget.
+    pub fn gpu_wait(&self) -> f32 {
+        #[cfg(feature = "gpu")]
+        if self.on_gpu {
+            return self.gpu.as_ref().map_or(0.0, |g| g.last_wait());
+        }
+        0.0
+    }
+
+    /// Whether the last frame came from the GPU.
+    pub fn on_gpu(&self) -> bool {
+        self.on_gpu
+    }
+
+    /// Render one frame. `exposure` and `ramp_len` set the GPU's text
+    /// stream (the same tone map and ramp the overlays use).
+    pub fn render(&mut self, scene: &Scene, w: usize, h: usize, rs: &RenderSettings, exposure: f32, ramp_len: usize) {
+        self.on_gpu = false;
+        #[cfg(feature = "gpu")]
+        if let Some(g) = self.gpu.as_mut().filter(|_| self.use_gpu && crate::gpu::supports(scene)) {
+            match g.render(scene, w, h, rs, exposure, ramp_len) {
+                Ok(()) => {
+                    self.on_gpu = true;
+                    return;
+                }
+                Err(e) => {
+                    self.gpu_problem = Some(e);
+                    self.gpu = None;
+                }
+            }
+        }
+        let _ = (exposure, ramp_len);
+        self.cpu.render(scene, w, h, rs);
+    }
+
+    /// The last frame, from whichever renderer drew it.
+    pub fn view(&self) -> Option<FrameView<'_>> {
+        #[cfg(feature = "gpu")]
+        if self.on_gpu {
+            return self.gpu.as_ref().and_then(|g| g.view());
+        }
+        self.cpu.view()
     }
 }
 
@@ -197,6 +427,11 @@ impl QualityGovernor {
 
     pub fn level(&self) -> u8 {
         self.level
+    }
+
+    /// The smoothed render time as a share of the frame budget.
+    pub fn load(&self) -> f32 {
+        self.load
     }
 
     /// Pin a quality level (clamped), e.g. for benchmarks.

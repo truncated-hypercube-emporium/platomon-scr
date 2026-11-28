@@ -45,8 +45,11 @@ mod win {
     use platomon::collector::Collector;
     use platomon::color::{self, ColorBy, ColorMap};
     use platomon::metrics::{MetricsState, activity_score};
-    use platomon::overlay::{Halo, OverlayOptions, Overlays, TagFont, halo_factor, halo_lum, halo_reach};
-    use platomon::render::{QualityGovernor, Renderer};
+    use platomon::overlay::{Halo, OverlayOptions, Overlays, TagFont, halo_factor, halo_lum, halo_reach, pixel_colors, PixelPalette};
+    #[cfg(feature = "gpu")]
+    use platomon::render::Projection;
+    use platomon::render::{AnyRenderer, QualityGovernor, RenderSettings};
+    use platomon::debug::{self, Avg, DebugPanel};
     use platomon::scrconfig;
     use platomon::tiles::TileCache;
     use platomon::screensaver::{self, Display, PixelShift, Plan, ScrSettings};
@@ -135,6 +138,7 @@ mod win {
     #[link(name = "user32")]
     unsafe extern "system" {
         fn EnumDisplaySettingsW(device: *const u16, mode: u32, dm: *mut u8) -> i32;
+
         fn MessageBoxW(hwnd: HWND, text: *const u16, caption: *const u16, flags: u32) -> i32;
         fn SetProcessDPIAware() -> i32;
         fn GetSystemMetrics(index: i32) -> i32;
@@ -250,6 +254,7 @@ mod win {
     const WM_ERASEBKGND: u32 = 0x0014;
     const WM_SETCURSOR: u32 = 0x0020;
     const WM_KEYDOWN: u32 = 0x0100;
+    const VK_F1: usize = 0x70;
     const WM_SYSKEYDOWN: u32 = 0x0104;
     const WM_LBUTTONDOWN: u32 = 0x0201;
     const WM_RBUTTONDOWN: u32 = 0x0204;
@@ -269,6 +274,8 @@ mod win {
     static QUIT: AtomicBool = AtomicBool::new(false);
     /// The window was uncovered or moved: present the whole picture again.
     static REPAINT: AtomicBool = AtomicBool::new(false);
+    /// F1: show the debug panel.
+    static DEBUG: AtomicBool = AtomicBool::new(false);
     /// The running [`Kind`], for the window procedure.
     static KIND: AtomicU8 = AtomicU8::new(0);
 
@@ -348,6 +355,14 @@ mod win {
             0
         };
         match msg {
+            // F1 shows or hides the debug panel instead of ending (bit 30:
+            // the key was already down, a repeat)
+            WM_KEYDOWN if w == VK_F1 => {
+                if (l >> 30) & 1 == 0 {
+                    DEBUG.fetch_xor(true, Ordering::SeqCst);
+                }
+                0
+            }
             WM_KEYDOWN | WM_SYSKEYDOWN | WM_CLOSE => quit(),
             WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN if kind != Kind::Full => quit(),
             WM_MOUSEWHEEL if kind == Kind::Show => quit(),
@@ -476,6 +491,12 @@ mod win {
         /// The back buffer's pixels (`w × h`, top-down).
         bits: *mut u32,
         tiles: Tiles,
+        /// The debug panel's own, larger font (readable on fine text and
+        /// high resolutions), its glyph tiles and cell size.
+        panel_font: HGDIOBJ,
+        panel_tiles: Tiles,
+        pcw: i32,
+        pch: i32,
         /// What each grid cell shows now (glyph, colour), to skip unchanged
         /// cells; `None` = unknown (redraw).
         shown: Vec<Option<(u16, u32)>>,
@@ -586,6 +607,32 @@ mod win {
                 let x0 = (w - cols as i32 * cw) / 2;
                 let y0 = (h - rows as i32 * ch) / 2;
                 let tiles = Tiles::new(mem, font, cw, ch);
+                // the debug panel's font: a sixtieth of the screen's height,
+                // never smaller than the text's
+                let panel_px = (font_px as i32).max(h / 60);
+                let panel_font = CreateFontW(
+                    panel_px,
+                    0,
+                    0,
+                    0,
+                    FW_NORMAL,
+                    0,
+                    0,
+                    0,
+                    DEFAULT_CHARSET,
+                    0,
+                    0,
+                    CLEARTYPE_QUALITY,
+                    FIXED_PITCH_MODERN,
+                    wide("Consolas").as_ptr(),
+                );
+                SelectObject(mem, panel_font);
+                let mut psz = SIZE::default();
+                GetTextExtentPoint32W(mem, probe.as_ptr(), probe.len() as i32, &mut psz);
+                SelectObject(mem, font);
+                let pcw = ((psz.cx as f32 / probe.len() as f32).round() as i32).max(1);
+                let pch = psz.cy.max(1);
+                let panel_tiles = Tiles::new(mem, panel_font, pcw, pch);
                 Ok(Self {
                     hwnd,
                     mem,
@@ -602,6 +649,10 @@ mod win {
                     shift: (0, 0),
                     bits,
                     tiles,
+                    panel_font,
+                    panel_tiles,
+                    pcw,
+                    pch,
                     shown: vec![None; cols * rows],
                     gdi_pending: true,
                     spans: vec![(usize::MAX, 0); rows],
@@ -626,6 +677,129 @@ mod win {
 
         fn char_aspect(&self) -> f32 {
             self.cw as f32 / self.ch as f32
+        }
+
+        /// The debug panel's grid, in its own font's cells: the left half of
+        /// the screen.
+        fn panel_grid(&self) -> (usize, usize) {
+            (((self.w / 2) / self.pcw).max(1) as usize, (self.h / self.pch).max(1) as usize)
+        }
+
+        /// The debug panel's pixel width (its grid in its font's cells).
+        fn panel_width(&self) -> usize {
+            (self.panel_grid().0 as i32 * self.pcw).min(self.w) as usize
+        }
+
+        /// The debug panel's `lines` (on [`Screen::panel_grid`]) from the
+        /// top-left, in the panel's font, over whatever the frame drew. The
+        /// text cells under it are drawn again by the next frame.
+        fn draw_panel(&mut self, lines: &[String]) {
+            if self.gdi_pending {
+                // SAFETY: no arguments; finishes GDI drawing before the
+                // pixels are written directly.
+                unsafe { GdiFlush() };
+                self.gdi_pending = false;
+            }
+            let (pcw, pch, w, h) = (self.pcw, self.pch, self.w, self.h);
+            for (k, line) in lines.iter().enumerate() {
+                let y = k as i32 * pch;
+                for (j, c) in line.chars().enumerate() {
+                    let x = j as i32 * pcw;
+                    if x + pcw > w || y >= h {
+                        continue;
+                    }
+                    let u = if (c as u32) < 0x1_0000 { c as u16 } else { b'?' as u16 };
+                    let tile = self.panel_tiles.tile(u, FOREGROUND);
+                    for ty in 0..pch.min(h - y) {
+                        let src = &tile[(ty * pcw) as usize..((ty + 1) * pcw) as usize];
+                        // SAFETY: `y + ty` in 0..h and `x..x + pcw` within
+                        // 0..w: inside the w × h DIB.
+                        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), self.bits.add(((y + ty) * w + x) as usize), src.len()) };
+                    }
+                }
+            }
+            // the text cells under the panel: unknown now
+            let covered = ((self.panel_width() as i32 - self.x0 - self.shift.0 + self.cw - 1) / self.cw).clamp(0, self.cols as i32) as usize;
+            for row in 0..self.rows {
+                self.shown[row * self.cols..row * self.cols + covered].fill(None);
+            }
+            self.all_dirty = true;
+        }
+
+        /// A copy of the back buffer's pixels in `x..x+w`, `y..y+h`
+        /// (clipped), rows top-down.
+        #[cfg(feature = "gpu")]
+        fn region(&mut self, x: usize, y: usize, w: usize, h: usize) -> Vec<u32> {
+            if self.gdi_pending {
+                // SAFETY: no arguments; finishes GDI drawing before reading.
+                unsafe { GdiFlush() };
+                self.gdi_pending = false;
+            }
+            let (bw, bh) = (self.w as usize, self.h as usize);
+            let (x1, y1) = ((x + w).min(bw), (y + h).min(bh));
+            let mut out = Vec::with_capacity(x1.saturating_sub(x) * y1.saturating_sub(y));
+            for row in y..y1 {
+                // SAFETY: `row < bh` and `x..x1` within `0..bw`: inside the DIB.
+                let src = unsafe { std::slice::from_raw_parts(self.bits.add(row * bw + x), x1.saturating_sub(x)) };
+                out.extend_from_slice(src);
+            }
+            out
+        }
+
+        /// The back buffer's regions under the debug panel (the left half)
+        /// and the stats bar (the bottom row), when shown, as (x, y, w, h,
+        /// pixels): what to hand the GPU when it has the window.
+        #[cfg(feature = "gpu")]
+        fn extras_regions(&mut self, panel: bool, stats: bool) -> Vec<(i32, i32, usize, usize, Vec<u32>)> {
+            let mut out = Vec::new();
+            let sy = self.y0 + self.shift.1;
+            if panel {
+                let w = self.panel_width();
+                let h = self.h as usize;
+                let px = self.region(0, 0, w, h);
+                out.push((0, 0, w, px.len() / w.max(1), px));
+            }
+            if stats {
+                let y = (sy + (self.rows as i32 - 1) * self.ch).max(0) as usize;
+                let (w, h) = (self.w as usize, self.ch as usize);
+                let px = self.region(0, y, w, h);
+                out.push((0, y as i32, w, px.len() / w.max(1), px));
+            }
+            out
+        }
+
+        /// The back buffer's size in pixels.
+        fn pixel_size(&self) -> (usize, usize) {
+            (self.w as usize, self.h as usize)
+        }
+
+        /// Draw a picture of discrete pixels (`0xRRGGBB`, `iw × ih`, the
+        /// screen's size) at the burn-in offset. The next text frame redraws
+        /// every cell over it.
+        fn draw_pixels(&mut self, img: &[u32], iw: usize, ih: usize) {
+            if self.gdi_pending {
+                // SAFETY: no arguments; finishes GDI drawing before the
+                // pixels are written directly.
+                unsafe { GdiFlush() };
+                self.gdi_pending = false;
+            }
+            let (w, h) = (self.w, self.h);
+            let (sx, sy) = self.shift;
+            let (x_lo, x_hi) = (sx.max(0), (sx + iw as i32).min(w));
+            if x_hi > x_lo {
+                for y in 0..ih.min(img.len() / iw.max(1)) {
+                    let py = y as i32 + sy;
+                    if py < 0 || py >= h {
+                        continue;
+                    }
+                    let src = &img[y * iw + (x_lo - sx) as usize..y * iw + (x_hi - sx) as usize];
+                    // SAFETY: `py` in 0..h and `x_lo..x_hi` within 0..w: inside
+                    // the w × h DIB; `src` has exactly `x_hi - x_lo` pixels.
+                    unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), self.bits.add((py * w + x_lo) as usize), src.len()) };
+                }
+            }
+            self.shown.fill(None);
+            self.all_dirty = true;
         }
 
         /// Draw one row of cells at grid row `row` (unchanged cells are skipped).
@@ -738,6 +912,7 @@ mod win {
                 DeleteDC(self.mem);
                 DeleteObject(self.bitmap);
                 DeleteObject(self.font);
+                DeleteObject(self.panel_font);
                 DestroyWindow(self.hwnd);
             }
         }
@@ -790,19 +965,31 @@ mod win {
     fn run(plan: Plan, full: &Display, win: &Display, seed: u64, kind: Kind, mut watch: Option<Watch>) -> Result<(), String> {
         KIND.store(kind as u8, Ordering::Relaxed);
         let mut screen = Screen::new(win, plan.font_px, kind)?;
+        // One renderer for the window's life: a preview's reload keeps it,
+        // so a GPU that took the window keeps showing it (Windows wouldn't
+        // show GDI's drawing there again) and isn't reopened on every edit.
+        let mut renderer = AnyRenderer::new(plan.config.gpu);
         let mut plan = plan;
         loop {
-            match run_with(&mut screen, &plan, seed, kind, watch.as_mut())? {
+            match run_with(&mut screen, &mut renderer, &plan, seed, kind, watch.as_mut())? {
                 Next::Quit => return Ok(()),
                 Next::Reload(s) => {
                     plan = Plan { config: screensaver::plan_config(full, seed, &s), settings: *s, ..plan };
+                    renderer.set_want_gpu(plan.config.gpu);
                     screen.set_shift((0, 0));
                 }
             }
         }
     }
 
-    fn run_with(screen: &mut Screen, plan: &Plan, seed: u64, kind: Kind, mut watch: Option<&mut Watch>) -> Result<Next, String> {
+    fn run_with(
+        screen: &mut Screen,
+        renderer: &mut AnyRenderer,
+        plan: &Plan,
+        seed: u64,
+        kind: Kind,
+        mut watch: Option<&mut Watch>,
+    ) -> Result<Next, String> {
         let s = &plan.settings;
         let mut shift = s.shift.then(|| {
             PixelShift::new(seed ^ 0x0005_EED0_FB0B, s.shift_radius, s.shift_min_frames, s.shift_max_frames)
@@ -822,7 +1009,7 @@ mod win {
         let mut metrics = MetricsState::new(&cfg, drives.sources());
         let weights = drives.weights(&cfg.weights);
         let mut fps = FrameClock::new(cfg.fps_min, cfg.fps_max, cfg.fps_curve, cfg.fps_slew).inverted(cfg.fps_invert);
-        let mut renderer = Renderer::new();
+
         let mut governor = QualityGovernor::default();
         let mut overlays = Overlays::new(&scene);
         let mut levels: Vec<f32> = Vec::new();
@@ -852,13 +1039,17 @@ mod win {
         let mut last_full: Option<Instant> = None;
         // Frame counts for last-run-frames.txt (written on exit).
         let (mut full_frames, mut halo_frames, mut halo_cells) = (0u64, 0u64, 0u64);
+        // Space heater: full frames the GPU rendered.
+        let mut gpu_frames = 0u64;
+        // ... of them presented straight to the window
+        let mut direct_frames = 0u64;
         // Seconds spent per stage: render, compose, draw (GDI text), present,
         // halo-only frame.
         let mut spent = [0.0f64; 5];
         // Burn-in shift: largest drift reached per axis, and moves made.
         let (mut shift_reach, mut shift_moves) = ((0i32, 0i32), 0u64);
         let scene_kinds: Vec<_> = scene.solids.iter().map(|i| i.poly.kind()).collect();
-        let report = |full: u64, halo: u64, cells: u64, secs: f32, spent: &[f64; 5], sound: Option<&SoundHalo>, shift: ((i32, i32), u64)| {
+        let report = |full: u64, halo: u64, cells: u64, secs: f32, spent: &[f64; 5], sound: Option<&SoundHalo>, shift: ((i32, i32), u64), gpu: (Option<String>, u64, u64)| {
             let ms = |s: f64, n: u64| s * 1e3 / n.max(1) as f64;
             let halo_line = sound.filter(|s| s.range.0 <= s.range.1).map_or_else(
                 || "sound halo off\n".to_string(),
@@ -878,7 +1069,11 @@ mod win {
                 },
             );
             let shift_line = format!("burn-in shift {} moves, reached {} px x, {} px y\n", shift.1, shift.0.0, shift.0.1);
-            let text = halo_line + &shift_line + &format!(
+            let gpu_line = match gpu.0 {
+                Some(name) => format!("space heater: {name}, {} of {full} full frames on the GPU, {} presented straight to the window\n", gpu.1, gpu.2),
+                None => "space heater: off (or no Vulkan 1.1 GPU)\n".to_string(),
+            };
+            let text = halo_line + &shift_line + &gpu_line + &format!(
                 "seconds {secs:.1}\nfull frames {full} ({:.1}/s)\nhalo-only frames {halo} ({:.1}/s)\n\
                  redrawn cells per halo frame {:.0}\n\
                  full frame ms: render {:.2}, compose {:.2}, draw {:.2}, present {:.2}\nhalo frame ms {:.3}\n",
@@ -891,9 +1086,26 @@ mod win {
                 ms(spent[3], full),
                 ms(spent[4], halo),
             );
-            let _ = std::fs::write(data_dir().join("last-run-frames.txt"), text);
+            let _ = std::fs::write(data_dir().join(if kind == Kind::Show { "last-run-frames.txt" } else { "last-preview-frames.txt" }), text);
         };
 
+        // Space heater's discrete pixels: one ray per pixel of the screen.
+        let (pw, ph) = screen.pixel_size();
+        let mut img: Vec<u32> = Vec::new();
+        // The last full frame was drawn as pixels (no halo-only frames then).
+        let mut last_pixels = false;
+        // The last full frame went straight to the screen (traced on the
+        // GPU): its halo-only frames are redrawn there, with these settings
+        // and palette.
+        let mut last_direct: Option<(RenderSettings, PixelPalette)> = None;
+        // the halo's lines: half their width, pixels (wider on bigger screens)
+        #[cfg(feature = "gpu")]
+        let halo_half_width = (ph as f32 / 900.0).max(1.0);
+        // F1: the debug panel's lines (refreshed every full frame) and the
+        // per-stage timings it shows.
+        let mut panel: Vec<String> = Vec::new();
+        let mut panel_shown = false;
+        let (mut t_render, mut t_compose, mut t_draw, mut t_present) = (Avg::default(), Avg::default(), Avg::default(), Avg::default());
         let area_rows = screen.rows.saturating_sub(cfg.show_stats as usize).max(1);
         let vp = aspect::viewport(screen.cols, area_rows, None, cfg.aspect_mode, cfg.char_aspect);
         let started = Instant::now();
@@ -912,9 +1124,9 @@ mod win {
                     }
                 });
             if moved || QUIT.load(Ordering::SeqCst) {
-                if kind == Kind::Show {
+                {
                     let secs = started.elapsed().as_secs_f32();
-                    report(full_frames, halo_frames, halo_cells, secs, &spent, sound.as_ref().filter(|_| halo_on), (shift_reach, shift_moves));
+                    report(full_frames, halo_frames, halo_cells, secs, &spent, sound.as_ref().filter(|_| halo_on), (shift_reach, shift_moves), (renderer.gpu_name().map(str::to_string), gpu_frames, direct_frames));
                 }
                 return Ok(Next::Quit);
             }
@@ -930,7 +1142,7 @@ mod win {
             let gap = Duration::from_secs_f32((render_avg / budget).min(1.0));
             let deadline = fps.next_deadline().max(last_full.map_or(now, |t| t + gap));
             if now < deadline {
-                if let (Some(sh), Some(at)) = (sound.as_mut().filter(|_| halo_on), next_halo)
+                if let (Some(sh), Some(at)) = (sound.as_mut().filter(|_| halo_on && (!last_pixels || last_direct.is_some())), next_halo)
                     && now >= at
                     && deadline - now > halo_every / 2
                 {
@@ -940,11 +1152,31 @@ mod win {
                     let next = at + halo_every;
                     next_halo = Some(if next > now { next } else { now + halo_every });
                     let th = Instant::now();
+                    #[cfg(feature = "gpu")]
+                    if let Some((rs, palette)) = last_direct.as_ref() {
+                        // discrete pixels: the GPU redraws the halo over the
+                        // picture it traced last
+                        let hl = sh.next();
+                        let opt = options(&cfg, &ramp, cmap.as_ref(), &levels, Some(hl), &sh.factors, None);
+                        let lines = overlays.halo_lines(&scene, &Projection::new(scene.camera, pw, ph, rs), &opt, halo_half_width);
+                        let regions = screen.extras_regions(panel_shown, cfg.show_stats);
+                        let ovs: Vec<platomon::gpu::Overlay<'_>> =
+                            regions.iter().map(|(x, y, w, h, px)| platomon::gpu::Overlay { x: *x, y: *y, w: *w, h: *h, pixels: px }).collect();
+                        if renderer.present_window(platomon::gpu::Shown::HaloOnly, rs, cfg.exposure, palette, screen.shift, &ovs, lines.as_ref()) {
+                            halo_frames += 1;
+                        }
+                        spent[4] += th.elapsed().as_secs_f64();
+                        continue;
+                    }
                     if let Some(view) = renderer.view() {
                         let hl = sh.next();
                         let opt = options(&cfg, &ramp, cmap.as_ref(), &levels, Some(hl), &sh.factors, tags_on.then_some((&tag_labels[..], tag_ink, tag_blocks, tag_font)));
                         let u = overlays.update_halo(&view, vp.w, vp.h, &scene, &opt);
                         screen.draw_dirty(u.dirty, vp.w, u.chars, u.colors);
+                        if panel_shown {
+                            // the halo may have drawn over it
+                            screen.draw_panel(&panel);
+                        }
                         screen.present();
                         halo_frames += 1;
                         halo_cells += u.dirty.len() as u64;
@@ -972,6 +1204,9 @@ mod win {
             for (i, k) in drives.shapes().enumerate() {
                 scene.set_kind(i, k);
             }
+            for (i, &c) in drives.curvatures().iter().enumerate() {
+                scene.set_curvature(i, c);
+            }
             scene.update(channels, &anim, dt);
             scene.color_values(cfg.color_by, drives.color_channels(), &mut levels);
             if tags_on {
@@ -994,38 +1229,168 @@ mod win {
             }
 
             let settings = if cfg.adaptive_quality { governor.apply(base) } else { base };
+            let want_pixels = cfg.gpu_pixels && renderer.can_gpu(&scene);
+            // square pixels, the screen's own resolution
+            let pixel_rs = RenderSettings { char_aspect: 1.0, ..settings };
+            // (also when the GPU only shows the CPU's frames: it took the window earlier)
+            let palette = (cfg.gpu_pixels || renderer.presenting()).then(|| PixelPalette::new(cmap.as_ref(), &levels, &ramp, scene.solids.len(), FOREGROUND));
+            // Discrete pixels go straight from the GPU to the window. Once
+            // the GPU has the window it keeps it (GDI's drawing wouldn't show
+            // again): what the CPU draws is handed to it to show.
+            // SAFETY: no arguments; this process's module handle.
+            let hinstance = unsafe { GetModuleHandleW(std::ptr::null()) };
+            let gpu_window =
+                renderer.presenting() || (want_pixels && renderer.attach_window(&scene, screen.hwnd, hinstance, (pw as u32, ph as u32)));
+            let debug_on = DEBUG.load(Ordering::SeqCst);
+            if debug_on != panel_shown {
+                for a in [&mut t_render, &mut t_compose, &mut t_draw, &mut t_present] {
+                    a.reset_peak();
+                }
+            }
+            // The stats bar and the debug panel, drawn into the back buffer
+            // over the frame (the GPU's or the CPU's).
+            macro_rules! draw_extras {
+                ($pixels:expr) => {{
+                    if cfg.show_stats {
+                        let extra = if governor.level() > 0 { format!(" | q-{}", governor.level()) } else { String::new() };
+                        let line = ui::stats_line_fit(&metrics.readings(), fps.achieved_fps(), fps.target_fps(), &extra, screen.cols);
+                        let mut chars: Vec<char> = line.chars().collect();
+                        chars.resize(screen.cols, ' ');
+                        screen.draw_row(screen.rows - 1, &chars, None);
+                    }
+                    if debug_on {
+                        let mut p = DebugPanel::new();
+                        debug::program_rows(&mut p, started, full_frames);
+                        p.section("frame")
+                            .row("run", match kind { Kind::Show => "screensaver, full screen", Kind::Window => "preview, in a window", Kind::Full => "preview, full screen" })
+                            .row(
+                                "fps",
+                                format!(
+                                    "{:.1} achieved, target {:.1} (range {}-{}{})",
+                                    fps.achieved_fps(),
+                                    fps.target_fps(),
+                                    cfg.fps_min,
+                                    cfg.fps_max,
+                                    if cfg.fps_invert { ", inverted" } else { "" }
+                                ),
+                            )
+                            .row(
+                                "picture",
+                                match $pixels {
+                                    2 => format!("{pw}x{ph} discrete pixels, presented by the GPU (this panel too)"),
+                                    1 => format!("{pw}x{ph} discrete pixels, read back and drawn by the CPU"),
+                                    _ => format!("{}x{} cells of {}x{} px, font {} px, {pw}x{ph} screen", vp.w, vp.h, screen.cw, screen.ch, plan.font_px),
+                                },
+                            )
+                            .row("CPU budget", format!("{:.0}%{} (rendering paced to it: {:.1} ms gap)", budget * 100.0, if s.overdrive { ", overdrive" } else { "" }, render_avg / budget * 1e3))
+                            .row("render", t_render.ms())
+                            .row("compose", t_compose.ms())
+                            .row("draw", t_draw.ms())
+                            .row("present", t_present.ms())
+                            .row("halo frames", format!("{halo_frames} ({:.1}/s)", halo_frames as f32 / started.elapsed().as_secs_f32().max(1e-3)));
+                        debug::renderer_rows(&mut p, &cfg, &renderer, &governor, &base, &settings);
+                        debug::scene_rows(&mut p, &cfg, &scene);
+                        let (pc, pr) = screen.panel_grid();
+                panel = p.boxed(pc, pr);
+                        screen.draw_panel(&panel);
+                    }
+                }};
+            }
             let t0 = Instant::now();
-            renderer.render(&scene, vp.w, vp.h, &settings);
+            #[cfg_attr(not(feature = "gpu"), allow(unused_mut))]
+            let mut presented = false;
+            let mut d_draw = 0.0f32;
+            #[cfg(feature = "gpu")]
+            if gpu_window && want_pixels && let Some(p) = palette.as_ref() {
+                // the extras first, handed over as overlays
+                draw_extras!(2);
+                let regions = screen.extras_regions(debug_on, cfg.show_stats);
+                let ovs: Vec<platomon::gpu::Overlay<'_>> =
+                    regions.iter().map(|(x, y, w, h, px)| platomon::gpu::Overlay { x: *x, y: *y, w: *w, h: *h, pixels: px }).collect();
+                // the sound halo, drawn by the GPU over the pixels
+                let lines = halo.and_then(|_| {
+                    let factors = sound.as_ref().filter(|_| halo_on).map_or(&[][..], |s| &s.factors[..]);
+                    let opt = options(&cfg, &ramp, cmap.as_ref(), &levels, halo, factors, None);
+                    overlays.halo_lines(&scene, &Projection::new(scene.camera, pw, ph, &pixel_rs), &opt, halo_half_width)
+                });
+                presented = renderer.present_window(platomon::gpu::Shown::Traced(&scene), &pixel_rs, cfg.exposure, p, screen.shift, &ovs, lines.as_ref());
+            }
+            last_direct = presented.then(|| (pixel_rs, palette.clone().unwrap_or_default()));
+            if !presented {
+                if want_pixels {
+                    renderer.render(&scene, pw, ph, &pixel_rs, cfg.exposure, ramp.len());
+                } else {
+                    renderer.render(&scene, vp.w, vp.h, &settings, cfg.exposure, ramp.len());
+                }
+            }
+            gpu_frames += renderer.on_gpu() as u64;
+            direct_frames += presented as u64;
+            let pixels = want_pixels && renderer.on_gpu();
             let t1 = Instant::now();
             spent[0] += (t1 - t0).as_secs_f64();
             let r = (t1 - t0).as_secs_f32();
-            render_avg = if render_avg == 0.0 { r } else { 0.9 * render_avg + 0.1 * r };
-            if let Some(view) = renderer.view() {
+            // The CPU budget paces by CPU work: time spent waiting for the
+            // GPU doesn't count (the CPU is idle meanwhile).
+            let cpu = (r - renderer.gpu_wait()).max(0.0);
+            render_avg = if render_avg == 0.0 { cpu } else { 0.9 * render_avg + 0.1 * cpu };
+            t_render.push(r);
+            if presented {
+                // nothing to do: the GPU has shown it
+            } else if pixels {
+                if let (Some(view), Some(palette)) = (renderer.view(), palette.as_ref()) {
+                    pixel_colors(&view, cfg.exposure, palette, scene.solids.len(), &mut img);
+                    let t2 = Instant::now();
+                    spent[1] += (t2 - t1).as_secs_f64();
+                    t_compose.push((t2 - t1).as_secs_f32());
+                    screen.draw_pixels(&img, pw, ph);
+                    spent[2] += t2.elapsed().as_secs_f64();
+                    d_draw = t2.elapsed().as_secs_f32();
+                }
+            } else if let Some(view) = renderer.view() {
                 let factors = sound.as_ref().filter(|_| halo_on).map_or(&[][..], |s| &s.factors[..]);
                 let opt = options(&cfg, &ramp, cmap.as_ref(), &levels, halo, factors, tags_on.then_some((&tag_labels[..], tag_ink, tag_blocks, tag_font)));
                 let cells = overlays.compose(&view, vp.w, vp.h, &scene, &opt);
                 let t2 = Instant::now();
                 spent[1] += (t2 - t1).as_secs_f64();
+                t_compose.push((t2 - t1).as_secs_f32());
                 // No picture-ratio framing: the viewport is the grid's top `area_rows`.
                 for row in 0..vp.h {
                     let r = row * vp.w..(row + 1) * vp.w;
                     screen.draw_row(row, &cells.chars[r.clone()], cells.colors.map(|c| &c[r]));
                 }
                 spent[2] += t2.elapsed().as_secs_f64();
+                d_draw = t2.elapsed().as_secs_f32();
             }
-            if cfg.show_stats {
-                let extra = if governor.level() > 0 { format!(" | q-{}", governor.level()) } else { String::new() };
-                let line = ui::stats_line_fit(&metrics.readings(), fps.achieved_fps(), fps.target_fps(), &extra, screen.cols);
-                let mut chars: Vec<char> = line.chars().collect();
-                chars.resize(screen.cols, ' ');
-                screen.draw_row(screen.rows - 1, &chars, None);
+            if !presented {
+                draw_extras!(if pixels { 1 } else { 0 });
             }
+            t_draw.push(d_draw);
+            panel_shown = debug_on;
             let tp = Instant::now();
-            screen.present();
+            if !presented {
+                #[cfg(feature = "gpu")]
+                let shown = gpu_window && palette.as_ref().is_some_and(|p| {
+                    // the GPU has the window: show the CPU's whole frame through it
+                    let all = screen.region(0, 0, pw, ph);
+                    let ov = [platomon::gpu::Overlay { x: 0, y: 0, w: pw, h: ph, pixels: &all }];
+                    renderer.present_window(platomon::gpu::Shown::CpuFrame, &pixel_rs, cfg.exposure, p, (0, 0), &ov, None)
+                });
+                #[cfg(not(feature = "gpu"))]
+                let shown = {
+                    let _ = gpu_window;
+                    false
+                };
+                if !shown {
+                    screen.present();
+                }
+            }
             spent[3] += tp.elapsed().as_secs_f64();
+            t_present.push(tp.elapsed().as_secs_f32());
             governor.update(t0.elapsed().as_secs_f32(), fps.target_fps(), dt);
             next_halo = Some(frame_start + halo_every);
             full_frames += 1;
+            // (no halo-only frames while the GPU shows the window: they draw with GDI)
+            last_pixels = pixels || presented || renderer.presenting();
         }
     }
 

@@ -11,10 +11,11 @@ use platomon::clock::{self, FrameClock, SPIN_MARGIN};
 use platomon::color::{self, ColorBy, ColorMap, Gradient};
 use platomon::collector::{Collector, gpu::GpuSampler, system::SystemSampler};
 use platomon::config::{Config, SlotSpec, split_assignment};
+use platomon::debug::{self, Avg, DebugPanel};
 use platomon::drive::Drives;
 use platomon::metrics::{Channel, MetricKind, MetricsState, Reading, activity_score};
 use platomon::overlay::{LegendPos, OverlayOptions, Overlays, TagPlace};
-use platomon::render::{QualityGovernor, RenderSettings, Renderer, TraceSettings};
+use platomon::render::{AnyRenderer, QualityGovernor, RenderSettings, TraceSettings};
 use platomon::scene::camera::{CameraMode, CameraParams, OrbitDir};
 use platomon::scene::ground::{Pattern, Spin, parse_vec2};
 use platomon::scene::sdf::{Polyhedron, SolidKind};
@@ -86,14 +87,24 @@ struct Cli {
     #[arg(long, value_name = "METRIC=N")]
     ring: Vec<String>,
     /// One solid with its own inputs (repeatable, max 12; replaces --show):
-    /// SHAPE|SIZE|SPIN|COLOUR|COMPLEXITY, e.g. "auto|cpu|delta:ram|cpu|off".
+    /// SHAPE|SIZE|SPIN|COLOUR|COMPLEXITY[|CURVATURE], e.g. "auto|cpu|delta:ram|cpu|off|-5".
     /// SHAPE is a solid or auto; each input a metric, delta:METRIC (its change
-    /// over --delta-period) or off.
-    #[arg(long, value_name = "SHAPE|SIZE|SPIN|COLOUR|COMPLEXITY")]
+    /// over --delta-period) or off. CURVATURE is -10..10 (dished to spherical),
+    /// or VALUE@INPUT: flat when the input is idle, VALUE at full load.
+    #[arg(long, value_name = "SHAPE|SIZE|SPIN|COLOUR|COMPLEXITY[|CURVATURE]")]
     bind: Vec<String>,
     /// Seconds a delta input measures the change over (1..600).
     #[arg(long, value_name = "SECS")]
     delta_period: Option<f32>,
+    /// Split the CPU into its cores: every solid driven by the whole CPU
+    /// becomes one per logical core (cpu:0, cpu:1, ...; 32 solids at most).
+    #[arg(long)]
+    split_cpu: bool,
+    /// Curvature of every solid that sets none of its own (--bind's sixth
+    /// field): -10 (faces dished in, hyperboloid-like) to 10 (spherical);
+    /// 0 = flat faces.
+    #[arg(long, value_name = "-10..10", allow_negative_numbers = true)]
+    curvature: Option<f32>,
 
     // ---- rendering
     /// Samples per pixel.
@@ -154,6 +165,10 @@ struct Cli {
     /// Extended floor: draw the ground plane 8x further out (shaded cheaply past the normal distance).
     #[arg(long)]
     far_ground: bool,
+    /// Let the solids rest just above the floor instead of floating so their
+    /// largest halo clears it (a big halo can then dip into the floor).
+    #[arg(long)]
+    no_floor_clearance: bool,
 
     // ---- colour
     /// Colour gradient: off, a preset (see --list gradients) or hex stops like "#000:#f80:#fff".
@@ -329,6 +344,10 @@ struct Cli {
     /// Polka background: invert the dots on one side of a line through the centre.
     #[arg(long)]
     bg_invert_half: bool,
+    /// Space heater: render on the GPU through Vulkan (builds with the `gpu`
+    /// feature; the CPU renders when there is no Vulkan 1.1 GPU).
+    #[arg(long)]
+    gpu: bool,
 }
 
 fn fail(msg: impl std::fmt::Display) -> ! {
@@ -365,8 +384,14 @@ fn apply_cli(cfg: &mut Config, cli: &Cli) -> Result<(), String> {
     if cli.bg_invert_half {
         cfg.bg_invert_half = true;
     }
+    if cli.gpu {
+        cfg.gpu = true;
+    }
     if cli.far_ground {
         cfg.far_ground = true;
+    }
+    if cli.no_floor_clearance {
+        cfg.floor_clearance = false;
     }
     // Choosing a colour source (or reversing) without a gradient picks a default one.
     if (cli.color_by.is_some() || cli.color_reverse) && cli.color.is_none() && cfg.color.trim() == "off" {
@@ -423,6 +448,12 @@ fn apply_cli(cfg: &mut Config, cli: &Cli) -> Result<(), String> {
     }
     if let Some(p) = cli.delta_period {
         cfg.delta_period = p;
+    }
+    if cli.split_cpu {
+        cfg.split_cpu = true;
+    }
+    if let Some(c) = cli.curvature {
+        cfg.curvature = c;
     }
     if cli.stats {
         cfg.show_stats = true;
@@ -572,6 +603,26 @@ fn list(what: ListWhat) {
             let g = gpu.sample();
             println!("GPU backend: {} ({})", gpu.backend_name(), g.map_or("n/a".into(), |g| format!("{:.0}%", g.util)));
             println!("CPU: {}", m.cpu_total.map_or("n/a".into(), |c| format!("{c:.0}%")));
+            let cores: Vec<String> = m.cpu_cores.iter().map(|c| format!("{c:.0}")).collect();
+            println!("Cores (use with cpu:N, or --split-cpu): {} [{}%]", cores.len(), cores.join(" "));
+            let mut sensors = platomon::collector::sensors::SensorSampler::new();
+            sensors.sample();
+            std::thread::sleep(Duration::from_millis(300));
+            let s = sensors.sample();
+            let val = |v: Option<f32>, unit: &str, digits: usize| v.map_or("n/a".into(), |v| format!("{v:.digits$} {unit}"));
+            let g = g.unwrap_or(platomon::collector::gpu::GpuSample { util: 0.0, mem_util: None, temp: None, clock: None, clock_max: None });
+            println!("\nSensors ({}; GPU: {}):", sensors.sources(), gpu.backend_name());
+            println!("  cpu-temp {:>10}   gpu-temp {:>10}", val(s.cpu_temp, "\u{b0}C", 0), val(g.temp.or(s.gpu_temp), "\u{b0}C", 0));
+            println!(
+                "  cpu-freq {:>10}   gpu-freq {:>10}",
+                val(s.cpu_clock.or(m.sensors.cpu_clock), "MHz", 0),
+                val(g.clock.or(s.gpu_clock), "MHz", 0)
+            );
+            println!("  cpu-volt {:>10}   gpu-volt {:>10}", val(s.cpu_volt, "V", 3), val(s.gpu_volt, "V", 3));
+            if cfg!(windows) && (s.cpu_volt.is_none() || s.cpu_temp.is_none()) {
+                println!("  (on Windows the CPU's voltage, and its temperature where there is no ACPI thermal zone,");
+                println!("   come from LibreHardwareMonitor or OpenHardwareMonitor while it runs)");
+            }
             println!("\nDisks (use with disk-dev:NAME):");
             if m.disks.is_empty() {
                 println!("  none with I/O counters (disk-dev will show n/a)");
@@ -650,8 +701,17 @@ fn snapshot(cfg: &Config, slots: &[SlotSpec], ratio: Option<f32>, (w, h): (usize
         scene.update(&ch, &anim, secs / steps as f32);
     }
     let vp = aspect::viewport(w, h, ratio, cfg.aspect_mode, cfg.char_aspect);
-    let mut r = Renderer::new();
-    r.render(&scene, vp.w, vp.h, &render_settings(cfg, ratio));
+    let ramp = Ramp::new(&cfg.ramp);
+    let mut r = AnyRenderer::new(cfg.gpu);
+    if let Some(why) = r.gpu_problem() {
+        eprintln!("platomon: --gpu: {why}; rendering on the CPU");
+    }
+    let t = std::time::Instant::now();
+    r.render(&scene, vp.w, vp.h, &render_settings(cfg, ratio), cfg.exposure, ramp.len());
+    if cfg.gpu {
+        let on = r.gpu_name().filter(|_| r.on_gpu()).map_or_else(|| "the CPU".to_string(), |n| n.to_string());
+        eprintln!("platomon: --gpu: {}x{} rendered on {on} in {:.2} ms", vp.w, vp.h, t.elapsed().as_secs_f64() * 1e3);
+    }
     let labels: Vec<String> =
         slots.iter().zip(&ch).map(|(s, c)| format!("{} {:.0}%", s.metric.key().to_uppercase(), c.level * 100.0)).collect();
     let legend = cfg.legend_params();
@@ -660,7 +720,7 @@ fn snapshot(cfg: &Config, slots: &[SlotSpec], ratio: Option<f32>, (w, h): (usize
         legend: cfg.legend.then_some(&legend),
         labels: &labels,
         char_aspect: cfg.char_aspect,
-        ramp: &Ramp::new(&cfg.ramp),
+        ramp: &ramp,
         exposure: cfg.exposure,
         color: cmap.as_ref(),
         levels: &{
@@ -891,7 +951,7 @@ fn run(
     let mut levels: Vec<f32> = Vec::new();
     let weights = drives.weights(&cfg.weights);
     let mut fps = FrameClock::new(cfg.fps_min, cfg.fps_max, cfg.fps_curve, cfg.fps_slew).inverted(cfg.fps_invert);
-    let mut renderer = Renderer::new();
+    let mut renderer = AnyRenderer::new(cfg.gpu);
     let mut governor = QualityGovernor::default();
     let mut frame = String::with_capacity(cols as usize * rows as usize * 2 + 1024);
     let mut overlays = Overlays::new(&scene);
@@ -902,6 +962,11 @@ fn run(
     let tag_ink = cfg.tag_ink(cmap);
     let mut labels: Vec<String> = Vec::new();
     let mut tag_labels: Vec<String> = Vec::new();
+    // F1: the debug panel, and the timings it shows.
+    let mut show_debug = false;
+    let (mut t_render, mut t_compose, mut t_write, mut t_late) = (Avg::default(), Avg::default(), Avg::default(), Avg::default());
+    let (mut frames, mut last_bytes) = (0u64, 0usize);
+    let (mut dbg_chars, mut dbg_colors): (Vec<char>, Vec<u32>) = (Vec::new(), Vec::new());
 
     loop {
         // Wait for the frame deadline, staying responsive to input. Input is
@@ -933,6 +998,12 @@ fn run(
                     Action::ToggleLegend => show_legend = !show_legend,
                     Action::ToggleWireframe => wireframe = !wireframe,
                     Action::ToggleTags => tags = !tags,
+                    Action::ToggleDebug => {
+                        show_debug = !show_debug;
+                        for a in [&mut t_render, &mut t_compose, &mut t_write, &mut t_late] {
+                            a.reset_peak();
+                        }
+                    }
                     Action::Resize(w, h) => {
                         (cols, rows) = (w, h);
                         need_clear = true;
@@ -984,6 +1055,9 @@ fn run(
         for (i, k) in drives.shapes().enumerate() {
             scene.set_kind(i, k);
         }
+        for (i, &c) in drives.curvatures().iter().enumerate() {
+            scene.set_curvature(i, c);
+        }
         scene.update(channels, &anim, dt);
         scene.color_values(cfg.color_by, drives.color_channels(), &mut levels);
 
@@ -992,7 +1066,9 @@ fn run(
         let settings = if cfg.adaptive_quality { governor.apply(base) } else { base };
 
         let t0 = Instant::now();
-        renderer.render(&scene, vp.w, vp.h, &settings);
+        renderer.render(&scene, vp.w, vp.h, &settings, cfg.exposure, ramp.len());
+        t_render.push(t0.elapsed().as_secs_f32());
+        let tc = Instant::now();
         let stats_text = show_stats.then(|| {
             let extra = if governor.level() > 0 { format!(" | q-{}", governor.level()) } else { String::new() };
             ui::stats_line_fit(&metrics.readings(), fps.achieved_fps(), fps.target_fps(), &extra, cols as usize)
@@ -1029,9 +1105,44 @@ fn run(
         };
         if let Some(view) = renderer.view() {
             let cells = overlays.compose(&view, vp.w, vp.h, &scene, &opt);
-            let colors = cells.colors;
-            ascii::compose_terminal(cells.chars, colors, &vp, (cols as usize, area_h), stats, &mut frame);
+            if show_debug {
+                let mut p = DebugPanel::new();
+                debug::program_rows(&mut p, started, frames);
+                p.section("frame")
+                    .row(
+                        "fps",
+                        format!(
+                            "{:.1} achieved, target {:.1} (range {}-{}{})",
+                            fps.achieved_fps(),
+                            fps.target_fps(),
+                            cfg.fps_min,
+                            cfg.fps_max,
+                            if cfg.fps_invert { ", inverted" } else { "" }
+                        ),
+                    )
+                    .row("grid", format!("{}x{} cells in a {cols}x{rows} terminal", vp.w, vp.h))
+                    .row("render", t_render.ms())
+                    .row("compose", t_compose.ms())
+                    .row("write", format!("{} ({} KB a frame)", t_write.ms(), last_bytes / 1024))
+                    .row("late wake", t_late.ms());
+                debug::renderer_rows(&mut p, cfg, &renderer, &governor, &base, &settings);
+                debug::scene_rows(&mut p, cfg, &scene);
+                let lines = p.boxed(vp.w / 2, vp.h);
+                dbg_chars.clear();
+                dbg_chars.extend_from_slice(cells.chars);
+                dbg_colors.clear();
+                if let Some(c) = cells.colors {
+                    dbg_colors.extend_from_slice(c);
+                }
+                let has_colors = cells.colors.is_some();
+                debug::stamp(&lines, &mut dbg_chars, has_colors.then_some(&mut dbg_colors[..]), vp.w, vp.h, color::NONE);
+                ascii::compose_terminal(&dbg_chars, has_colors.then_some(&dbg_colors[..]), &vp, (cols as usize, area_h), stats, &mut frame);
+            } else {
+                let colors = cells.colors;
+                ascii::compose_terminal(cells.chars, colors, &vp, (cols as usize, area_h), stats, &mut frame);
+            }
         }
+        t_compose.push(tc.elapsed().as_secs_f32());
         let render_secs = t0.elapsed().as_secs_f32();
 
         if need_clear {
@@ -1043,6 +1154,10 @@ fn run(
         out.write_all(frame.as_bytes())?;
         out.flush()?;
         let write_secs = tw.elapsed().as_secs_f32();
+        t_write.push(write_secs);
+        t_late.push(late_secs);
+        last_bytes = frame.len();
+        frames += 1;
 
         governor.update(render_secs, fps.target_fps(), dt);
         if let Some(p) = perf.as_mut() {

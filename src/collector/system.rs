@@ -88,11 +88,21 @@ impl SystemSampler {
 
         // --- CPU + memory ---
         if let Some(sys) = self.sys.as_mut() {
-            sys.refresh_cpu_specifics(CpuRefreshKind::nothing().with_usage());
+            // (Windows reads the CPU's clock from PDH: sysinfo's is the nominal one there)
+            let kind = CpuRefreshKind::nothing().with_usage();
+            let kind = if cfg!(windows) { kind } else { kind.with_frequency() };
+            sys.refresh_cpu_specifics(kind);
             sys.refresh_memory_specifics(MemoryRefreshKind::nothing().with_ram());
             let total = sys.global_cpu_usage();
             if total.is_finite() && !sys.cpus().is_empty() {
                 m.cpu_total = Some(total.clamp(0.0, 100.0));
+            }
+            m.cpu_cores = sys.cpus().iter().map(|c| if c.usage().is_finite() { c.usage().clamp(0.0, 100.0) } else { 0.0 }).collect();
+            if !cfg!(windows) {
+                let f: Vec<u64> = sys.cpus().iter().map(|c| c.frequency()).filter(|&f| f > 0).collect();
+                if !f.is_empty() {
+                    m.sensors.cpu_clock = Some(f.iter().sum::<u64>() as f32 / f.len() as f32);
+                }
             }
             let tm = sys.total_memory();
             if tm > 0 {

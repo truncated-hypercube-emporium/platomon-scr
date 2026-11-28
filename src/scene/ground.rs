@@ -360,6 +360,24 @@ pub fn rotate_floor(v: Vec2, angle: f32) -> Vec2 {
     Vec2::new(v.x * c + v.y * s, v.y * c - v.x * s)
 }
 
+/// The floor's state for one frame (see [`Ground::shade`]): the pivot and
+/// offset in the floor frame ([`floor_frame`]), the turn as sine and cosine
+/// of minus its angle.
+#[derive(Debug, Clone, Copy)]
+pub struct GroundShade {
+    pub enabled: bool,
+    pub pattern: Pattern,
+    pub base: f32,
+    pub contrast: f32,
+    pub inv_scale: f32,
+    pub fade_rate: f32,
+    pub pivot: Vec2,
+    pub sin: f32,
+    pub cos: f32,
+    pub offset: Vec2,
+    pub shape: PatternShape,
+}
+
 #[derive(Debug, Clone)]
 pub struct Ground {
     pub enabled: bool,
@@ -522,6 +540,53 @@ impl Ground {
 
     pub fn mean_albedo(&self) -> f32 {
         self.base
+    }
+
+    /// This frame's pattern data for the GPU renderer (`src/gpu/frame.wgsl`):
+    /// a list of four-number items and four parameters, by pattern:
+    /// quasicrystal: wave directions (x, y); parameters phase in turns,
+    /// count. Rain: drops (x, y, radius, strength); ripple spacing, count.
+    /// Ocean: waves (kx, ky, height, phase in turns); height sum, chop,
+    /// count. Julia: constant x, y, iterations. Clouds: drift x, y,
+    /// octaves, roughness. Carpet: levels. Radial: sectors.
+    pub fn shader_pattern(&self) -> (Vec<[f32; 4]>, [f32; 4]) {
+        let s = &self.shape;
+        match self.pattern {
+            Pattern::Quasicrystal => (
+                self.wave_dirs[..self.n_waves].iter().map(|d| [d.x, d.y, 0.0, 0.0]).collect(),
+                [self.frame_phase / TAU, self.n_waves as f32, 0.0, 0.0],
+            ),
+            Pattern::Rain => (
+                self.frame_drops.iter().map(|&(p, r, k)| [p.x, p.y, r, k]).collect(),
+                [s.ripple, self.frame_drops.len() as f32, 0.0, 0.0],
+            ),
+            Pattern::Ocean => (
+                self.ocean.iter().zip(&self.frame_ocean).map(|(w, p)| [w.k.x, w.k.y, w.amp, *p]).collect(),
+                [self.ocean_sum, s.chop, OCEAN_WAVES as f32, 0.0],
+            ),
+            Pattern::Julia => (Vec::new(), [self.frame_julia.x, self.frame_julia.y, s.julia_iter as f32, 0.0]),
+            Pattern::Clouds => (Vec::new(), [self.frame_drift.x, self.frame_drift.y, s.octaves as f32, s.roughness]),
+            Pattern::Carpet => (Vec::new(), [s.carpet_levels as f32, 0.0, 0.0, 0.0]),
+            Pattern::Radial => (Vec::new(), [s.sectors as f32, 0.0, 0.0, 0.0]),
+            _ => (Vec::new(), [0.0; 4]),
+        }
+    }
+
+    /// This frame's floor as [`Ground::albedo`] sees it, for the GPU renderer.
+    pub fn shade(&self) -> GroundShade {
+        GroundShade {
+            enabled: self.enabled,
+            pattern: self.pattern,
+            base: self.base,
+            contrast: self.contrast,
+            inv_scale: self.inv_scale,
+            fade_rate: self.fade_rate,
+            pivot: self.pivot,
+            sin: self.frame_sin,
+            cos: self.frame_cos,
+            offset: self.frame_offset,
+            shape: self.shape,
+        }
     }
 
     pub fn angle(&self) -> f32 {

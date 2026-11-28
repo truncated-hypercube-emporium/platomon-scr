@@ -28,10 +28,25 @@ pub enum MetricKind {
     Nic,
     /// One disk / volume.
     DiskDev,
+    /// Temperatures, °C.
+    CpuTemp,
+    GpuTemp,
+    /// Clocks, MHz.
+    CpuFreq,
+    GpuFreq,
+    /// Core voltages, V.
+    CpuVolt,
+    GpuVolt,
 }
 
+/// Temperatures map this range, °C, onto 0..=1.
+pub const TEMP_RANGE: (f32, f32) = (30.0, 95.0);
+/// A voltage's range reads at least this wide, V, so the noise of a steady
+/// one stays small.
+pub const VOLT_SPAN: f32 = 0.25;
+
 impl MetricKind {
-    pub const ALL: [MetricKind; 7] = [
+    pub const ALL: [MetricKind; 13] = [
         MetricKind::Cpu,
         MetricKind::Ram,
         MetricKind::Disk,
@@ -39,6 +54,12 @@ impl MetricKind {
         MetricKind::Gpu,
         MetricKind::Nic,
         MetricKind::DiskDev,
+        MetricKind::CpuTemp,
+        MetricKind::GpuTemp,
+        MetricKind::CpuFreq,
+        MetricKind::GpuFreq,
+        MetricKind::CpuVolt,
+        MetricKind::GpuVolt,
     ];
 
     pub fn id(self) -> &'static str {
@@ -50,6 +71,12 @@ impl MetricKind {
             MetricKind::Gpu => "gpu",
             MetricKind::Nic => "nic",
             MetricKind::DiskDev => "disk-dev",
+            MetricKind::CpuTemp => "cpu-temp",
+            MetricKind::GpuTemp => "gpu-temp",
+            MetricKind::CpuFreq => "cpu-freq",
+            MetricKind::GpuFreq => "gpu-freq",
+            MetricKind::CpuVolt => "cpu-volt",
+            MetricKind::GpuVolt => "gpu-volt",
         }
     }
 
@@ -58,9 +85,19 @@ impl MetricKind {
         Self::ALL.into_iter().find(|k| k.id() == s)
     }
 
-    /// Takes an optional `:INSTANCE` suffix.
+    /// Takes an optional `:INSTANCE` suffix (for `cpu`, a core's number).
     pub fn has_instance(self) -> bool {
-        matches!(self, MetricKind::Nic | MetricKind::DiskDev)
+        matches!(self, MetricKind::Nic | MetricKind::DiskDev | MetricKind::Cpu)
+    }
+
+    /// A temperature, clock or voltage (read from the sensors).
+    pub fn is_sensor(self) -> bool {
+        matches!(self, Self::CpuTemp | Self::GpuTemp | Self::CpuFreq | Self::GpuFreq | Self::CpuVolt | Self::GpuVolt)
+    }
+
+    /// Of the GPU (its weight is the GPU's).
+    pub fn is_gpu(self) -> bool {
+        matches!(self, Self::Gpu | Self::GpuTemp | Self::GpuFreq | Self::GpuVolt)
     }
 
     pub fn default_solid(self) -> SolidKind {
@@ -72,13 +109,25 @@ impl MetricKind {
             MetricKind::Gpu => SolidKind::Dodecahedron,
             MetricKind::Nic => SolidKind::RhombicDodecahedron,
             MetricKind::DiskDev => SolidKind::TruncatedCube,
+            MetricKind::CpuTemp => SolidKind::TruncatedTetrahedron,
+            MetricKind::GpuTemp => SolidKind::TruncatedDodecahedron,
+            MetricKind::CpuFreq => SolidKind::Cuboctahedron,
+            MetricKind::GpuFreq => SolidKind::Icosidodecahedron,
+            MetricKind::CpuVolt => SolidKind::TruncatedOctahedron,
+            MetricKind::GpuVolt => SolidKind::RhombicTriacontahedron,
         }
     }
 
     /// (scale, spin) description for `--list metrics`.
     pub fn describe(self) -> (&'static str, &'static str) {
         match self {
-            MetricKind::Cpu => ("utilisation (minus platomon)", "utilisation"),
+            MetricKind::Cpu => ("utilisation (minus platomon); cpu:N one core", "utilisation"),
+            MetricKind::CpuTemp => ("CPU temperature, 30 to 95 °C", "temperature"),
+            MetricKind::GpuTemp => ("GPU temperature, 30 to 95 °C", "temperature"),
+            MetricKind::CpuFreq => ("CPU clock / highest seen (at least nominal)", "clock"),
+            MetricKind::GpuFreq => ("GPU core clock / its maximum", "clock"),
+            MetricKind::CpuVolt => ("CPU core voltage, across the range seen", "voltage"),
+            MetricKind::GpuVolt => ("GPU core voltage, across the range seen", "voltage"),
             MetricKind::Ram => ("used / total", "rate of change of used memory"),
             MetricKind::Disk => ("all disks, read+write", "Y = read, X = write"),
             MetricKind::Net => ("all adapters, rx+tx", "Y = rx, X = tx"),
@@ -115,6 +164,9 @@ impl MetricSpec {
             }
             None | Some("") => None,
             Some(i) if i.eq_ignore_ascii_case("auto") => None,
+            Some(i) if kind == MetricKind::Cpu && i.parse::<usize>().is_err() => {
+                return Err(format!("cpu:{i}: a core is picked by its number (cpu:0, cpu:1, ...)"));
+            }
             Some(i) => Some(i.to_string()),
         };
         Ok(Self { kind, instance })
@@ -265,12 +317,45 @@ pub struct Reading {
     pub a: Option<f64>,
     /// MB/s: write / tx.
     pub b: Option<f64>,
+    /// A sensor's reading: °C, MHz or V.
+    pub value: Option<f32>,
 }
 
 impl Reading {
-    fn empty(kind: MetricKind) -> Self {
-        Self { kind, name: None, pct: None, a: None, b: None }
+    pub fn empty(kind: MetricKind) -> Self {
+        Self { kind, name: None, pct: None, a: None, b: None, value: None }
     }
+}
+
+/// A steady signal: `u` drives size, spin (a little of it sideways) and activity.
+fn steady(u: f32) -> Channel {
+    let u = if u.is_finite() { u.clamp(0.0, 1.0) } else { 0.0 };
+    Channel { available: true, level: u, spin_y: u, spin_x: u * TILT, activity: u }
+}
+
+/// A temperature, °C, as 0..=1 over [`TEMP_RANGE`].
+pub fn temp_level(c: f32) -> f32 {
+    ((c - TEMP_RANGE.0) / (TEMP_RANGE.1 - TEMP_RANGE.0)).clamp(0.0, 1.0)
+}
+
+/// A clock's top before it is seen higher, MHz, when its rated one is
+/// unknown (so an idle GPU's first 20 MHz doesn't read as full).
+pub const CLOCK_FLOOR: f32 = 1000.0;
+
+/// A clock against the most it reaches: the larger of `max` (the nominal or
+/// rated clock; else [`CLOCK_FLOOR`]) and the highest seen so far (`seen`, updated).
+pub fn clock_level(mhz: f32, max: Option<f32>, seen: &mut Option<(f32, f32)>) -> f32 {
+    let hi = seen.map_or(mhz, |(_, h)| h.max(mhz)).max(max.unwrap_or(CLOCK_FLOOR)).max(1.0);
+    *seen = Some((0.0, hi));
+    (mhz / hi).clamp(0.0, 1.0)
+}
+
+/// A voltage across the range seen so far (`seen`, updated; at least
+/// [`VOLT_SPAN`] wide).
+pub fn volt_level(v: f32, seen: &mut Option<(f32, f32)>) -> f32 {
+    let (lo, hi) = seen.map_or((v, v), |(l, h)| (l.min(v), h.max(v)));
+    *seen = Some((lo, hi));
+    ((v - lo) / (hi - lo).max(VOLT_SPAN)).clamp(0.0, 1.0)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -288,6 +373,8 @@ struct Slot {
     peak: RollingPeak,
     last_mem: Option<u64>,
     chosen: Option<String>,
+    /// A clock's or voltage's (lowest, highest) seen.
+    seen: Option<(f32, f32)>,
     reading: Reading,
 }
 
@@ -311,6 +398,7 @@ impl MetricsState {
                 peak,
                 last_mem: None,
                 chosen: None,
+                seen: None,
                 reading: Reading::empty(s.kind),
             })
             .collect();
@@ -350,7 +438,41 @@ impl MetricsState {
                 }
             };
 
+            let core = slot.spec.instance.as_deref().and_then(|i| i.parse::<usize>().ok());
+            let sensors = &raw.sensors;
             slot.target = match kind {
+                // one core: the platomon share comes off each core alike
+                MetricKind::Cpu if core.is_some() => {
+                    let n = core.unwrap_or(0);
+                    r.name = Some(n.to_string());
+                    match raw.cpu_cores.get(n) {
+                        Some(&c) => {
+                            let c = subtract_self_cpu(c, raw.cpu_self.unwrap_or(0.0));
+                            r.pct = Some(c);
+                            steady(c / 100.0)
+                        }
+                        None => Channel::default(),
+                    }
+                }
+                MetricKind::CpuTemp | MetricKind::GpuTemp => {
+                    let t = if kind == MetricKind::CpuTemp { sensors.cpu_temp } else { sensors.gpu_temp };
+                    r.value = t;
+                    t.map_or(Channel::default(), |t| steady(temp_level(t)))
+                }
+                MetricKind::CpuFreq | MetricKind::GpuFreq => {
+                    let (c, max) = if kind == MetricKind::CpuFreq {
+                        (sensors.cpu_clock, sensors.cpu_clock_base)
+                    } else {
+                        (sensors.gpu_clock, sensors.gpu_clock_max)
+                    };
+                    r.value = c;
+                    c.map_or(Channel::default(), |c| steady(clock_level(c, max, &mut slot.seen)))
+                }
+                MetricKind::CpuVolt | MetricKind::GpuVolt => {
+                    let v = if kind == MetricKind::CpuVolt { sensors.cpu_volt } else { sensors.gpu_volt };
+                    r.value = v;
+                    v.map_or(Channel::default(), |v| steady(volt_level(v, &mut slot.seen)))
+                }
                 MetricKind::Cpu => match raw.cpu_total {
                     Some(total) => {
                         let c = subtract_self_cpu(total, raw.cpu_self.unwrap_or(0.0));
@@ -543,9 +665,60 @@ mod tests {
         assert_eq!(d.kind, MetricKind::DiskDev);
         assert_eq!(d.instance.as_deref(), Some(r"C:\"));
         assert_eq!(d.key(), r"disk-dev:C:\");
-        assert!(MetricSpec::parse("cpu:0").is_err());
-        assert!(MetricSpec::parse("cpu-temp").is_err());
+        assert_eq!(MetricSpec::parse("cpu:3").unwrap().instance.as_deref(), Some("3"));
+        assert!(MetricSpec::parse("cpu:big").is_err(), "a core by number");
+        assert!(MetricSpec::parse("ram:0").is_err());
+        assert!(MetricSpec::parse("fan").is_err());
+        assert_eq!(MetricSpec::parse("cpu_temp").unwrap().kind, MetricKind::CpuTemp);
+        assert!(MetricSpec::parse("gpu-volt:0").is_err());
         assert_eq!(MetricSpec::parse("disk_dev").unwrap().kind, MetricKind::DiskDev);
+        for k in MetricKind::ALL {
+            assert_eq!(MetricKind::from_id(k.id()), Some(k));
+        }
+    }
+
+    #[test]
+    fn sensors_and_cores_normalise() {
+        use crate::collector::sensors::SensorSample;
+        assert_eq!(temp_level(30.0), 0.0);
+        assert_eq!(temp_level(95.0), 1.0);
+        assert!(approx(temp_level(62.5), 0.5));
+        let mut seen = None;
+        assert_eq!(clock_level(2000.0, Some(4000.0), &mut seen), 0.5, "against the nominal clock");
+        assert_eq!(clock_level(5000.0, Some(4000.0), &mut seen), 1.0, "boost raises the top");
+        assert_eq!(clock_level(2500.0, Some(4000.0), &mut seen), 0.5);
+        let mut seen = None;
+        assert_eq!(clock_level(20.0, None, &mut seen), 0.02, "an idle clock with no rating isn't full");
+        assert_eq!(clock_level(2000.0, None, &mut seen), 1.0);
+        assert_eq!(clock_level(500.0, None, &mut seen), 0.25);
+        let mut seen = None;
+        assert_eq!(volt_level(1.0, &mut seen), 0.0);
+        assert!(approx(volt_level(1.1, &mut seen), 0.4), "a narrow range reads over the minimum span");
+        assert!(approx(volt_level(1.5, &mut seen), 1.0));
+        assert!(approx(volt_level(1.25, &mut seen), 0.5));
+
+        let cfg = Config::default();
+        let mut m = MetricsState::new(&cfg, &specs(&["cpu:1", "cpu:9", "cpu-temp", "gpu-freq", "cpu-volt", "gpu-temp"]));
+        let r = RawMetrics {
+            seq: 1,
+            cpu_cores: vec![10.0, 90.0],
+            cpu_self: Some(20.0),
+            sensors: SensorSample { cpu_temp: Some(62.5), gpu_clock: Some(1000.0), gpu_clock_max: Some(2000.0), cpu_volt: Some(1.2), ..Default::default() },
+            ..raw(1)
+        };
+        m.ingest(&r);
+        for _ in 0..200 {
+            m.tick(0.05);
+        }
+        assert!(approx(m.channel(0).level, 0.7), "core 1 less platomon's share: {:?}", m.channel(0));
+        assert!(!m.channel(1).available, "no core 9");
+        assert!(approx(m.channel(2).level, 0.5));
+        assert!(approx(m.channel(3).level, 0.5));
+        assert!(m.channel(4).available && m.channel(4).level == 0.0, "first voltage: the bottom of its range");
+        assert!(!m.channel(5).available, "no GPU temperature");
+        let rd = m.readings();
+        assert_eq!((rd[0].name.as_deref(), rd[0].pct), (Some("1"), Some(70.0)));
+        assert_eq!((rd[2].value, rd[3].value, rd[4].value, rd[5].value), (Some(62.5), Some(1000.0), Some(1.2), None));
     }
 
     fn io(name: &str, a: f64, b: f64) -> IoSample {

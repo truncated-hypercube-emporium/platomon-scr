@@ -1642,6 +1642,22 @@ fn mark_edges(
     }
 }
 
+/// The sound halo over discrete pixels, ready for the GPU (see
+/// [`Overlays::halo_lines`] and `src/gpu/frame.wgsl`: `with_halo`).
+#[derive(Debug, Clone, Default)]
+pub struct HaloLines {
+    /// Per solid three items (bounding box x0, y0, x1, y1; first line, line
+    /// count, colour or [`color::NONE`] for the colour under it, the solid,
+    /// as bits; depth slack), then per line two (from x, y, to x, y in
+    /// picture pixels; depth at each end).
+    pub data: Vec<[f32; 4]>,
+    /// Solids in `data`.
+    pub groups: u32,
+    /// Brightness 0..=1 and half the lines' width in pixels.
+    pub lum: f32,
+    pub half_width: f32,
+}
+
 /// The composed picture: glyphs and, when colour is on, per-cell colours.
 pub struct Cells<'a> {
     pub chars: &'a [char],
@@ -1758,6 +1774,8 @@ impl Overlays {
     }
 
     /// Fill `self.colors` from the final luminances.
+    /// (With a text stream from the renderer, its glyph levels are used for
+    /// every cell no overlay changed; see [`stream_level`].)
     /// Glyphs and palette colours from the final luminances in one pass
     /// (same result as [`ascii::shade`] plus [`cell_color`] per cell): the
     /// glyph level is found once, per-solid colours come from a solid ×
@@ -1792,8 +1810,9 @@ impl Overlays {
         self.cells.reserve(n_cells);
         self.colors.reserve(n_cells);
         let ids = frame.ids;
+        let stream = frame.glyphs.zip(frame.lum);
         for (i, &l) in self.lum.iter().enumerate() {
-            let lvl = ramp.level(l);
+            let lvl = stream_level(stream, i, l, ramp);
             self.cells.push(ramp.glyph_at(lvl));
             let id = ids.get(i).copied().unwrap_or(crate::render::NO_HIT) as usize;
             let c = if id >= n_solids {
@@ -1807,7 +1826,87 @@ impl Overlays {
         }
     }
 
-    /// Tone-map the frame, apply the overlays and return the `w × h` grid.
+    /// One wire model per solid, of its current shape (a solid driven by
+    /// complexity changes its shape).
+    fn sync_wires(&mut self, scene: &Scene) {
+        self.wires.resize_with(scene.solids.len(), || Wire::new(SolidKind::Tetrahedron));
+        for (wire, s) in self.wires.iter_mut().zip(&scene.solids) {
+            if wire.kind != s.poly.kind() {
+                *wire = Wire::new(s.poly.kind());
+            }
+        }
+    }
+
+    /// The sound halo as lines for discrete pixels (Space heater): the
+    /// edges [`mark_edges`] marks for the text halo (each solid's wire
+    /// model at its halo size, front faces only), projected to picture
+    /// pixels by `proj`, `half_width` pixels either side, with the depth
+    /// slack and colour (by `opt.halo_color`, as [`halo_cell_color`])
+    /// the GPU needs to hide and paint them like the text halo. `None`
+    /// without a halo.
+    pub fn halo_lines(&mut self, scene: &Scene, proj: &crate::render::Projection, opt: &OverlayOptions<'_>, half_width: f32) -> Option<HaloLines> {
+        let hl = opt.halo?;
+        let sizes = opt.halo_sizes()?;
+        self.sync_wires(scene);
+        let eye = proj.cam.pos;
+        let (lvl, nr) = (opt.ramp.level(hl.lum), opt.ramp.len());
+        let mut groups: Vec<[f32; 4]> = Vec::new();
+        let mut lines: Vec<[f32; 4]> = Vec::new();
+        let bits = |u: u32| f32::from_bits(u);
+        for (i, (inst, wire)) in scene.solids.iter().zip(&self.wires).enumerate() {
+            let rot = inst.inv_rot.transpose();
+            let factor = sizes.get(i).or(sizes.last()).copied().unwrap_or(1.0);
+            let scale = inst.scale * factor;
+            let front: Vec<bool> = wire
+                .faces
+                .iter()
+                .map(|&(n, o)| {
+                    let nw = rot * n;
+                    nw.dot(eye - (inst.center + nw * (o * scale))) > 0.0
+                })
+                .collect();
+            let world: Vec<Vec3A> = wire.verts.iter().map(|&v| inst.center + rot * (v * scale)).collect();
+            let first = lines.len() / 2;
+            let mut bb = [f32::MAX, f32::MAX, f32::MIN, f32::MIN];
+            for &(a, b, f1, f2) in &wire.edges {
+                if !(front[f1] || front[f2]) {
+                    continue;
+                }
+                let (pa, pb) = (world[a], world[b]);
+                let (Some(sa), Some(sb)) = (proj.project(pa), proj.project(pb)) else { continue };
+                lines.push([sa.0, sa.1, sb.0, sb.1]);
+                lines.push([(pa - eye).length(), (pb - eye).length(), 0.0, 0.0]);
+                bb = [bb[0].min(sa.0).min(sb.0), bb[1].min(sa.1).min(sb.1), bb[2].max(sa.0).max(sb.0), bb[3].max(sa.1).max(sb.1)];
+            }
+            let count = lines.len() / 2 - first;
+            if count == 0 {
+                continue;
+            }
+            let colour = match opt.color {
+                None => color::NONE,
+                Some(cm) => match opt.halo_color {
+                    HaloColor::Under => color::NONE,
+                    HaloColor::Solid if cm.solid.is_some() => cm.solid_color(opt.levels.get(i).copied(), hl.lum, lvl, nr),
+                    HaloColor::Solid => cm.bg_color(hl.lum),
+                    HaloColor::Size => cm.value_color(opt.halo_level(i), lvl, nr),
+                    HaloColor::Bass => {
+                        let bass = (hl.lum - HALO_LUM_MIN) / (1.0 - HALO_LUM_MIN);
+                        cm.value_color(bass.clamp(0.0, 1.0), lvl, nr)
+                    }
+                },
+            };
+            groups.push(bb);
+            groups.push([bits(first as u32), bits(count as u32), bits(colour), bits(i as u32)]);
+            // an edge is hidden only by something clearly in front of it
+            groups.push([0.2 * inst.scale + 0.02, 0.0, 0.0, 0.0]);
+        }
+        let n = (groups.len() / 3) as u32;
+        groups.extend(lines);
+        Some(HaloLines { data: groups, groups: n, lum: hl.lum, half_width })
+    }
+
+    /// Tone-map the frame (or take the renderer's text stream), apply the
+    /// overlays and return the `w × h` grid.
     pub fn compose(
         &mut self,
         frame: &FrameView<'_>,
@@ -1816,15 +1915,16 @@ impl Overlays {
         scene: &Scene,
         opt: &OverlayOptions<'_>,
     ) -> Cells<'_> {
-        // (a solid driven by complexity changes its shape)
-        self.wires.resize_with(scene.solids.len(), || Wire::new(SolidKind::Tetrahedron));
-        for (wire, s) in self.wires.iter_mut().zip(&scene.solids) {
-            if wire.kind != s.poly.kind() {
-                *wire = Wire::new(s.poly.kind());
-            }
-        }
+        self.sync_wires(scene);
         let ramp = opt.ramp;
-        ascii::tone_buffer(frame.radiance, opt.exposure, &mut self.lum);
+        match frame.lum {
+            // the GPU's text stream: already tone-mapped
+            Some(l) => {
+                self.lum.clear();
+                self.lum.extend_from_slice(l);
+            }
+            None => ascii::tone_buffer(frame.radiance, opt.exposure, &mut self.lum),
+        }
         self.lum.resize(w * h, 0.0);
         if opt.wireframe {
             self.mask.clear();
@@ -1877,7 +1977,13 @@ impl Overlays {
             }
         }
         if opt.color.is_none() {
-            ascii::shade(&self.lum, ramp, &mut self.cells);
+            match frame.glyphs.zip(frame.lum) {
+                Some(stream) => {
+                    self.cells.clear();
+                    self.cells.extend(self.lum.iter().enumerate().map(|(i, &l)| ramp.glyph_at(stream_level(Some(stream), i, l, ramp))));
+                }
+                None => ascii::shade(&self.lum, ramp, &mut self.cells),
+            }
         }
         if let Some((_, panel)) = &panel {
             let mut g = Grid::new(&mut self.cells, w, h);
@@ -1953,6 +2059,98 @@ fn draw_legend(
         let lx = ex + iw + 1;
         let ly = ey + (ih.saturating_sub(panel.font.height())) / 2;
         draw_text(g, lx, ly, panel.label_w, label, &panel.font, ink);
+    }
+}
+
+/// How Space heater's discrete pixels are coloured: each pixel is the
+/// colour its glyph's ink would have, from the colour map like
+/// [`Overlays::compose`] (or `ink` where uncoloured), scaled by its
+/// luminance, as a glyph covers about that share of its cell. The CPU
+/// ([`pixel_colors`]) and the GPU (which gets [`PixelPalette::colors`])
+/// both follow it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PixelPalette {
+    /// The background palette, then the solids' brightness palette, then
+    /// the per-solid table (solid × ramp level), `0xRRGGBB` or `NONE`.
+    pub colors: Vec<u32>,
+    pub n_bg: usize,
+    pub n_solid: usize,
+    /// Colour by solid (the table), not by brightness.
+    pub per_solid: bool,
+    /// A colour map at all (otherwise every pixel is `ink`).
+    pub colored: bool,
+    pub ink: u32,
+    pub ramp_len: usize,
+}
+
+impl PixelPalette {
+    pub fn new(cm: Option<&ColorMap>, levels: &[f32], ramp: &Ramp, n_solids: usize, ink: u32) -> Self {
+        let nr = ramp.len();
+        let per_solid = cm.is_some_and(|c| c.by.per_solid() && c.solid.is_some());
+        let bg: &[u32] = cm.and_then(|c| c.bg.as_ref()).map_or(&[], |p| p.colors());
+        let solid: &[u32] = match cm.and_then(|c| c.solid.as_ref()) {
+            Some(p) if !per_solid => p.colors(),
+            _ => &[],
+        };
+        let mut colors = Vec::with_capacity(bg.len() + solid.len() + n_solids * nr);
+        colors.extend_from_slice(bg);
+        colors.extend_from_slice(solid);
+        if let Some(c) = cm.filter(|_| per_solid) {
+            colors.extend((0..n_solids).flat_map(|k| (0..nr).map(move |b| c.solid_color(levels.get(k).copied(), 0.0, b, nr))));
+        }
+        Self { colors, n_bg: bg.len(), n_solid: solid.len(), per_solid, colored: cm.is_some(), ink, ramp_len: nr }
+    }
+
+    /// The colour of a pixel of luminance `l` showing solid `id` (one of
+    /// `n_solids`, or the floor / sky beyond).
+    #[inline]
+    pub fn color(&self, l: f32, id: usize, n_solids: usize) -> u32 {
+        let l = if l.is_finite() { l.clamp(0.0, 1.0) } else { 0.0 };
+        let pick = |pal: &[u32]| match pal.len() {
+            0 => color::NONE,
+            n => pal[((l * n as f32) as usize).min(n - 1)],
+        };
+        let c = if !self.colored {
+            color::NONE
+        } else if id >= n_solids {
+            pick(&self.colors[..self.n_bg])
+        } else if self.per_solid {
+            let level = ((l * self.ramp_len as f32) as usize).min(self.ramp_len.max(1) - 1);
+            self.colors.get(self.n_bg + self.n_solid + id * self.ramp_len + level).copied().unwrap_or(color::NONE)
+        } else {
+            pick(&self.colors[self.n_bg..self.n_bg + self.n_solid])
+        };
+        let c = if c == color::NONE { self.ink } else { c & 0x00ff_ffff };
+        let ch = |s: u32| (((c >> s) & 0xff) as f32 * l + 0.5) as u32;
+        (ch(16) << 16) | (ch(8) << 8) | ch(0)
+    }
+}
+
+/// [`PixelPalette`] colours (`0xRRGGBB`) for a frame rendered one ray per
+/// screen pixel, on the CPU (when the GPU can't present them itself).
+pub fn pixel_colors(frame: &FrameView<'_>, exposure: f32, palette: &PixelPalette, n_solids: usize, out: &mut Vec<u32>) {
+    let mut toned = Vec::new();
+    let lum: &[f32] = match frame.lum {
+        Some(l) => l,
+        None => {
+            ascii::tone_buffer(frame.radiance, exposure, &mut toned);
+            &toned
+        }
+    };
+    out.clear();
+    out.extend(lum.iter().enumerate().map(|(i, &l)| {
+        let id = frame.ids.get(i).copied().unwrap_or(crate::render::NO_HIT) as usize;
+        palette.color(l, id, n_solids)
+    }));
+}
+/// Cell `i`'s ramp level: from the renderer's text stream (glyph levels,
+/// luminances) while the cell still shows the luminance it rendered, from
+/// `l` itself once an overlay changed it.
+#[inline(always)]
+fn stream_level(stream: Option<(&[u8], &[f32])>, i: usize, l: f32, ramp: &Ramp) -> usize {
+    match stream {
+        Some((g, l0)) if l0.get(i) == Some(&l) => (g[i] as usize).min(ramp.len() - 1),
+        _ => ramp.level(l),
     }
 }
 
@@ -2950,6 +3148,41 @@ mod tests {
             let (cells_q, _, b_quiet) = draw(&opt(HaloColor::Bass, quiet, &[]));
             assert!(cells.iter().all(|&c| b_loud[c] == b_loud[cells[0]]), "{by:?}: one bass colour");
             assert_ne!(b_loud[cells[0]], b_quiet[cells_q[0]], "{by:?}: bass colour follows the level");
+            // discrete pixels: the GPU's halo lines are the text halo's edges,
+            // in the same colours
+            for src in HaloColor::ALL {
+                let o = opt(src, loud, &[1.4, 1.0, 1.2, 1.3, 1.1]);
+                let lines = Overlays::new(&scene).halo_lines(&scene, &view.proj, &o, 1.5).expect("a halo");
+                assert_eq!((lines.groups, lines.lum, lines.half_width), (5, 1.0, 1.5));
+                let n = lines.groups as usize;
+                let (cells, owner, colors) = draw(&o);
+                for g in 0..n {
+                    let info = lines.data[g * 3 + 1].map(f32::to_bits);
+                    let solid = info[3] as usize;
+                    let want = match src {
+                        HaloColor::Under => color::NONE,
+                        _ => cells.iter().find(|&&c| owner[c] as usize == solid).map(|&c| colors[c]).unwrap(),
+                    };
+                    assert_eq!(info[2], want, "{by:?} {src:?}: solid {solid}'s halo colour");
+                    assert!(info[1] > 0, "some edges face the camera");
+                }
+                // every halo cell lies on one of the lines
+                let segs: Vec<[f32; 4]> = lines.data[n * 3..].iter().step_by(2).copied().collect();
+                let near = |x: f32, y: f32| {
+                    segs.iter().any(|s| {
+                        let (a, b) = (glam::Vec2::new(s[0], s[1]), glam::Vec2::new(s[2], s[3]));
+                        let p = glam::Vec2::new(x, y);
+                        let t = ((p - a).dot(b - a) / (b - a).length_squared().max(1e-6)).clamp(0.0, 1.0);
+                        (p - (a + (b - a) * t)).length() < 1.5
+                    })
+                };
+                assert!(cells.iter().all(|&c| near((c % W) as f32 + 0.5, (c / W) as f32 + 0.5)), "{by:?} {src:?}");
+            }
+            // a bigger halo, a bigger box round its solid; none without a halo
+            let bbox = |f: &'static [f32]| Overlays::new(&scene).halo_lines(&scene, &view.proj, &opt(HaloColor::Under, loud, f), 1.0).unwrap().data[0];
+            let (small, big) = (bbox(&[1.0; 5]), bbox(&[1.6; 5]));
+            assert!(big[2] - big[0] > small[2] - small[0]);
+            assert!(Overlays::new(&scene).halo_lines(&scene, &view.proj, &OverlayOptions { halo: None, ..opt(HaloColor::Under, loud, &[]) }, 1.0).is_none());
             // halo-only updates agree with a full compose in every mode
             for src in HaloColor::ALL {
                 let mut inc = Overlays::new(&scene);

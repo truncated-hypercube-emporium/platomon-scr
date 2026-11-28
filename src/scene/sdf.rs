@@ -295,6 +295,25 @@ fn enumerate_vertices(pl: &[(Vec3A, f32)]) -> Vec<Vec3A> {
     out
 }
 
+/// Curvature range: -10 (faces dished in, edges pinched: hyperboloid-like)
+/// to +10 (the circumsphere); 0 = the flat-faced solid.
+pub const CURVATURE_RANGE: (f32, f32) = (-10.0, 10.0);
+/// Below this |curvature| a solid is drawn flat (a dish that shallow is
+/// a sphere too large for f32 to carve cleanly).
+const CURVATURE_FLAT: f32 = 0.05;
+/// At curvature -10 a face's dish is this share of its plane's distance
+/// from the centre deep (under 1, so the centre stays solid)...
+const DISH_DEPTH: f32 = 0.6;
+/// ...but no deeper than this share of the face's corner radius (so a small
+/// face's dish stays shallower than a hemisphere and never overhangs).
+const DISH_MAX_RHO: f32 = 0.8;
+
+/// A face's dish depth at `t` (0..=1 of the way to curvature -10), for its
+/// plane offset `o` and corner radius `rho`.
+fn dish_depth(t: f32, o: f32, rho: f32) -> f32 {
+    t * (DISH_DEPTH * o).min(DISH_MAX_RHO * rho)
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Polyhedron {
     kind: SolidKind,
@@ -303,6 +322,13 @@ pub struct Polyhedron {
     n: usize,
     symmetric: bool,
     inradius: f32,
+    /// Each axis's face circumradius: from the face's centre to its corners.
+    rho: [f32; MAX_AXES],
+    /// Curvature / 10, -1..=1 (0 = flat).
+    curve: f32,
+    /// Concave: each face's dish, a sphere (its centre's distance along
+    /// the axis, its radius) that passes through the face's corners.
+    dish: [(f32, f32); MAX_AXES],
 }
 
 impl Polyhedron {
@@ -319,11 +345,62 @@ impl Polyhedron {
         }
         let n = normals.len();
         let inradius = offs[..n].iter().copied().fold(f32::INFINITY, f32::min);
-        Self { kind, axes, offs, n, symmetric, inradius }
+        let mut rho = [0.0f32; MAX_AXES];
+        for k in 0..n {
+            let (a, o) = (axes[k], offs[k]);
+            rho[k] = verts
+                .iter()
+                .map(|v| *v / circum)
+                .filter(|v| (v.dot(a) - o).abs() < 1e-3)
+                .map(|v| (v - a * o).length())
+                .fold(0.0f32, f32::max);
+        }
+        Self { kind, axes, offs, n, symmetric, inradius, rho, curve: 0.0, dish: [(0.0, 0.0); MAX_AXES] }
+    }
+
+    /// The solid with curvature `c` ([`CURVATURE_RANGE`]): positive bulges
+    /// the faces out toward the circumsphere (a sphere at +10), negative
+    /// carves a dish into each face through its corners, pinching the edges.
+    pub fn with_curvature(mut self, c: f32) -> Self {
+        self.set_curvature(c);
+        self
+    }
+
+    pub fn set_curvature(&mut self, c: f32) {
+        let c = if c.is_finite() { c.clamp(CURVATURE_RANGE.0, CURVATURE_RANGE.1) } else { 0.0 };
+        let c = if c.abs() < CURVATURE_FLAT { 0.0 } else { c };
+        if c == self.curvature() {
+            return;
+        }
+        self.curve = c / CURVATURE_RANGE.1;
+        if self.curve < 0.0 {
+            for k in 0..self.n {
+                let (o, rho) = (self.offs[k], self.rho[k]);
+                let s = dish_depth(-self.curve, o, rho);
+                let r = (rho * rho + s * s) / (2.0 * s);
+                self.dish[k] = (o - s + r, r);
+            }
+        }
+    }
+
+    /// Curvature, [`CURVATURE_RANGE`].
+    pub fn curvature(&self) -> f32 {
+        self.curve * CURVATURE_RANGE.1
+    }
+
+    /// Curvature / 10 and each axis's dish (centre distance, radius), for the GPU.
+    pub fn curve_params(&self) -> (f32, &[(f32, f32)]) {
+        (self.curve, &self.dish[..self.n])
     }
 
     pub fn kind(&self) -> SolidKind {
         self.kind
+    }
+
+    /// The face planes as [`Polyhedron::eval`] tests them (circumradius 1):
+    /// normals, offsets, and whether each also stands for its negated twin.
+    pub fn planes(&self) -> (&[Vec3A], &[f32], bool) {
+        (&self.axes[..self.n], &self.offs[..self.n], self.symmetric)
     }
 
     /// Distance from the centre to the nearest face.
@@ -364,8 +441,35 @@ impl Polyhedron {
     }
 
     /// Signed distance (a bound outside near edges/vertices) for circumradius 1.
+    ///
+    /// Curved solids stay valid bounds (never more than the true distance):
+    /// convex ones blend the flat bound with the circumsphere's exact
+    /// distance (a convex blend of 1-Lipschitz functions), concave ones
+    /// intersect the flat solid with the outsides of the dish spheres.
+    /// Either way the solid stays inside its circumsphere.
     #[inline(always)]
     pub fn eval(&self, p: Vec3A) -> f32 {
+        let flat = self.eval_flat(p);
+        if self.curve == 0.0 {
+            flat
+        } else if self.curve > 0.0 {
+            flat + self.curve * (p.length() - 1.0 - flat)
+        } else {
+            let mut m = flat;
+            let pp = p.length_squared();
+            for k in 0..self.n {
+                let x = p.dot(self.axes[k]);
+                let x = if self.symmetric { x.abs() } else { x };
+                let (cd, r) = self.dish[k];
+                let dx = x - cd;
+                m = m.max(r - ((pp - x * x).max(0.0) + dx * dx).sqrt());
+            }
+            m
+        }
+    }
+
+    #[inline(always)]
+    fn eval_flat(&self, p: Vec3A) -> f32 {
         match self.kind {
             SolidKind::Cube => p.abs().max_element() - self.offs[0],
             SolidKind::Octahedron => p.abs().element_sum() * INV_SQRT3 - self.offs[0],
@@ -503,6 +607,50 @@ mod tests {
             for vert in p.vertices() {
                 assert!(p.eval(vert * 0.5) < 0.0);
                 assert!(p.eval(vert * 1.5) > 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn curvature_bulges_to_the_sphere_and_dishes_the_faces() {
+        let mut rng = fastrand::Rng::with_seed(9);
+        let rand_p = |rng: &mut fastrand::Rng, r: f32| Vec3A::new(rng.f32() * 2.0 - 1.0, rng.f32() * 2.0 - 1.0, rng.f32() * 2.0 - 1.0) * r;
+        for k in SolidKind::ALL {
+            let flat = Polyhedron::new(k);
+            assert_eq!(flat.with_curvature(0.02).curvature(), 0.0, "tiny curvature: flat");
+            let sphere = flat.with_curvature(10.0);
+            let dished = flat.with_curvature(-10.0);
+            let pl = flat.face_planes();
+            for _ in 0..200 {
+                let p = rand_p(&mut rng, 1.6);
+                assert!((sphere.eval(p) - (p.length() - 1.0)).abs() < 1e-5, "{k:?} +10 is the circumsphere");
+                assert!(dished.eval(p) >= flat.eval(p) - 1e-6, "{k:?} concave stays inside the flat solid");
+                for c in [-10.0, -4.0, 3.0, 10.0] {
+                    let s = flat.with_curvature(c);
+                    if p.length() > 1.0 + 1e-4 {
+                        assert!(s.eval(p) > 0.0, "{k:?} c={c}: inside the circumsphere");
+                    }
+                    // a valid distance bound: 1-Lipschitz
+                    let q = p + rand_p(&mut rng, 0.2);
+                    assert!((s.eval(p) - s.eval(q)).abs() <= (p - q).length() + 1e-4, "{k:?} c={c}");
+                }
+            }
+            for c in [-10.0, -5.0, 5.0] {
+                let s = flat.with_curvature(c);
+                assert!(s.eval(Vec3A::ZERO) < 0.0, "{k:?} c={c}: the centre is solid");
+                // (the outermost corners: a rhombus's or kite's nearer ones are carved too)
+                for v in flat.vertices().into_iter().filter(|v| v.length() > 0.999) {
+                    assert!(s.eval(v).abs() < 1e-3, "{k:?} c={c}: vertices stay on the surface ({})", s.eval(v));
+                }
+            }
+            // each face's centre: pushed out by a bulge, carved in by a dish
+            for (n, o) in pl {
+                let fc = n * o;
+                let rho = (0..flat.n).find(|&a| (flat.axes[a].dot(n).abs() - 1.0).abs() < 1e-4 && (flat.offs[a] - o).abs() < 1e-4).map_or(1.0, |a| flat.rho[a]);
+                assert!(flat.with_curvature(5.0).eval(fc) < -1e-3, "{k:?} bulge covers the face centre");
+                let d = dished.eval(fc);
+                // (at least its own dish's depth: a bigger neighbour's dish can cut deeper)
+                assert!(d >= dish_depth(1.0, o, rho) - 2e-3 && d > 0.05, "{k:?} dish depth at the face centre: {d}");
             }
         }
     }

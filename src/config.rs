@@ -8,7 +8,8 @@ use crate::aspect::AspectMode;
 use crate::clock::FpsCurve;
 use crate::color::{self, ColorBy, ColorMap, Gradient, HaloColor};
 use crate::scene::{Arrangement, DISTANCE_SCALE_RANGE, Layout, OrbitCenter, OrbitParams, Ordering, SPACING_RANGE};
-use crate::drive::{Binding, DELTA_PERIOD_RANGE, Input, MAX_SOLIDS};
+use crate::drive::{Binding, DELTA_PERIOD_RANGE, INPUTS, Input, MAX_SOLIDS};
+use crate::scene::sdf::CURVATURE_RANGE;
 use crate::metrics::{MetricKind, MetricSpec};
 use crate::overlay::{LEGEND_SIZE_MAX, LEGEND_SIZE_MIN, LegendParams, LegendPos, TagPlace};
 use crate::scene::camera::{CameraMode, OrbitDir};
@@ -38,8 +39,12 @@ impl Default for Weights {
 }
 
 impl Weights {
+    /// A temperature, clock or voltage weighs as its CPU or GPU.
     pub fn get(&self, k: MetricKind) -> f32 {
         match k {
+            _ if k.is_sensor() => {
+                if k.is_gpu() { self.gpu } else { self.cpu }
+            }
             MetricKind::Cpu => self.cpu,
             MetricKind::Ram => self.ram,
             MetricKind::Disk => self.disk,
@@ -47,8 +52,53 @@ impl Weights {
             MetricKind::Gpu => self.gpu,
             MetricKind::Nic => self.nic,
             MetricKind::DiskDev => self.disk_dev,
+            // (sensors: above)
+            _ => self.cpu,
         }
     }
+}
+
+/// Most solids in all once the CPU is split into cores (the GPU renderer's
+/// limit).
+pub const MAX_SPLIT_SOLIDS: usize = 32;
+
+/// The machine's logical cores (what the collector reports per core).
+pub fn logical_cores() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get())
+}
+
+/// `slots` with each one using the whole CPU (`cpu`) turned into one per
+/// core (`cpu:0`, `cpu:1`, ...), alike in everything else. With too many
+/// cores for [`MAX_SPLIT_SOLIDS`], the first cores that fit (the other
+/// solids stay).
+pub fn split_cpu_slots(slots: Vec<SlotSpec>, cores: usize) -> Vec<SlotSpec> {
+    let whole = MetricSpec::new(MetricKind::Cpu);
+    let uses = |s: &SlotSpec| s.inputs.iter().any(|i| i.metric.as_ref() == Some(&whole));
+    let split = slots.iter().filter(|s| uses(s)).count();
+    if split == 0 || cores < 2 {
+        return slots;
+    }
+    let room = MAX_SPLIT_SOLIDS.saturating_sub(slots.len() - split);
+    let per = (room / split).clamp(1, cores);
+    let mut out = Vec::new();
+    for s in slots {
+        if !uses(&s) {
+            out.push(s);
+            continue;
+        }
+        for c in 0..per {
+            let core = MetricSpec { kind: MetricKind::Cpu, instance: Some(c.to_string()) };
+            let inputs = s.inputs.clone().map(|mut i| {
+                if i.metric.as_ref() == Some(&whole) {
+                    i.metric = Some(core.clone());
+                }
+                i
+            });
+            let metric = if s.metric == whole { core.clone() } else { s.metric.clone() };
+            out.push(SlotSpec { metric, inputs, ..s.clone() });
+        }
+    }
+    out
 }
 
 /// Every tunable, with defaults.
@@ -63,6 +113,12 @@ pub struct Config {
     pub bindings: Vec<String>,
     /// Delta inputs measure the change over this many seconds.
     pub delta_period: f32,
+    /// Split the CPU into its cores: every solid the whole CPU drives
+    /// becomes one per logical core.
+    pub split_cpu: bool,
+    /// Curvature of every solid that sets none of its own, -10 (dished
+    /// faces, hyperboloid-like) to +10 (spherical); 0 = flat faces.
+    pub curvature: f32,
 
     // --- frame rate ---
     pub fps_min: f32,
@@ -80,6 +136,13 @@ pub struct Config {
     pub max_dist: f32,
     /// Drop spp / bounces when the frame budget is missed.
     pub adaptive_quality: bool,
+    /// Space heater: render on the GPU (Vulkan) when the build has it and
+    /// the scene is one the GPU covers; the CPU otherwise.
+    pub gpu: bool,
+    /// Space heater's discrete pixels: with the GPU, trace one ray per
+    /// screen pixel and draw the picture as pixels, not characters
+    /// (screensaver only).
+    pub gpu_pixels: bool,
 
     // --- output ---
     pub ramp: String,
@@ -177,6 +240,9 @@ pub struct Config {
     /// Draw the ground plane 8x further out, shaded cheaply (averaged, no
     /// sampling) past the normal render distance.
     pub far_ground: bool,
+    /// Minimum floor distance: solids float so even their largest halo
+    /// clears the floor (off: they rest just above it).
+    pub floor_clearance: bool,
     /// Fixed tag length: tags placed for each solid's current size so the
     /// leader keeps one length, growing only to keep tags off other solids.
     pub tag_fixed_len: bool,
@@ -269,6 +335,8 @@ impl Default for Config {
             show: ["cpu", "ram", "disk", "net", "gpu"].map(String::from).to_vec(),
             bindings: Vec::new(),
             delta_period: crate::drive::DELTA_PERIOD_DEFAULT,
+            split_cpu: false,
+            curvature: 0.0,
             fps_min: 5.0,
             fps_max: 150.0,
             fps_curve: FpsCurve::Sqrt,
@@ -279,6 +347,8 @@ impl Default for Config {
             max_steps: 64,
             max_dist: 50.0,
             adaptive_quality: true,
+            gpu: false,
+            gpu_pixels: false,
             ramp: crate::ascii::DEFAULT_RAMP.to_string(),
             char_aspect: 0.5,
             exposure: 1.0,
@@ -312,6 +382,7 @@ impl Default for Config {
             focus_tau: 1.5,
             auto_distance: false,
             far_ground: false,
+            floor_clearance: true,
             tag_fixed_len: false,
             tag_place: TagPlace::Circle,
             halo_color: HaloColor::Under,
@@ -371,14 +442,17 @@ pub struct SlotSpec {
     pub solid: SolidKind,
     /// Requested ring; `None` = automatic.
     pub ring: Option<u32>,
-    /// What drives its size, spin, colour and complexity.
-    pub inputs: [Input; 4],
+    /// What drives its size, spin, colour, complexity and curvature.
+    pub inputs: [Input; INPUTS],
+    /// Curvature, -10 (dished) to +10 (spherical): fixed, or reached at its
+    /// curvature input's full load.
+    pub curvature: f32,
 }
 
 impl SlotSpec {
-    /// The (shape, inputs) pairs a [`crate::drive::Drives`] takes.
-    pub fn drives(slots: &[SlotSpec]) -> Vec<(SolidKind, [Input; 4])> {
-        slots.iter().map(|s| (s.solid, s.inputs.clone())).collect()
+    /// The (shape, inputs, curvature) a [`crate::drive::Drives`] takes.
+    pub fn drives(slots: &[SlotSpec]) -> Vec<(SolidKind, [Input; INPUTS], f32)> {
+        slots.iter().map(|s| (s.solid, s.inputs.clone(), s.curvature)).collect()
     }
 }
 
@@ -443,6 +517,7 @@ impl Config {
         self.spacing = finite_or(self.spacing, d.spacing).clamp(SPACING_RANGE.0, SPACING_RANGE.1);
         self.distance_scale = finite_or(self.distance_scale, 0.0).clamp(DISTANCE_SCALE_RANGE.0, DISTANCE_SCALE_RANGE.1);
         self.delta_period = finite_or(self.delta_period, d.delta_period).clamp(DELTA_PERIOD_RANGE.0, DELTA_PERIOD_RANGE.1);
+        self.curvature = finite_or(self.curvature, 0.0).clamp(CURVATURE_RANGE.0, CURVATURE_RANGE.1);
         let o = self.orbit_params().sanitized();
         (self.orbit_velocity, self.orbit_inclination, self.orbit_eccentricity, self.orbit_variation) =
             (o.velocity, o.inclination, o.eccentricity, o.variation);
@@ -538,6 +613,7 @@ impl Config {
             seed: self.seed.unwrap_or(0),
             orbit: self.orbit_params(),
             center_slot,
+            halo_clearance: self.floor_clearance,
         }
     }
 
@@ -606,6 +682,11 @@ impl Config {
     /// Resolve `show`, `solids` and `rings` (or `bindings`) into slots.
     /// Errors are meant for the user.
     pub fn resolve_slots(&self) -> Result<Vec<SlotSpec>, String> {
+        let slots = self.resolve_unsplit()?;
+        Ok(if self.split_cpu { split_cpu_slots(slots, logical_cores()) } else { slots })
+    }
+
+    fn resolve_unsplit(&self) -> Result<Vec<SlotSpec>, String> {
         if !self.bindings.is_empty() {
             return self.resolve_bindings();
         }
@@ -649,6 +730,7 @@ impl Config {
                 solid: lookup(&solids, &m).copied().unwrap_or(m.kind.default_solid()),
                 ring: lookup(&rings, &m).copied(),
                 inputs: Binding::of(m.clone()).inputs,
+                curvature: self.curvature,
                 metric: m,
             })
             .collect())
@@ -690,7 +772,9 @@ impl Config {
                     k
                 }
             };
-            slots.push(SlotSpec { metric, solid, ring: None, inputs: b.inputs });
+            // (a flat solid with no curvature input takes the global curvature)
+            let curvature = if b.curvature == 0.0 && b.inputs[4].metric.is_none() { self.curvature } else { b.curvature };
+            slots.push(SlotSpec { metric, solid, ring: None, inputs: b.inputs, curvature });
         }
         Ok(slots)
     }
@@ -709,6 +793,27 @@ pub fn split_assignment(s: &str) -> Result<(String, String), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_cpu_makes_a_solid_per_core() {
+        let cfg = Config { bindings: vec!["cube|cpu|cpu|ram".into(), "auto|ram".into(), "auto|cpu-temp|cpu".into()], ..Config::default() };
+        let slots = cfg.resolve_slots().unwrap();
+        let split = split_cpu_slots(slots.clone(), 4);
+        assert_eq!(split.len(), 4 + 1 + 4);
+        assert_eq!(split[2].metric.key(), "cpu:2");
+        assert_eq!(split[2].solid, SolidKind::Cube, "cores keep their solid's shape");
+        assert_eq!(split[2].inputs[2].metric.as_ref().map(MetricSpec::key).as_deref(), Some("ram"), "other inputs stay");
+        assert_eq!(split[4].metric.key(), "ram");
+        assert_eq!(split[7].metric.key(), "cpu-temp", "known by its size input");
+        assert_eq!(split[7].inputs[1].metric.as_ref().map(MetricSpec::key).as_deref(), Some("cpu:2"));
+        assert_eq!(split_cpu_slots(slots.clone(), 1), slots, "one core: nothing to split");
+        // 64 cores: the two CPU solids share what the other one leaves
+        let many = split_cpu_slots(slots, 64);
+        assert_eq!(many.len(), 1 + 2 * ((MAX_SPLIT_SOLIDS - 1) / 2));
+        assert!(many.len() <= MAX_SPLIT_SOLIDS);
+        let on = Config { split_cpu: true, ..cfg };
+        assert_eq!(on.resolve_slots().unwrap().len(), if logical_cores() > 1 { 1 + 2 * logical_cores().min(15) } else { 3 });
+    }
 
     #[test]
     fn defaults_roundtrip_through_toml() {
@@ -792,7 +897,7 @@ mod tests {
         };
         assert!(bad(&|c| c.show = vec!["cpu".into(), "cpu".into()]).contains("twice"));
         assert!(bad(&|c| c.show.clear()).contains("nothing"));
-        assert!(bad(&|c| c.show = vec!["cpu-temp".into()]).contains("unknown metric"));
+        assert!(bad(&|c| c.show = vec!["fan".into()]).contains("unknown metric"));
         assert!(bad(&|c| c.show = (0..17).map(|i| format!("nic:n{i}")).collect()).contains("at most"));
         assert!(bad(&|c| _ = c.solids.insert("cpu".into(), "sphere".into())).contains("unknown solid"));
         assert!(bad(&|c| _ = c.solids.insert("nic".into(), "cube".into())).contains("not in show"));

@@ -15,7 +15,7 @@ Push-Location $root
 try {
     $target = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $root 'target' }
 
-    cargo build --release --bin platomon-scr --bin platomon-config --features screensaver
+    cargo build --release --bin platomon-scr --bin platomon-config --features screensaver,gpu
     if ($LASTEXITCODE -ne 0) { throw 'build failed' }
 
     New-Item -ItemType Directory -Force (Join-Path $root 'dist') | Out-Null
