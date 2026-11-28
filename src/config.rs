@@ -8,7 +8,7 @@ use crate::aspect::AspectMode;
 use crate::clock::FpsCurve;
 use crate::color::{self, ColorBy, ColorMap, Gradient, HaloColor};
 use crate::scene::{Arrangement, DISTANCE_SCALE_RANGE, Layout, OrbitCenter, OrbitParams, Ordering, SPACING_RANGE};
-use crate::drive::{Binding, DELTA_PERIOD_RANGE, INPUTS, Input, MAX_SOLIDS};
+use crate::drive::{Binding, Curve, DELTA_PERIOD_RANGE, INPUTS, Input, MAX_SOLIDS};
 use crate::scene::sdf::CURVATURE_RANGE;
 use crate::metrics::{MetricKind, MetricSpec};
 use crate::overlay::{LEGEND_SIZE_MAX, LEGEND_SIZE_MIN, LegendParams, LegendPos, TagPlace};
@@ -445,13 +445,13 @@ pub struct SlotSpec {
     /// What drives its size, spin, colour, complexity and curvature.
     pub inputs: [Input; INPUTS],
     /// Curvature, -10 (dished) to +10 (spherical): fixed, or reached at its
-    /// curvature input's full load.
-    pub curvature: f32,
+    /// curvature input's full load (one way or both).
+    pub curvature: Curve,
 }
 
 impl SlotSpec {
     /// The (shape, inputs, curvature) a [`crate::drive::Drives`] takes.
-    pub fn drives(slots: &[SlotSpec]) -> Vec<(SolidKind, [Input; INPUTS], f32)> {
+    pub fn drives(slots: &[SlotSpec]) -> Vec<(SolidKind, [Input; INPUTS], Curve)> {
         slots.iter().map(|s| (s.solid, s.inputs.clone(), s.curvature)).collect()
     }
 }
@@ -730,7 +730,7 @@ impl Config {
                 solid: lookup(&solids, &m).copied().unwrap_or(m.kind.default_solid()),
                 ring: lookup(&rings, &m).copied(),
                 inputs: Binding::of(m.clone()).inputs,
-                curvature: self.curvature,
+                curvature: Curve::fixed(self.curvature),
                 metric: m,
             })
             .collect())
@@ -773,7 +773,7 @@ impl Config {
                 }
             };
             // (a flat solid with no curvature input takes the global curvature)
-            let curvature = if b.curvature == 0.0 && b.inputs[4].metric.is_none() { self.curvature } else { b.curvature };
+            let curvature = if b.curvature == 0.0 && b.inputs[4].metric.is_none() { Curve::fixed(self.curvature) } else { b.curve() };
             slots.push(SlotSpec { metric, solid, ring: None, inputs: b.inputs, curvature });
         }
         Ok(slots)

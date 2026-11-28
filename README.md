@@ -383,7 +383,7 @@ written `SHAPE|SIZE|SPIN|COLOUR|COMPLEXITY[|CURVATURE]`:
   and the edges pinch into concave arcs (hyperboloid-like); at -10 a dish is 60% of the way to the
   centre (or 80% of the face's corner radius, whichever is less). `VALUE` alone is fixed;
   `VALUE@INPUT` (`-8@cpu-temp`, `10@delta:gpu`) is flat while the input is idle and reaches
-  `VALUE` at full load, following it every frame. `--curvature` sets it for every solid that sets
+  `VALUE` at full load, following it every frame; `VALUE@INPUT@both` (the Metrics dialog's **±** box) `--curvature` sets it for every solid that sets
   none of its own. Both stay true distance bounds, so curved solids march, shadow and render on
   the GPU like flat ones; a dished solid costs about twice a flat one to trace.
 - **`delta:`** uses how much the metric changed over the delta period (`--delta-period`, 10 s by
@@ -679,7 +679,7 @@ replaces the former *Extra metrics* drop-down. Its dialog has a row for each of 
 a check box to use the row, the *Shape* (Auto or one of the 15 solids), and drop-downs for what
 drives its *Size*, *Spin*, *Colour* and *Complexity*, and a *Curvature* slider (-10 to +10, its value beside it)
 with the drop-down that scales it (*Curvature by*: Off holds the slider's curvature, a metric takes the solid
-from flat at idle to the slider's curvature at full load). The drop-downs offer Off, CPU, RAM, Disk, Network, GPU, Adapter
+from flat at idle to the slider's curvature at full load; its **±** box, after the Δ box, makes it sweep The drop-downs offer Off, CPU, RAM, Disk, Network, GPU, Adapter
 (the busiest network adapter), Disk dev (the busiest disk), CPU temp, GPU temp, CPU freq, GPU freq,
 CPU volts or GPU volts, plus any named adapter, disk or core the settings already use. *Split CPU
 into cores* (beside *Defaults*) turns each solid the whole CPU drives into one per logical core;
@@ -919,7 +919,7 @@ wireframe=off          ; on | off
 stats=off              ; on | off
 fps_invert=off         ; on | off
 solid1=auto|cpu|cpu|cpu|off ; Metrics dialog: SHAPE|SIZE|SPIN|COLOUR|COMPLEXITY[|CURVATURE], up to solid12
-solid3=auto|gpu|gpu|gpu|off|-6@cpu-temp ; curvature -10..10, fixed or VALUE@INPUT
+solid3=auto|gpu|gpu|gpu|off|-6@cpu-temp@both ; curvature -10..10: VALUE, VALUE@INPUT, VALUE@INPUT@both (±)
 solid2=cube|ram|delta:ram|ram|off ; delta:METRIC = its change over delta_period
 delta_period=10        ; seconds, 1..600
 split_cpu=off          ; on: one solid per logical core for each solid the whole CPU drives

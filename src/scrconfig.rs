@@ -405,6 +405,8 @@ const ID_MET_SPLIT: i32 = 2962;
 /// Row `k`'s curvature slider (0..=20 for -10..=10) and its value.
 const ID_MET_CURVE: i32 = 3300;
 const ID_MET_CURVE_VAL: i32 = 3320;
+/// Row `k`'s ± box: its curvature input sweeps both ways.
+const ID_MET_CURVE_BOTH: i32 = 3340;
 /// Inputs per row of the Metrics dialog (ids `ID_MET_IN + k * INS + d`).
 const INS: i32 = INPUTS as i32;
 const CBN_SELCHANGE: usize = 1;
@@ -2560,7 +2562,9 @@ const MET_IN_W: i16 = 78;
 /// The curvature column: slider, its value, then its input and Δ box.
 const MET_CURVE_X: i16 = MET_IN_X + 4 * MET_IN_W;
 const MET_CURVE_IN_X: i16 = MET_CURVE_X + 84;
-const MET_W: i16 = MET_CURVE_IN_X + MET_IN_W + 6;
+/// The ± box, after the curvature input's Δ box.
+const MET_BOTH_X: i16 = MET_CURVE_IN_X + 76;
+const MET_W: i16 = MET_BOTH_X + 18 + 6;
 
 /// What the Metrics dialog edits: the solids, the delta period and Split CPU.
 #[derive(Debug, Clone, PartialEq)]
@@ -2608,6 +2612,7 @@ fn metrics_template() -> (Vec<u32>, usize) {
     t.item(0, (MET_CURVE_X, hy, 82, 10), ID_STATIC, STATIC, "Curvature (-10 to +10)");
     t.item(0, (MET_CURVE_IN_X, hy, 58, 10), ID_STATIC, STATIC, "Curvature by");
     t.item(0, (MET_CURVE_IN_X + 60, hy, 14, 10), ID_STATIC, STATIC, "\u{394}");
+    t.item(0, (MET_BOTH_X, hy, 14, 10), ID_STATIC, STATIC, "\u{b1}");
     for k in 0..rows {
         let y = MET_TOP + k * MET_ROW;
         let k32 = k as i32;
@@ -2622,6 +2627,9 @@ fn metrics_template() -> (Vec<u32>, usize) {
             }
             t.item(CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, (x, y, 58, 160), (ID_MET_IN + i) as u16, COMBOBOX, "");
             t.item(BS_AUTOCHECKBOX | WS_TABSTOP, (x + 60, y + 1, 14, 10), (ID_MET_DELTA + i) as u16, BUTTON, "");
+            if d == 4 {
+                t.item(BS_AUTOCHECKBOX | WS_TABSTOP, (MET_BOTH_X, y + 1, 14, 10), (ID_MET_CURVE_BOTH + k32) as u16, BUTTON, "");
+            }
         }
     }
     let py = MET_TOP + rows * MET_ROW + 6;
@@ -2695,6 +2703,7 @@ unsafe fn metrics_fill(h: HWND, e: &MetricsEdit) {
             let shape = b.solid.and_then(|s| SolidKind::ALL.iter().position(|x| *x == s)).map_or(0, |i| i + 1);
             SendDlgItemMessageW(h, ID_MET_SHAPE + k32, CB_SETCURSEL, shape, 0);
             set_curve(h, k32, b.curvature);
+            CheckDlgButton(h, ID_MET_CURVE_BOTH + k32, b.curve_both as u32);
             for (d, input) in b.inputs.iter().enumerate() {
                 let i = k32 * INS + d as i32;
                 let key = input.metric.as_ref().map_or_else(|| "off".to_string(), |m| m.key());
@@ -2732,7 +2741,7 @@ fn curve_label(v: isize) -> String {
     if v > 0 { format!("+{v}") } else { v.to_string() }
 }
 
-/// Grey out unticked rows, and Δ boxes whose input is off.
+/// Grey out unticked rows, and Δ (and ±) boxes whose input is off.
 unsafe fn metrics_enable(h: HWND) {
     // SAFETY: control ids from the metrics template.
     unsafe {
@@ -2746,6 +2755,10 @@ unsafe fn metrics_enable(h: HWND) {
                 EnableWindow(GetDlgItem(h, ID_MET_IN + i), on as i32);
                 let set = SendDlgItemMessageW(h, ID_MET_IN + i, CB_GETCURSEL, 0, 0) > 0;
                 EnableWindow(GetDlgItem(h, ID_MET_DELTA + i), (on && set) as i32);
+                if d == 4 {
+                    // ± only means something with a curvature input
+                    EnableWindow(GetDlgItem(h, ID_MET_CURVE_BOTH + k), (on && set) as i32);
+                }
             }
         }
     }
@@ -2776,7 +2789,8 @@ unsafe fn metrics_take(h: HWND) -> Result<MetricsEdit, String> {
             if inputs.iter().all(|i| i.metric.is_none()) {
                 return Err(format!("Solid {} has every input off: give it at least one metric, or untick it.", k + 1));
             }
-            solids.push(Binding { solid, inputs, curvature: get_curve(h, k) });
+            let curve_both = inputs[4].metric.is_some() && IsDlgButtonChecked(h, ID_MET_CURVE_BOTH + k) == 1;
+            solids.push(Binding { solid, inputs, curvature: get_curve(h, k), curve_both });
         }
         if solids.is_empty() {
             return Err("Tick at least one solid.".into());
@@ -2823,6 +2837,7 @@ unsafe extern "system" fn metrics_dialog(h: HWND, msg: u32, w: usize, l: isize) 
                     tips.push((ID_MET_ON + k, help("metric_on").into()));
                     tips.push((ID_MET_SHAPE + k, help("metric_shape").into()));
                     tips.push((ID_MET_CURVE + k, help("metric_curvature").into()));
+                    tips.push((ID_MET_CURVE_BOTH + k, help("metric_curvature_both").into()));
                     for (d, key) in ["metric_size", "metric_spin", "metric_colour", "metric_complexity", "metric_curvature_input"].iter().enumerate() {
                         let i = k * INS + d as i32;
                         tips.push((ID_MET_IN + i, help(key).into()));
@@ -3002,7 +3017,7 @@ mod tests {
         assert_eq!(items, n);
         // (plus the curvature column: 3 headers; per row a slider, its value,
         // and a fifth input and Δ box)
-        assert_eq!(n, 1 + 13 + screensaver::MAX_SOLIDS * 14 + 3 + 4);
+        assert_eq!(n, 1 + 14 + screensaver::MAX_SOLIDS * 15 + 3 + 4, "(and a ± header and box per row)");
         assert_eq!((curve_label(4), curve_label(0), curve_label(-10)), ("+4".to_string(), "0".to_string(), "-10".to_string()));
         assert!(ID_MET_IN + INS * screensaver::MAX_SOLIDS as i32 <= ID_MET_DELTA, "input ids don't run into the Δ boxes");
         assert!(ID_MET_DELTA + INS * screensaver::MAX_SOLIDS as i32 <= ID_MET_PERIOD);

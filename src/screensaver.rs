@@ -966,6 +966,7 @@ pub fn help(key: &str) -> &'static str {
             need LibreHardwareMonitor or OpenHardwareMonitor running; without it the CPU temperature is the hottest ACPI thermal zone, where Windows has one.",
         "metric_curvature" => "The solid's curvature, -10 to +10: 0 is the flat-faced solid; toward +10 its faces bulge out until it is a sphere through its corners; toward -10 each face is dished in through its corners, pinching the edges (hyperboloid-like). With a curvature input, the curvature it reaches at the input's full load.",
         "metric_curvature_input" => "What sets how far the solid curves: flat when idle, the slider's curvature at full load (any metric: CPU, GPU, temperatures, clocks, voltages...). Off: the slider's curvature all the time. Changes show in a running preview.",
+        "metric_curvature_both" => "\u{b1}: the curvature input sweeps both ways: the slider's curvature reversed when idle (-6 for +6), flat at half load, the slider's curvature at full load. Unticked: flat when idle.",
         "split_cpu" => "Split the CPU into its cores: every solid driven by the whole CPU becomes one solid per logical core (CPU0, CPU1, ...), alike in everything else. Up to 32 solids in all.",
         "metric_spin" => "What sets how fast the solid spins (rx/read on one axis and tx/write on the other for network and disks). Off: the idle spin.",
         "metric_colour" => "What sets the solid's colour when Colour by is Load. Off: the start of the gradient.",

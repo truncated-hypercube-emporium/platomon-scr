@@ -7,8 +7,9 @@
 //! `auto`, each input a metric (`cpu`, `nic:Ethernet`, ...), `delta:METRIC`
 //! for its change, or `off`. `CURVATURE` is a value from -10 to +10, alone
 //! (fixed) or as `VALUE@INPUT` (flat when the input is idle, `VALUE` at
-//! full load). [`Drives`] turns the metrics' channels into each solid's
-//! channel every frame.
+//! full load), or `VALUE@INPUT@both` (both ways: `-VALUE` when idle, flat
+//! at half load, `VALUE` at full load). [`Drives`] turns the metrics'
+//! channels into each solid's channel every frame.
 
 use std::collections::VecDeque;
 
@@ -117,18 +118,55 @@ pub fn curvature_text(c: f32) -> String {
     if c.fract() == 0.0 { format!("{}", c as i32) } else { format!("{c:.1}") }
 }
 
-/// `VALUE` or `VALUE@INPUT` (a curvature and what scales it).
-fn parse_curvature(s: &str) -> Result<(f32, Input), String> {
-    let (v, input) = match s.split_once('@') {
-        Some((v, i)) => (v.trim(), Input::parse(i)?),
-        None if s.eq_ignore_ascii_case("off") || s.is_empty() => ("0", Input::OFF),
-        None => (s, Input::OFF),
+/// The curvature field's both-ways marker: `VALUE@INPUT@both`.
+const BOTH: &str = "both";
+
+/// A solid's curvature setting.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Curve {
+    /// -10..=10: the curvature (input off), or what full load reaches.
+    pub value: f32,
+    /// With an input: it sweeps from -value (idle) through flat to +value.
+    pub both: bool,
+}
+
+impl Curve {
+    pub const FLAT: Curve = Curve { value: 0.0, both: false };
+
+    pub fn fixed(value: f32) -> Self {
+        Self { value, both: false }
+    }
+
+    /// The curvature at input level `l` (0..=1).
+    pub fn at(self, l: f32) -> f32 {
+        let l = l.clamp(0.0, 1.0);
+        if self.both { self.value * (2.0 * l - 1.0) } else { self.value * l }
+    }
+}
+
+/// `VALUE`, `VALUE@INPUT` or `VALUE@INPUT@both` (a curvature, what scales
+/// it, and whether it scales both ways).
+fn parse_curvature(s: &str) -> Result<(f32, Input, bool), String> {
+    let mut parts = s.split('@').map(str::trim);
+    let v = parts.next().unwrap_or("");
+    let (v, input) = match parts.next() {
+        Some(i) => (v, Input::parse(i)?),
+        None if v.eq_ignore_ascii_case("off") || v.is_empty() => ("0", Input::OFF),
+        None => (v, Input::OFF),
     };
+    let both = match parts.next() {
+        None => false,
+        Some(b) if b.eq_ignore_ascii_case(BOTH) && input.metric.is_some() => true,
+        Some(b) => return Err(format!("curvature '{s}': '@{b}' (only VALUE@INPUT@{BOTH})")),
+    };
+    if parts.next().is_some() {
+        return Err(format!("curvature '{s}': expected VALUE, VALUE@INPUT or VALUE@INPUT@{BOTH}"));
+    }
     let c = v.parse::<f32>().ok().filter(|c| c.is_finite()).ok_or_else(|| format!("curvature '{v}': a number from -10 to 10"))?;
     if !(CURVATURE_RANGE.0..=CURVATURE_RANGE.1).contains(&c) {
         return Err(format!("curvature {c}: from -10 (hyperboloid) to 10 (spherical)"));
     }
-    Ok((c, input))
+    Ok((c, input, both))
 }
 
 /// One solid: its shape, its inputs (in [`Drive::ALL`] order) and its
@@ -141,6 +179,8 @@ pub struct Binding {
     /// Curvature, -10..=10: the solid's (input off), or what it reaches at
     /// its curvature input's full load (flat when idle).
     pub curvature: f32,
+    /// The curvature input sweeps both ways: -curvature idle, +curvature at full load.
+    pub curve_both: bool,
 }
 
 impl Eq for Binding {}
@@ -149,7 +189,7 @@ impl Binding {
     /// The classic solid: `metric` drives size, spin and colour.
     pub fn of(metric: MetricSpec) -> Self {
         let i = Input::abs(metric);
-        Self { solid: None, inputs: [i.clone(), i.clone(), i, Input::OFF, Input::OFF], curvature: 0.0 }
+        Self { solid: None, inputs: [i.clone(), i.clone(), i, Input::OFF, Input::OFF], curvature: 0.0, curve_both: false }
     }
 
     /// `SHAPE|SIZE|SPIN|COLOUR|COMPLEXITY|CURVATURE`; missing spin and
@@ -166,15 +206,20 @@ impl Binding {
         };
         let size = Input::parse(f[1])?;
         let at = |k: usize, d: &Input| f.get(k).map_or(Ok(d.clone()), |v| Input::parse(v));
-        let (curvature, curve_in) = match f.get(5) {
+        let (curvature, curve_in, curve_both) = match f.get(5) {
             Some(v) => parse_curvature(v).map_err(|e| format!("'{s}': {e}"))?,
-            None => (0.0, Input::OFF),
+            None => (0.0, Input::OFF, false),
         };
         let inputs = [size.clone(), at(2, &size)?, at(3, &size)?, at(4, &Input::OFF)?, curve_in];
         if inputs.iter().all(|i| i.metric.is_none()) {
             return Err(format!("'{s}': a solid needs at least one input"));
         }
-        Ok(Self { solid, inputs, curvature })
+        Ok(Self { solid, inputs, curvature, curve_both })
+    }
+
+    /// Its curvature setting.
+    pub fn curve(&self) -> Curve {
+        Curve { value: self.curvature, both: self.curve_both && self.inputs[4].metric.is_some() }
     }
 
     /// The binding's text; the curvature field only when it is set.
@@ -185,7 +230,7 @@ impl Binding {
         let tail = match (curve.metric.is_some(), self.curvature != 0.0) {
             (false, false) => String::new(),
             (false, true) => format!("|{}", curvature_text(self.curvature)),
-            (true, _) => format!("|{}@{}", curvature_text(self.curvature), curve.text()),
+            (true, _) => format!("|{}@{}{}", curvature_text(self.curvature), curve.text(), if self.curve_both { "@both" } else { "" }),
         };
         format!("{shape}|{}{tail}", inputs.join("|"))
     }
@@ -251,7 +296,7 @@ pub struct Drives {
     sources: Vec<MetricSpec>,
     links: Vec<[Link; INPUTS]>,
     /// Each solid's curvature setting, and its curvature now.
-    curve_set: Vec<f32>,
+    curve_set: Vec<Curve>,
     curvature: Vec<f32>,
     /// Complexity: the shape each solid starts from (its index in the
     /// ladder) and the step it is on now.
@@ -267,7 +312,7 @@ pub struct Drives {
 impl Drives {
     /// `solids`: each solid's shape at rest, its inputs and its curvature
     /// setting.
-    pub fn new(solids: &[(SolidKind, [Input; INPUTS], f32)], period: f32) -> Self {
+    pub fn new(solids: &[(SolidKind, [Input; INPUTS], Curve)], period: f32) -> Self {
         let mut sources: Vec<MetricSpec> = Vec::new();
         // primary metrics first, so the stats bar follows the solids
         let order = solids.iter().flat_map(|(_, ins, _)| ins.iter()).filter_map(|i| i.metric.as_ref());
@@ -287,9 +332,10 @@ impl Drives {
             .collect();
         let ladder = ladder();
         let base: Vec<usize> = solids.iter().map(|(k, _, _)| ladder.iter().position(|l| l == k).unwrap_or(0)).collect();
-        let curve_set: Vec<f32> = solids.iter().map(|s| s.2.clamp(CURVATURE_RANGE.0, CURVATURE_RANGE.1)).collect();
-        // (an input starts the solid flat, as if idle)
-        let curvature = solids.iter().zip(&curve_set).map(|(s, &c)| if s.1[4].metric.is_some() { 0.0 } else { c }).collect();
+        let curve_set: Vec<Curve> =
+            solids.iter().map(|s| Curve { value: s.2.value.clamp(CURVATURE_RANGE.0, CURVATURE_RANGE.1), both: s.2.both && s.1[4].metric.is_some() }).collect();
+        // (an input starts the solid flat, until it has a reading)
+        let curvature = solids.iter().zip(&curve_set).map(|(s, c)| if s.1[4].metric.is_some() { 0.0 } else { c.value }).collect();
         let n = solids.len();
         let period = if period.is_finite() { period.clamp(DELTA_PERIOD_RANGE.0, DELTA_PERIOD_RANGE.1) } else { DELTA_PERIOD_DEFAULT };
         Self {
@@ -351,11 +397,11 @@ impl Drives {
             self.color[i] =
                 Channel { available: on(Drive::Color, color), level: if on(Drive::Color, color) { color.1[0] } else { 0.0 }, ..Channel::default() };
             // curvature: the setting, scaled by its input when it has one
-            // (an unavailable input leaves the solid flat)
+            // (one way or both; an unavailable input leaves the solid flat)
             self.curvature[i] = if links[Drive::Curvature.index()].src.is_some() {
-                if curve.0 { self.curve_set[i] * curve.1[0].clamp(0.0, 1.0) } else { 0.0 }
+                if curve.0 { self.curve_set[i].at(curve.1[0]) } else { 0.0 }
             } else {
-                self.curve_set[i]
+                self.curve_set[i].value
             };
             if on(Drive::Complexity, cplx) {
                 let steps = self.ladder.len() - 1 - self.base[i];
@@ -444,17 +490,24 @@ mod tests {
         assert!(Binding::parse("auto|cpu|cpu|cpu|off|11").is_err());
         assert!(Binding::parse("auto|cpu|cpu|cpu|off|bent").is_err());
         assert!(Binding::parse("auto|cpu|cpu|cpu|off|5@fan").is_err());
+        let b = Binding::parse("auto|cpu|cpu|cpu|off|-6@gpu-temp@BOTH").unwrap();
+        assert_eq!((b.curvature, b.curve_both, b.curve()), (-6.0, true, Curve { value: -6.0, both: true }));
+        assert_eq!(b.text(), "auto|cpu|cpu|cpu|off|-6@gpu-temp@both");
+        assert!(Binding::parse("auto|cpu|cpu|cpu|off|6@both").is_err(), "both ways needs an input");
+        assert!(Binding::parse("auto|cpu|cpu|cpu|off|6@cpu@twice").is_err());
+        assert_eq!((Curve { value: 4.0, both: true }.at(0.0), Curve { value: 4.0, both: true }.at(0.5), Curve::fixed(4.0).at(0.5)), (-4.0, 0.0, 2.0));
     }
 
     #[test]
     fn curvature_follows_its_input() {
         let solids = [
-            (SolidKind::Cube, Binding::parse("cube|cpu|cpu|cpu|off|-8").unwrap().inputs, -8.0),
-            (SolidKind::Cube, Binding::parse("cube|cpu|cpu|cpu|off|10@cpu").unwrap().inputs, 10.0),
-            (SolidKind::Cube, Binding::parse("cube|cpu|cpu|cpu|off|-10@gpu").unwrap().inputs, -10.0),
+            (SolidKind::Cube, Binding::parse("cube|cpu|cpu|cpu|off|-8").unwrap().inputs, Curve::fixed(-8.0)),
+            (SolidKind::Cube, Binding::parse("cube|cpu|cpu|cpu|off|10@cpu").unwrap().inputs, Curve::fixed(10.0)),
+            (SolidKind::Cube, Binding::parse("cube|cpu|cpu|cpu|off|-10@gpu").unwrap().inputs, Curve::fixed(-10.0)),
+            (SolidKind::Cube, Binding::parse("cube|cpu|cpu|cpu|off|10@cpu@both").unwrap().inputs, Curve { value: 10.0, both: true }),
         ];
         let mut d = Drives::new(&solids, 10.0);
-        assert_eq!(d.curvatures(), [-8.0, 0.0, 0.0], "an input starts flat");
+        assert_eq!(d.curvatures(), [-8.0, 0.0, 0.0, 0.0], "an input starts flat");
         let mut m = MetricsState::new(&Config::default(), d.sources());
         let mut seq = 0;
         run(&mut d, &mut m, &mut seq, 60.0, 20.0);
@@ -462,6 +515,10 @@ mod tests {
         assert_eq!(c[0], -8.0, "fixed");
         assert!((c[1] - 6.0).abs() < 0.1, "60% load: 6 of 10: {}", c[1]);
         assert_eq!(c[2], 0.0, "no GPU here in the test: flat");
+        assert!((c[3] - 2.0).abs() < 0.2, "both ways, 60% load: 10 x (2 x 0.6 - 1) = 2: {}", c[3]);
+        run(&mut d, &mut m, &mut seq, 10.0, 20.0);
+        assert!((d.curvatures()[3] + 8.0).abs() < 0.2, "both ways, 10% load: -8: {}", d.curvatures()[3]);
+        assert!((d.curvatures()[1] - 1.0).abs() < 0.2, "one way, 10% load: 1");
     }
 
     fn raw(seq: u64, cpu: f32) -> RawMetrics {
@@ -483,8 +540,8 @@ mod tests {
     #[test]
     fn inputs_route_and_delta_reads_change_not_level() {
         let solids = [
-            (SolidKind::Cube, Binding::parse("cube|cpu|ram|ram|off").unwrap().inputs, 0.0),
-            (SolidKind::Tetrahedron, Binding::parse("tetrahedron|delta:cpu|off|cpu|cpu").unwrap().inputs, 0.0),
+            (SolidKind::Cube, Binding::parse("cube|cpu|ram|ram|off").unwrap().inputs, Curve::FLAT),
+            (SolidKind::Tetrahedron, Binding::parse("tetrahedron|delta:cpu|off|cpu|cpu").unwrap().inputs, Curve::FLAT),
         ];
         let mut d = Drives::new(&solids, 2.0);
         assert_eq!(d.sources(), [spec("cpu"), spec("ram")]);
@@ -510,7 +567,7 @@ mod tests {
         let l = ladder();
         assert_eq!(l[0], SolidKind::Tetrahedron);
         assert!(l.windows(2).all(|w| w[0].complexity() <= w[1].complexity()));
-        let solids = [(SolidKind::Tetrahedron, Binding::parse("tetrahedron|off|off|off|cpu").unwrap().inputs, 0.0)];
+        let solids = [(SolidKind::Tetrahedron, Binding::parse("tetrahedron|off|off|off|cpu").unwrap().inputs, Curve::FLAT)];
         let mut d = Drives::new(&solids, 10.0);
         let mut m = MetricsState::new(&Config::default(), d.sources());
         let mut seq = 0;
